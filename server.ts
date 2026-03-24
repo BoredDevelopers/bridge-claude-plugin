@@ -108,6 +108,26 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let agentId = "";
 let agentName = "";
 const seenMessageIds = new Set<string>();
+const pendingReplay: any[] = [];
+let replayFlushed = false;
+let replayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushReplay(trigger: string): void {
+  if (replayFlushed) return;
+  replayFlushed = true;
+  if (replayFallbackTimer) {
+    clearTimeout(replayFallbackTimer);
+    replayFallbackTimer = null;
+  }
+  if (pendingReplay.length === 0) return;
+  process.stderr.write(
+    `bridge channel: flushing ${pendingReplay.length} replay messages (trigger: ${trigger})\n`
+  );
+  for (const msg of pendingReplay) {
+    handleInboundMessage(msg);
+  }
+  pendingReplay.length = 0;
+}
 // In-memory cursor: updated on every inbound message.
 // Seeded from disk on startup, falls back to "now" on first-ever connect.
 let lastMessageTime: string | null = loadCursor();
@@ -238,15 +258,26 @@ function handleWsMessage(data: any): void {
       if (Array.isArray(data.data?.messages) && data.data.messages.length > 0) {
         const msgs = data.data.messages;
         process.stderr.write(
-          `bridge channel: replay received ${msgs.length} messages, delivering after delay\n`
+          `bridge channel: replay received ${msgs.length} messages, queuing for delivery\n`
         );
-        // Delay replay delivery to let Claude Code finish startup hooks.
-        // Without this, notifications sent during initialization get dropped.
-        setTimeout(() => {
-          for (const msg of msgs) {
-            handleInboundMessage(msg);
-          }
-        }, 3000);
+        // Queue replay messages. They'll be delivered either:
+        // 1. When the first tool call succeeds (proves session is ready), or
+        // 2. After a generous timeout as fallback
+        for (const msg of msgs) {
+          pendingReplay.push(msg);
+        }
+        // Save cursors immediately so we don't re-fetch on next connect
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg?.createdAt) {
+          lastMessageTime = lastMsg.createdAt;
+          saveCursor(lastMsg.createdAt);
+        }
+        // Fallback: deliver after 10s even if no tool call happens
+        if (!replayFallbackTimer) {
+          replayFallbackTimer = setTimeout(() => {
+            flushReplay("timeout");
+          }, 10000);
+        }
       }
       break;
 
@@ -459,6 +490,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  // First tool call proves Claude Code session is fully initialized
+  if (!replayFlushed && pendingReplay.length > 0) {
+    flushReplay("tool_call");
+  }
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
   try {
     switch (req.params.name) {
