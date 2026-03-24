@@ -235,10 +235,18 @@ function handleWsMessage(data: any): void {
       break;
 
     case "replay":
-      if (Array.isArray(data.data?.messages)) {
-        for (const msg of data.data.messages) {
-          handleInboundMessage(msg);
-        }
+      if (Array.isArray(data.data?.messages) && data.data.messages.length > 0) {
+        const msgs = data.data.messages;
+        process.stderr.write(
+          `bridge channel: replay received ${msgs.length} messages, delivering after delay\n`
+        );
+        // Delay replay delivery to let Claude Code finish startup hooks.
+        // Without this, notifications sent during initialization get dropped.
+        setTimeout(() => {
+          for (const msg of msgs) {
+            handleInboundMessage(msg);
+          }
+        }, 3000);
       }
       break;
 
@@ -260,13 +268,28 @@ function handleInboundMessage(msg: any): void {
   if (!msg) return;
 
   const channelId = msg.channelId ?? "";
-  if (!shouldDeliverChannel(channelId)) return;
+  if (!shouldDeliverChannel(channelId)) {
+    process.stderr.write(
+      `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")})\n`
+    );
+    return;
+  }
 
   // Don't echo own messages back
-  if (msg.agentId === agentId) return;
+  if (msg.agentId === agentId) {
+    process.stderr.write(
+      `bridge channel: SKIPPED own msg id=${msg.id} agent=${msg.agentId}\n`
+    );
+    return;
+  }
 
   // Deduplicate: skip if we already processed this exact message
-  if (msg.id && seenMessageIds.has(msg.id)) return;
+  if (msg.id && seenMessageIds.has(msg.id)) {
+    process.stderr.write(
+      `bridge channel: DEDUP id=${msg.id}\n`
+    );
+    return;
+  }
   if (msg.id) {
     seenMessageIds.add(msg.id);
     // Cap the set so it doesn't grow forever
