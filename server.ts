@@ -24,6 +24,7 @@ import {
   mkdirSync,
   chmodSync,
   renameSync,
+  existsSync,
 } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -62,6 +63,33 @@ if (!API_URL || !TOKEN) {
   process.exit(1);
 }
 
+// ── Cursor persistence ──────────────────────────────────────────────────────
+// Track the timestamp of the last message seen so reconnects only replay
+// what was missed. On first-ever connect (no saved cursor), default to "now"
+// so the client doesn't get flooded with the full message history.
+
+const CURSOR_FILE = join(STATE_DIR, ".last_seen");
+
+function loadCursor(): string | null {
+  try {
+    const raw = readFileSync(CURSOR_FILE, "utf8").trim();
+    // Validate it looks like an ISO timestamp
+    if (raw && !isNaN(Date.parse(raw))) return raw;
+  } catch {}
+  return null;
+}
+
+function saveCursor(ts: string): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    const tmp = CURSOR_FILE + ".tmp";
+    writeFileSync(tmp, ts + "\n", { mode: 0o600 });
+    renameSync(tmp, CURSOR_FILE);
+  } catch (err) {
+    process.stderr.write(`bridge channel: failed to save cursor: ${err}\n`);
+  }
+}
+
 // ── Safety ──────────────────────────────────────────────────────────────────
 
 process.on("unhandledRejection", (err) => {
@@ -79,12 +107,17 @@ let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let agentId = "";
 let agentName = "";
-let lastMessageTime: string | null = null;
+// In-memory cursor: updated on every inbound message.
+// Seeded from disk on startup, falls back to "now" on first-ever connect.
+let lastMessageTime: string | null = loadCursor();
 
 function wsUrl(): string {
   const base = API_URL.replace(/^http/, "ws");
   const params = new URLSearchParams({ token: TOKEN });
-  if (lastMessageTime) params.set("since", lastMessageTime);
+  // Always send a since param. On first-ever connect (no saved cursor),
+  // use "now" so the server returns zero replay messages.
+  const since = lastMessageTime ?? new Date().toISOString();
+  params.set("since", since);
   return `${base}/ws?${params}`;
 }
 
@@ -190,8 +223,11 @@ function handleInboundMessage(msg: any): void {
   // Don't echo own messages back
   if (msg.agentId === agentId) return;
 
-  // Track time for replay on reconnect
-  if (msg.createdAt) lastMessageTime = msg.createdAt;
+  // Track time for replay on reconnect (memory + disk)
+  if (msg.createdAt) {
+    lastMessageTime = msg.createdAt;
+    saveCursor(msg.createdAt);
+  }
 
   const senderName = msg.agentName ?? msg.senderName ?? msg.agentId ?? "unknown";
   const msgType = msg.type ?? "text";
