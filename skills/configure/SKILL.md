@@ -79,21 +79,13 @@ Read both config values and give the user the full picture:
    regardless of this filter. `BRIDGE_CHANNELS` controls which shared
    channels you subscribe to. Add more later with
    `/bridge:configure channels general,random`.
-8. Check `~/.claude.json` for mcpServers.bridge. If missing, add it:
-   ```json
-   {
-     "mcpServers": {
-       "bridge": {
-         "command": "bun",
-         "args": ["run", "--cwd", "<plugin_root>", "--shell=bun", "--silent", "start"]
-       }
-     }
-   }
+8. Confirm success and print the launch command:
    ```
-9. Confirm success and print the launch command:
+   claude --dangerously-load-development-channels plugin:bridge@bored-marketplace
    ```
-   claude --dangerously-load-development-channels server:bridge
-   ```
+   **Do NOT add a `bridge` entry to `~/.claude.json` mcpServers.**
+   The plugin manages its own MCP server. A manual entry will conflict
+   and break channel notifications.
 
 Handle errors:
 - 404: "Invalid invite code"
