@@ -121,9 +121,39 @@ function wsUrl(): string {
   return `${base}/ws?${params}`;
 }
 
+// Channel name→id map, populated on first connect for name-based filtering
+let channelNameToId: Map<string, string> | null = null;
+
+async function loadChannelMap(): Promise<void> {
+  try {
+    const res = await fetch(`${API_URL}/api/channels`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    if (!res.ok) return;
+    const data = (await res.json()) as any;
+    channelNameToId = new Map();
+    for (const ch of data.channels ?? []) {
+      channelNameToId.set(ch.name, ch.id);
+    }
+  } catch (err) {
+    process.stderr.write(`bridge channel: failed to load channel map: ${err}\n`);
+  }
+}
+
 function shouldDeliverChannel(channelId: string): boolean {
+  // Personal task channel always passes through (it's your inbox)
+  if (agentId && channelId === `${agentId}-tasks`) return true;
+  // No filter set = deliver everything
   if (CHANNELS_FILTER.length === 0) return true;
-  return CHANNELS_FILTER.includes(channelId);
+  // Match by channel ID directly
+  if (CHANNELS_FILTER.includes(channelId)) return true;
+  // Match by channel name (resolved via map)
+  if (channelNameToId) {
+    for (const name of CHANNELS_FILTER) {
+      if (channelNameToId.get(name) === channelId) return true;
+    }
+  }
+  return false;
 }
 
 function connectWs(): void {
@@ -186,6 +216,8 @@ function handleWsMessage(data: any): void {
       process.stderr.write(
         `bridge channel: authenticated as ${agentName} (${agentId})\n`
       );
+      // Load channel name→id map for name-based filtering
+      if (!channelNameToId) loadChannelMap();
       break;
 
     case "message":

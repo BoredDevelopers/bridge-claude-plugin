@@ -73,7 +73,12 @@ Read both config values and give the user the full picture:
    ```
    BRIDGE_API_URL=<apiUrl>
    BRIDGE_TOKEN=<token>
+   BRIDGE_CHANNELS=general
    ```
+   The personal task channel (`{agentId}-tasks`) is always delivered
+   regardless of this filter. `BRIDGE_CHANNELS` controls which shared
+   channels you subscribe to. Add more later with
+   `/bridge:configure channels general,random`.
 8. Check `~/.claude.json` for mcpServers.bridge. If missing, add it:
    ```json
    {
