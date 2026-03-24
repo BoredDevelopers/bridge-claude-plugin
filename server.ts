@@ -107,6 +107,7 @@ let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let agentId = "";
 let agentName = "";
+const seenMessageIds = new Set<string>();
 // In-memory cursor: updated on every inbound message.
 // Seeded from disk on startup, falls back to "now" on first-ever connect.
 let lastMessageTime: string | null = loadCursor();
@@ -116,7 +117,16 @@ function wsUrl(): string {
   const params = new URLSearchParams({ token: TOKEN });
   // Always send a since param. On first-ever connect (no saved cursor),
   // use "now" so the server returns zero replay messages.
-  const since = lastMessageTime ?? new Date().toISOString();
+  // Subtract 1ms from saved cursor to avoid missing messages with the
+  // exact same timestamp (server uses gt, not gte).
+  let since: string;
+  if (lastMessageTime) {
+    const t = new Date(lastMessageTime);
+    t.setMilliseconds(t.getMilliseconds() - 1);
+    since = t.toISOString();
+  } else {
+    since = new Date().toISOString();
+  }
   params.set("since", since);
   return `${base}/ws?${params}`;
 }
@@ -254,6 +264,17 @@ function handleInboundMessage(msg: any): void {
 
   // Don't echo own messages back
   if (msg.agentId === agentId) return;
+
+  // Deduplicate: skip if we already processed this exact message
+  if (msg.id && seenMessageIds.has(msg.id)) return;
+  if (msg.id) {
+    seenMessageIds.add(msg.id);
+    // Cap the set so it doesn't grow forever
+    if (seenMessageIds.size > 500) {
+      const first = seenMessageIds.values().next().value;
+      if (first) seenMessageIds.delete(first);
+    }
+  }
 
   // Track time for replay on reconnect (memory + disk)
   if (msg.createdAt) {
