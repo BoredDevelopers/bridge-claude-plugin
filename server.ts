@@ -26,7 +26,7 @@ import {
   renameSync,
   existsSync,
 } from "fs";
-import { homedir } from "os";
+import { homedir, hostname } from "os";
 import { join } from "path";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -61,6 +61,66 @@ if (!API_URL || !TOKEN) {
       `    BRIDGE_TOKEN=your-agent-token\n`
   );
   process.exit(1);
+}
+
+// ── Session info ────────────────────────────────────────────────────────────
+// Sent with WS auth so the server registers a per-session context (used for
+// context-level message addressing). Repo/branch come from CLAUDE_PROJECT_DIR;
+// the MCP server's own cwd is the plugin install dir, not the user's project.
+
+const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR ?? "";
+
+async function execOut(argv: string[]): Promise<string> {
+  try {
+    const proc = Bun.spawn(argv, {
+      stdout: "pipe",
+      stderr: "ignore",
+      // Explicit PATH: GUI-launched processes may not have homebrew paths
+      env: {
+        ...process.env,
+        PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`,
+      },
+    });
+    return (await new Response(proc.stdout).text()).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function git(args: string[]): Promise<string | null> {
+  if (!PROJECT_DIR) return null;
+  const out = await execOut(["git", "-C", PROJECT_DIR, ...args]);
+  return out || null;
+}
+
+async function collectSessionInfo(): Promise<Record<string, string>> {
+  const info: Record<string, string> = { clientName: "Claude Code" };
+  try {
+    info.hostName = hostname();
+  } catch {}
+  if (PROJECT_DIR) {
+    const worktreeName = PROJECT_DIR.split("/").filter(Boolean).pop() ?? "";
+    const repoRoot = await git(["rev-parse", "--show-toplevel"]);
+    const repoName = repoRoot
+      ? (repoRoot.split("/").filter(Boolean).pop() ?? "")
+      : worktreeName;
+    if (repoName) info.repoName = repoName;
+    if (worktreeName) info.worktreeName = worktreeName;
+    const branchName =
+      (await git(["branch", "--show-current"])) ??
+      (await git(["symbolic-ref", "-q", "--short", "HEAD"]));
+    if (branchName) info.branchName = branchName;
+    const headShortSha = await git(["rev-parse", "--short", "HEAD"]);
+    if (headShortSha) info.headShortSha = headShortSha;
+  }
+  return info;
+}
+
+// Collected once — the session's project doesn't change; reused on reconnects.
+let sessionInfoPromise: Promise<Record<string, string>> | null = null;
+function getSessionInfo(): Promise<Record<string, string>> {
+  if (!sessionInfoPromise) sessionInfoPromise = collectSessionInfo();
+  return sessionInfoPromise;
 }
 
 // ── Cursor persistence ──────────────────────────────────────────────────────
@@ -133,22 +193,22 @@ function flushReplay(trigger: string): void {
 let lastMessageTime: string | null = loadCursor();
 
 function wsUrl(): string {
-  const base = API_URL.replace(/^http/, "ws");
-  const params = new URLSearchParams({ token: TOKEN });
-  // Always send a since param. On first-ever connect (no saved cursor),
+  // Token and since are sent in the first-message auth (not query params) so
+  // sessionInfo can ride along and the server registers a session context.
+  return `${API_URL.replace(/^http/, "ws")}/ws`;
+}
+
+function sinceParam(): string {
+  // Always send a since value. On first-ever connect (no saved cursor),
   // use "now" so the server returns zero replay messages.
   // Subtract 1ms from saved cursor to avoid missing messages with the
   // exact same timestamp (server uses gt, not gte).
-  let since: string;
   if (lastMessageTime) {
     const t = new Date(lastMessageTime);
     t.setMilliseconds(t.getMilliseconds() - 1);
-    since = t.toISOString();
-  } else {
-    since = new Date().toISOString();
+    return t.toISOString();
   }
-  params.set("since", since);
-  return `${base}/ws?${params}`;
+  return new Date().toISOString();
 }
 
 // Channel name→id map, populated on first connect for name-based filtering
@@ -201,10 +261,23 @@ function connectWs(): void {
     return;
   }
 
-  ws.addEventListener("open", () => {
+  const sock = ws;
+  sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;
     reconnectAttempt = 0;
+    try {
+      sock.send(
+        JSON.stringify({
+          type: "auth",
+          token: TOKEN,
+          since: sinceParam(),
+          sessionInfo: await getSessionInfo(),
+        })
+      );
+    } catch (err) {
+      process.stderr.write(`bridge channel: auth send failed: ${err}\n`);
+    }
   });
 
   ws.addEventListener("message", (event) => {
@@ -392,7 +465,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.1.0" },
+  { name: "bridge", version: "0.3.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
