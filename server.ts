@@ -98,6 +98,12 @@ async function collectSessionInfo(): Promise<Record<string, string>> {
   try {
     info.hostName = hostname();
   } catch {}
+  // Stable session key: the server reuses it as the context ID, so reconnects
+  // resume the same context instead of minting a new one
+  const sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? "";
+  if (/^[a-zA-Z0-9_-]{1,64}$/.test(sessionId)) {
+    info.sessionKey = sessionId;
+  }
   if (PROJECT_DIR) {
     const worktreeName = PROJECT_DIR.split("/").filter(Boolean).pop() ?? "";
     const repoRoot = await git(["rev-parse", "--show-toplevel"]);
@@ -167,6 +173,7 @@ let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let agentId = "";
 let agentName = "";
+let myContextId = ""; // this connection's context ID (from the authenticated payload)
 const seenMessageIds = new Set<string>();
 const pendingReplay: any[] = [];
 let replayFlushed = false;
@@ -316,8 +323,11 @@ function handleWsMessage(data: any): void {
     case "authenticated":
       agentId = data.data?.agentId ?? "";
       agentName = data.data?.agentName ?? "";
+      myContextId = data.data?.contextId ?? "";
       process.stderr.write(
-        `bridge channel: authenticated as ${agentName} (${agentId})\n`
+        `bridge channel: authenticated as ${agentName} (${agentId})` +
+          (myContextId ? ` context ${myContextId}` : "") +
+          `\n`
       );
       // Load channel name→id map for name-based filtering
       if (!channelNameToId) loadChannelMap();
@@ -422,6 +432,20 @@ function handleInboundMessage(msg: any): void {
     metadata = msg.metadata;
   }
 
+  // Context targeting: skip messages aimed at another session of this agent.
+  // (Cursor is already saved above, so the skip survives replay on reconnect.)
+  if (
+    metadata.contextId &&
+    metadata.contextAgentId === agentId &&
+    myContextId &&
+    metadata.contextId !== myContextId
+  ) {
+    process.stderr.write(
+      `bridge channel: CONTEXT-FILTERED id=${msg.id} target=${metadata.contextId} (mine=${myContextId})\n`
+    );
+    return;
+  }
+
   mcp
     .notification({
       method: "notifications/claude/channel",
@@ -436,6 +460,12 @@ function handleInboundMessage(msg: any): void {
           ...(msg.parentId ? { thread_id: msg.parentId } : {}),
           ts: msg.createdAt ?? new Date().toISOString(),
           ...(metadata.routedTo ? { routed_to: metadata.routedTo } : {}),
+          ...(metadata.contextId
+            ? {
+                context_id: metadata.contextId,
+                ...(metadata.contextLabel ? { context_label: metadata.contextLabel } : {}),
+              }
+            : {}),
         },
       },
     })
@@ -465,7 +495,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.3.0" },
+  { name: "bridge", version: "0.4.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -474,6 +504,8 @@ const mcp = new Server(
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. Use thread_id to reply in a thread (set to the parent message_id).",
       "",
       "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool fetches recent messages from a specific channel.",
+      "",
+      "Agents can run multiple sessions (contexts). Use list_contexts to see them, and pass context_id to reply to target one specific session — other sessions of that agent won't see the message. Inbound messages targeted at this session carry context_id/context_label in their metadata.",
       "",
       "Message types: text (default), task (work request), question, code, status, response.",
       "",
@@ -513,8 +545,27 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               "Parent message ID for threading. Use message_id from the inbound notification.",
           },
+          context_id: {
+            type: "string",
+            description:
+              "Target a specific session (context) of an agent. Get context IDs from list_contexts or from an inbound message's context_id. Other sessions of that agent will not see the message.",
+          },
         },
         required: ["channel_id", "text"],
+      },
+    },
+    {
+      name: "list_contexts",
+      description:
+        "List active sessions (contexts) of Bridge agents — use the context IDs to target a reply at a specific session. Omit agent_id to list contexts for all agents.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_id: {
+            type: "string",
+            description: "Only list contexts for this agent.",
+          },
+        },
       },
     },
     {
@@ -575,6 +626,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const text = args.text as string;
         const type = (args.type as string) ?? "text";
         const threadId = args.thread_id as string | undefined;
+        const contextId = args.context_id as string | undefined;
 
         const body: Record<string, unknown> = {
           channelId,
@@ -582,6 +634,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           type,
         };
         if (threadId) body.parentId = threadId;
+        if (contextId) body.contextId = contextId;
 
         const res = await apiFetch("/api/messages", {
           method: "POST",
@@ -619,6 +672,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             { type: "text", text: JSON.stringify(channels, null, 2) },
           ],
+        };
+      }
+
+      case "list_contexts": {
+        const filterAgentId = args.agent_id as string | undefined;
+
+        let agentIds: string[];
+        if (filterAgentId) {
+          agentIds = [filterAgentId];
+        } else {
+          const res = await apiFetch("/api/agents");
+          if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
+          const data = (await res.json()) as any;
+          agentIds = (data.agents ?? []).map((a: any) => a.id);
+        }
+
+        const results = await Promise.allSettled(
+          agentIds.map(async (id) => {
+            const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/contexts`);
+            if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
+            const data = (await res.json()) as any;
+            const contexts = (data.contexts ?? [])
+              .filter((c: any) => c.state === "active" || c.state === "idle")
+              .map((c: any) => ({
+                id: c.id,
+                label: c.label,
+                state: c.state,
+                lastHeartbeatAt: c.lastHeartbeatAt,
+              }));
+            return { agentId: id, contexts };
+          })
+        );
+
+        const listing = results
+          .filter((r): r is PromiseFulfilledResult<any> => r.status === "fulfilled")
+          .map((r) => r.value)
+          .filter((entry) => entry.contexts.length > 0);
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(listing, null, 2) }],
         };
       }
 
