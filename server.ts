@@ -70,6 +70,10 @@ if (!API_URL || !TOKEN) {
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR ?? "";
 
+// Stable for the lifetime of this plugin process — used when no
+// CLAUDE_CODE_SESSION_ID is available (e.g. older Claude Code versions)
+const FALLBACK_SESSION_KEY = crypto.randomUUID();
+
 async function execOut(argv: string[]): Promise<string> {
   try {
     const proc = Bun.spawn(argv, {
@@ -99,11 +103,14 @@ async function collectSessionInfo(): Promise<Record<string, string>> {
     info.hostName = hostname();
   } catch {}
   // Stable session key: the server reuses it as the context ID, so reconnects
-  // resume the same context instead of minting a new one
+  // resume the same context instead of minting a new one. Regex must match
+  // the server's SESSION_KEY_REGEX (packages/api/src/ws.ts). Falls back to a
+  // process-lifetime random key so WS reconnects within one plugin process
+  // still resume the same context.
   const sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? "";
-  if (/^[a-zA-Z0-9_-]{1,64}$/.test(sessionId)) {
-    info.sessionKey = sessionId;
-  }
+  info.sessionKey = /^[a-zA-Z0-9_-]{1,64}$/.test(sessionId)
+    ? sessionId
+    : FALLBACK_SESSION_KEY;
   if (PROJECT_DIR) {
     const worktreeName = PROJECT_DIR.split("/").filter(Boolean).pop() ?? "";
     const repoRoot = await git(["rev-parse", "--show-toplevel"]);
@@ -389,8 +396,22 @@ function handleInboundMessage(msg: any): void {
     return;
   }
 
-  // Don't echo own messages back
-  if (msg.agentId === agentId) {
+  // Parse metadata for extra context (needed before the own-message check:
+  // a message from another session of this agent targeted at THIS session
+  // must be delivered, not echo-suppressed)
+  let metadata: Record<string, any> = {};
+  if (typeof msg.metadata === "string") {
+    try {
+      metadata = JSON.parse(msg.metadata);
+    } catch {}
+  } else if (msg.metadata) {
+    metadata = msg.metadata;
+  }
+  const targetsThisSession =
+    !!metadata.contextId && !!myContextId && metadata.contextId === myContextId;
+
+  // Don't echo own messages back — unless targeted at this session
+  if (msg.agentId === agentId && !targetsThisSession) {
     process.stderr.write(
       `bridge channel: SKIPPED own msg id=${msg.id} agent=${msg.agentId}\n`
     );
@@ -421,16 +442,6 @@ function handleInboundMessage(msg: any): void {
 
   const senderName = msg.agentName ?? msg.senderName ?? msg.agentId ?? "unknown";
   const msgType = msg.type ?? "text";
-
-  // Parse metadata for extra context
-  let metadata: Record<string, string> = {};
-  if (typeof msg.metadata === "string") {
-    try {
-      metadata = JSON.parse(msg.metadata);
-    } catch {}
-  } else if (msg.metadata) {
-    metadata = msg.metadata;
-  }
 
   // Context targeting: skip messages aimed at another session of this agent.
   // (Cursor is already saved above, so the skip survives replay on reconnect.)
@@ -706,9 +717,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         );
 
         const listing = results
-          .filter((r): r is PromiseFulfilledResult<any> => r.status === "fulfilled")
-          .map((r) => r.value)
-          .filter((entry) => entry.contexts.length > 0);
+          .map((r, i) =>
+            r.status === "fulfilled"
+              ? r.value
+              : { agentId: agentIds[i], error: "failed to fetch contexts" }
+          )
+          .filter((entry) => entry.error || entry.contexts.length > 0);
 
         return {
           content: [{ type: "text", text: JSON.stringify(listing, null, 2) }],
