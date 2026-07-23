@@ -506,7 +506,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.4.1" },
+  { name: "bridge", version: "0.4.2" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -720,7 +720,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           .map((r, i) =>
             r.status === "fulfilled"
               ? r.value
-              : { agentId: agentIds[i], error: "failed to fetch contexts" }
+              : {
+                  agentId: agentIds[i],
+                  error: `failed to fetch contexts: ${
+                    r.reason instanceof Error ? r.reason.message : String(r.reason)
+                  }`,
+                }
           )
           .filter((entry) => entry.error || entry.contexts.length > 0);
 
