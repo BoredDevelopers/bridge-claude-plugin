@@ -554,14 +554,10 @@ function handleInboundMessage(msg: any): void {
       },
     })
     .then(() => {
-      // Ack only tracked messages (targeted / task / question) — the server
-      // ignores receipts for untracked broadcast chatter by design
-      const trackedForReceipt =
-        !!metadata.contextId ||
-        !!metadata.contextUnavailable ||
-        msgType === "task" ||
-        msgType === "question";
-      if (msg.id && trackedForReceipt) sendReceiptAck(msg.id);
+      // All messages are receipt-tracked (server scope decision 2026-07-23):
+      // ack every message we surface. Older servers silently drop acks for
+      // types they don't track, so this is backward-compatible.
+      if (msg.id) sendReceiptAck(msg.id);
     })
     .catch((err) => {
       process.stderr.write(
@@ -878,8 +874,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ts: m.createdAt,
         }));
 
-        // Attach delivery/seen receipts where they exist (tracked messages
-        // only — the server has no rows for untracked broadcast chatter)
+        // Attach delivery/seen receipts where they exist (all messages are
+        // tracked as of server scope decision 2026-07-23)
         if (messages.length > 0) {
           try {
             const ids = messages.map((m: any) => m.id).filter(Boolean);
