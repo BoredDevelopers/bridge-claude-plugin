@@ -356,6 +356,10 @@ function handleWsMessage(data: any): void {
       agentId = data.data?.agentId ?? "";
       agentName = data.data?.agentName ?? "";
       myContextId = data.data?.contextId ?? "";
+      // Re-arm the replay gate for this connection: without this, replay
+      // frames from mid-session reconnects queue forever and are never
+      // delivered (the flush triggers are one-shot per gate)
+      replayFlushed = false;
       process.stderr.write(
         `bridge channel: authenticated as ${agentName} (${agentId})` +
           (myContextId ? ` context ${myContextId}` : "") +
@@ -381,11 +385,16 @@ function handleWsMessage(data: any): void {
         for (const msg of msgs) {
           pendingReplay.push(msg);
         }
-        // Save cursors immediately so we don't re-fetch on next connect
+        // Save cursors immediately so we don't re-fetch on next connect.
+        // Missed/redelivery frames can be up to 48h old — they must never
+        // move the cursor (and certainly not rewind it); normal frames only
+        // ever advance it (max guard protects the shared cursor file).
         const lastMsg = msgs[msgs.length - 1];
-        if (lastMsg?.createdAt) {
-          lastMessageTime = lastMsg.createdAt;
-          saveCursor(lastMsg.createdAt);
+        if (!data.data.missed && lastMsg?.createdAt) {
+          if (!lastMessageTime || lastMsg.createdAt > lastMessageTime) {
+            lastMessageTime = lastMsg.createdAt;
+            saveCursor(lastMsg.createdAt);
+          }
         }
         // Fallback: deliver after 10s even if no tool call happens
         if (!replayFallbackTimer) {
@@ -874,12 +883,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (messages.length > 0) {
           try {
             const ids = messages.map((m: any) => m.id).filter(Boolean);
-            const rRes = await apiFetch(`/api/messages/receipts?ids=${ids.join(",")}`);
-            if (rRes.ok) {
-              const receiptMap = (((await rRes.json()) as any).receipts ?? {}) as Record<string, any[]>;
-              for (const m of messages) {
-                if (receiptMap[m.id]) (m as any).receipts = receiptMap[m.id];
-              }
+            const receiptMap: Record<string, any[]> = {};
+            // Server caps batch lookups at 100 ids — chunk (limit is 200 msgs)
+            for (let i = 0; i < ids.length; i += 100) {
+              const rRes = await apiFetch(`/api/messages/receipts?ids=${ids.slice(i, i + 100).join(",")}`);
+              if (rRes.ok) Object.assign(receiptMap, ((await rRes.json()) as any).receipts ?? {});
+            }
+            for (const m of messages) {
+              if (receiptMap[m.id]) (m as any).receipts = receiptMap[m.id];
             }
           } catch {}
         }
