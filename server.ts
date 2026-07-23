@@ -388,17 +388,9 @@ function handleWsMessage(data: any): void {
 function handleInboundMessage(msg: any): void {
   if (!msg) return;
 
-  const channelId = msg.channelId ?? "";
-  if (!shouldDeliverChannel(channelId)) {
-    process.stderr.write(
-      `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")})\n`
-    );
-    return;
-  }
-
-  // Parse metadata for extra context (needed before the own-message check:
-  // a message from another session of this agent targeted at THIS session
-  // must be delivered, not echo-suppressed)
+  // Parse metadata first: a message targeted at THIS session bypasses both
+  // the channel filter (it's addressed to us, regardless of subscriptions)
+  // and the own-message echo suppression (session-to-session within one agent)
   let metadata: Record<string, any> = {};
   if (typeof msg.metadata === "string") {
     try {
@@ -409,6 +401,14 @@ function handleInboundMessage(msg: any): void {
   }
   const targetsThisSession =
     !!metadata.contextId && !!myContextId && metadata.contextId === myContextId;
+
+  const channelId = msg.channelId ?? "";
+  if (!shouldDeliverChannel(channelId) && !targetsThisSession) {
+    process.stderr.write(
+      `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")})\n`
+    );
+    return;
+  }
 
   // Don't echo own messages back — unless targeted at this session
   if (msg.agentId === agentId && !targetsThisSession) {
@@ -506,7 +506,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.4.0" },
+  { name: "bridge", version: "0.4.1" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
