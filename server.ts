@@ -186,6 +186,27 @@ const seenMessageIds = new Set<string>();
 // to targeting the session that sent the message (server does the same for
 // thread replies; this covers replies through this tool explicitly)
 const senderContextByMessageId = new Map<string, string>();
+// Messages this session sent (id → type) — used to notify the model when a
+// tracked ask gets its first "seen" receipt
+const sentMessageTypes = new Map<string, string>();
+
+function rememberSentMessage(id: string, type: string): void {
+  sentMessageTypes.set(id, type);
+  if (sentMessageTypes.size > 200) {
+    const first = sentMessageTypes.keys().next().value;
+    if (first) sentMessageTypes.delete(first);
+  }
+}
+
+// Ack that a message was surfaced into this session ("seen" receipt).
+// Sent after the conversation notification dispatches, never before.
+function sendReceiptAck(messageId: string): void {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "receipt", messageId }));
+    }
+  } catch {}
+}
 const pendingReplay: any[] = [];
 let replayFlushed = false;
 let replayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
@@ -379,6 +400,34 @@ function handleWsMessage(data: any): void {
       ws?.send(JSON.stringify({ type: "pong", ts: Date.now() }));
       break;
 
+    case "receipt": {
+      // Notify the model when a tracked ask it sent gets its FIRST "seen" —
+      // the moment "did they get it?" is answered (task/question only)
+      const r = data.data ?? {};
+      const sentType = r.messageId ? sentMessageTypes.get(r.messageId) : undefined;
+      if (
+        r.firstSeen &&
+        r.state === "seen" &&
+        (sentType === "task" || sentType === "question")
+      ) {
+        mcp
+          .notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: `✓✓ Your ${sentType} (${r.messageId}) was seen by ${r.contextLabel || r.contextId} at ${r.at ?? "now"}.`,
+              meta: {
+                type: "receipt",
+                message_id: r.messageId,
+                seen_by_context: r.contextId ?? "",
+                ...(r.contextLabel ? { seen_by_label: r.contextLabel } : {}),
+              },
+            },
+          })
+          .catch(() => {});
+      }
+      break;
+    }
+
     case "presence":
     case "agent_state":
     case "agent_activity":
@@ -495,6 +544,16 @@ function handleInboundMessage(msg: any): void {
         },
       },
     })
+    .then(() => {
+      // Ack only tracked messages (targeted / task / question) — the server
+      // ignores receipts for untracked broadcast chatter by design
+      const trackedForReceipt =
+        !!metadata.contextId ||
+        !!metadata.contextUnavailable ||
+        msgType === "task" ||
+        msgType === "question";
+      if (msg.id && trackedForReceipt) sendReceiptAck(msg.id);
+    })
     .catch((err) => {
       process.stderr.write(
         `bridge channel: failed to deliver inbound to Claude: ${err}\n`
@@ -521,7 +580,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.5.0" },
+  { name: "bridge", version: "0.6.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -687,6 +746,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const result = (await res.json()) as any;
+        if (result.id) rememberSentMessage(result.id, type);
         const targetNote = result.contextFallback
           ? `, target session ${result.requestedContextId} gone — delivered untargeted`
           : result.contextId
@@ -808,6 +868,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           replies: m.replyCount ?? 0,
           ts: m.createdAt,
         }));
+
+        // Attach delivery/seen receipts where they exist (tracked messages
+        // only — the server has no rows for untracked broadcast chatter)
+        if (messages.length > 0) {
+          try {
+            const ids = messages.map((m: any) => m.id).filter(Boolean);
+            const rRes = await apiFetch(`/api/messages/receipts?ids=${ids.join(",")}`);
+            if (rRes.ok) {
+              const receiptMap = (((await rRes.json()) as any).receipts ?? {}) as Record<string, any[]>;
+              for (const m of messages) {
+                if (receiptMap[m.id]) (m as any).receipts = receiptMap[m.id];
+              }
+            }
+          } catch {}
+        }
+
         return {
           content: [
             { type: "text", text: JSON.stringify(messages, null, 2) },
