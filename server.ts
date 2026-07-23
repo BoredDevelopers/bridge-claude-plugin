@@ -182,6 +182,10 @@ let agentId = "";
 let agentName = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
 const seenMessageIds = new Set<string>();
+// Inbound message id → sender's context id, so threaded replies can default
+// to targeting the session that sent the message (server does the same for
+// thread replies; this covers replies through this tool explicitly)
+const senderContextByMessageId = new Map<string, string>();
 const pendingReplay: any[] = [];
 let replayFlushed = false;
 let replayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
@@ -402,6 +406,15 @@ function handleInboundMessage(msg: any): void {
   const targetsThisSession =
     !!metadata.contextId && !!myContextId && metadata.contextId === myContextId;
 
+  // Remember who sent this (by session) for default reply targeting
+  if (msg.id && metadata.senderContextId) {
+    senderContextByMessageId.set(msg.id, metadata.senderContextId);
+    if (senderContextByMessageId.size > 500) {
+      const first = senderContextByMessageId.keys().next().value;
+      if (first) senderContextByMessageId.delete(first);
+    }
+  }
+
   const channelId = msg.channelId ?? "";
   if (!shouldDeliverChannel(channelId) && !targetsThisSession) {
     process.stderr.write(
@@ -478,6 +491,7 @@ function handleInboundMessage(msg: any): void {
               }
             : {}),
           ...(metadata.senderContextId ? { sender_context_id: metadata.senderContextId } : {}),
+          ...(metadata.contextUnavailable ? { context_unavailable: metadata.contextUnavailable } : {}),
         },
       },
     })
@@ -507,7 +521,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.4.3" },
+  { name: "bridge", version: "0.5.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -517,7 +531,7 @@ const mcp = new Server(
       "",
       "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool fetches recent messages from a specific channel.",
       "",
-      "Agents can run multiple sessions (contexts). Use list_contexts to see them, and pass context_id to reply to target one specific session — other sessions of that agent won't see the message. Inbound messages targeted at this session carry context_id/context_label in their metadata; sender_context_id identifies the sender's session — pass it as context_id when replying to route your answer back to exactly that session.",
+      "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
       "Message types: text (default), task (work request), question, code, status, response.",
       "",
@@ -560,7 +574,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           context_id: {
             type: "string",
             description:
-              "Target a specific session (context) of an agent. Get context IDs from list_contexts or from an inbound message's context_id. Other sessions of that agent will not see the message.",
+              "Target a specific session (context) of an agent. Get context IDs from list_contexts or from an inbound message's sender_context_id. Threaded replies target the asking session automatically — pass \"\" (empty string) to force a broadcast reply instead. Other sessions of that agent will not see a targeted message.",
           },
         },
         required: ["channel_id", "text"],
@@ -638,7 +652,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const text = args.text as string;
         const type = (args.type as string) ?? "text";
         const threadId = args.thread_id as string | undefined;
-        const contextId = args.context_id as string | undefined;
+        let contextId = args.context_id as string | undefined;
+
+        // Targeted-by-default replies: "" forces broadcast; otherwise a
+        // threaded reply inherits the target session of the message being
+        // replied to (mirrors the server's thread-reply default)
+        const forceBroadcast = contextId === "";
+        if (forceBroadcast) contextId = undefined;
+        if (!contextId && !forceBroadcast && threadId) {
+          contextId = senderContextByMessageId.get(threadId);
+        }
 
         const body: Record<string, unknown> = {
           channelId,
@@ -647,6 +670,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
         if (threadId) body.parentId = threadId;
         if (contextId) body.contextId = contextId;
+        if (forceBroadcast) body.broadcast = true;
         // Stamp our own context so receivers can target their reply back at
         // this exact session (the server has no per-session sender identity —
         // agent tokens are shared across sessions)
@@ -662,12 +686,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           throw new Error(`Bridge API error ${res.status}: ${err}`);
         }
 
-        const result = await res.json();
+        const result = (await res.json()) as any;
+        const targetNote = result.contextFallback
+          ? `, target session ${result.requestedContextId} gone — delivered untargeted`
+          : result.contextId
+            ? `, targeted: ${result.contextId}`
+            : "";
         return {
           content: [
             {
               type: "text",
-              text: `sent (id: ${(result as any).id}, channel: ${channelId})`,
+              text: `sent (id: ${result.id}, channel: ${channelId}${targetNote})`,
             },
           ],
         };
