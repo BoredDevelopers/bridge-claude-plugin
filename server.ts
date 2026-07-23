@@ -85,9 +85,16 @@ const SESSION_KEY = /^[a-zA-Z0-9_-]{1,64}$/.test(
   ? (process.env.CLAUDE_CODE_SESSION_ID as string)
   : FALLBACK_SESSION_KEY;
 
+// Hard bound on every child process. A `git` invocation can block forever
+// (index.lock contention, a credential helper prompting on a tty, a stale
+// network mount); auth must never wait on it.
+const EXEC_TIMEOUT_MS = 5000;
+
 async function execOut(argv: string[]): Promise<string> {
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   try {
-    const proc = Bun.spawn(argv, {
+    proc = Bun.spawn(argv, {
       stdout: "pipe",
       stderr: "ignore",
       // Explicit PATH: GUI-launched processes may not have homebrew paths
@@ -96,9 +103,34 @@ async function execOut(argv: string[]): Promise<string> {
         PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`,
       },
     });
-    return (await new Response(proc.stdout).text()).trim();
+    // Race the read, not just the process: a child that keeps the pipe open
+    // hangs the read even after it stops making progress.
+    const out = await Promise.race([
+      new Response(proc.stdout).text(),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), EXEC_TIMEOUT_MS);
+      }),
+    ]);
+    if (out === null) {
+      process.stderr.write(
+        `bridge channel: ${argv[0]} timed out after ${EXEC_TIMEOUT_MS}ms, killed\n`
+      );
+      return "";
+    }
+    return out.trim();
   } catch {
     return "";
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (proc) {
+      // Unconditional: a no-op once the child has exited, and the only way a
+      // timed-out child is not left running.
+      try {
+        proc.kill();
+      } catch {}
+      // Reap so the child is not left as a zombie for the process lifetime.
+      proc.exited.catch(() => {});
+    }
   }
 }
 
@@ -108,12 +140,19 @@ async function git(args: string[]): Promise<string | null> {
   return out || null;
 }
 
-async function collectSessionInfo(): Promise<Record<string, string>> {
+// Everything the server needs to register the context. Repo/branch details are
+// enrichment only, so auth can proceed without them.
+function minimalSessionInfo(): Record<string, string> {
   const info: Record<string, string> = { clientName: "Claude Code" };
   try {
     info.hostName = hostname();
   } catch {}
   info.sessionKey = SESSION_KEY;
+  return info;
+}
+
+async function collectSessionInfo(): Promise<Record<string, string>> {
+  const info = minimalSessionInfo();
   if (PROJECT_DIR) {
     const worktreeName = PROJECT_DIR.split("/").filter(Boolean).pop() ?? "";
     const repoRoot = await git(["rev-parse", "--show-toplevel"]);
@@ -133,10 +172,41 @@ async function collectSessionInfo(): Promise<Record<string, string>> {
 }
 
 // Collected once — the session's project doesn't change; reused on reconnects.
+// Only a *successful* collection is memoized: caching a stuck or failed promise
+// would make every later reconnect await the same dead promise, and auth is
+// gated on this, so the plugin would stay dead for the rest of the session.
+const SESSION_INFO_TIMEOUT_MS = 8000;
 let sessionInfoPromise: Promise<Record<string, string>> | null = null;
+
 function getSessionInfo(): Promise<Record<string, string>> {
-  if (!sessionInfoPromise) sessionInfoPromise = collectSessionInfo();
+  if (!sessionInfoPromise) {
+    const p = collectSessionInfo().catch((err) => {
+      if (sessionInfoPromise === p) sessionInfoPromise = null;
+      throw err;
+    });
+    sessionInfoPromise = p;
+  }
   return sessionInfoPromise;
+}
+
+// Auth payload must always be sendable: on timeout or failure, fall back to the
+// minimal info and drop the memo so the next connect re-collects.
+async function getSessionInfoForAuth(): Promise<Record<string, string>> {
+  const p = getSessionInfo();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const info = await Promise.race([
+    p.catch(() => null),
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), SESSION_INFO_TIMEOUT_MS);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (info) return info;
+  if (sessionInfoPromise === p) sessionInfoPromise = null;
+  process.stderr.write(
+    `bridge channel: session info unavailable (timeout/failure) — authenticating with minimal info\n`
+  );
+  return minimalSessionInfo();
 }
 
 // ── Cursor persistence ──────────────────────────────────────────────────────
@@ -204,20 +274,63 @@ const LIVENESS_TIMEOUT_MS = 90000;
 let agentId = "";
 let agentName = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
-const seenMessageIds = new Set<string>();
+let authenticated = false;
+let lastServerError = ""; // most recent server error frame, surfaced to tools
+let notifiedServerError = "";
+let notifiedServerErrorAt = 0;
+const SERVER_ERROR_NOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+const loggedUnknownFrameTypes = new Set<string>();
+
+// Dedupe of surfaced messages. Time-based, not a small FIFO: a replay larger
+// than the bound would evict its own earliest ids and re-deliver (and re-ack)
+// them. The count cap is only a memory backstop.
+const seenMessageIds = new Map<string, number>(); // id → first seen (ms)
+const SEEN_TTL_MS = 24 * 60 * 60 * 1000; // server redelivers up to 48h; 24h covers a session
+const SEEN_MAX = 10000;
+
+function markSeen(id: string): void {
+  seenMessageIds.set(id, Date.now());
+  // Insertion order is time order, so the oldest entries are at the front.
+  const cutoff = Date.now() - SEEN_TTL_MS;
+  for (const [k, at] of seenMessageIds) {
+    if (at >= cutoff && seenMessageIds.size <= SEEN_MAX) break;
+    seenMessageIds.delete(k);
+  }
+}
+
 // Inbound message id → sender's context id, so threaded replies can default
 // to targeting the session that sent the message (server does the same for
 // thread replies; this covers replies through this tool explicitly)
 const senderContextByMessageId = new Map<string, string>();
-// Messages this session sent (id → type) — used to notify the model when a
-// tracked ask gets its first "seen" receipt
-const sentMessageTypes = new Map<string, string>();
+// Asks this session sent (id → type + send time) — used to notify the model
+// when one gets its first "seen" receipt. Only receipt-notified types are
+// tracked: keeping chatter here would evict pending asks.
+const sentAsks = new Map<string, { type: string; at: number }>();
+const SENT_ASK_TTL_MS = 24 * 60 * 60 * 1000;
+const SENT_ASK_MAX = 1000;
+
+// Every id this session sent. An echo of our own message must never be
+// surfaced (or acked) as inbound, not even when it comes back targeted at us.
+const ownSentIds = new Set<string>();
+const OWN_SENT_MAX = 1000;
+
+function rememberOwnSend(id: string): void {
+  ownSentIds.add(id);
+  if (ownSentIds.size > OWN_SENT_MAX) {
+    const first = ownSentIds.values().next().value;
+    if (first) ownSentIds.delete(first);
+  }
+}
 
 function rememberSentMessage(id: string, type: string): void {
-  sentMessageTypes.set(id, type);
-  if (sentMessageTypes.size > 200) {
-    const first = sentMessageTypes.keys().next().value;
-    if (first) sentMessageTypes.delete(first);
+  if (type !== "task" && type !== "question") return;
+  sentAsks.set(id, { type, at: Date.now() });
+  // Age-first eviction: an unanswered ask must not be pushed out just because
+  // the session sent a burst of newer messages.
+  const cutoff = Date.now() - SENT_ASK_TTL_MS;
+  for (const [k, v] of sentAsks) {
+    if (v.at >= cutoff && sentAsks.size <= SENT_ASK_MAX) break;
+    sentAsks.delete(k);
   }
 }
 
@@ -277,37 +390,75 @@ function sinceParam(): string {
 
 // Channel name→id map, populated on first connect for name-based filtering
 let channelNameToId: Map<string, string> | null = null;
+let channelMapPromise: Promise<void> | null = null;
+let channelMapAttemptedAt = 0;
+// Refresh floor: a channel id the map can never resolve (e.g. not visible to
+// this token) must not trigger one request per inbound message. Kept short —
+// messages from a channel created after the last load are dropped until the
+// map can be refreshed.
+const CHANNEL_MAP_MIN_REFRESH_MS = 5000;
 
 async function loadChannelMap(): Promise<void> {
+  channelMapAttemptedAt = Date.now();
   try {
-    const res = await fetch(`${API_URL}/api/channels`, {
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
+    const res = await apiFetch("/api/channels");
     if (!res.ok) return;
     const data = (await res.json()) as any;
-    channelNameToId = new Map();
+    const next = new Map<string, string>();
     for (const ch of data.channels ?? []) {
-      channelNameToId.set(ch.name, ch.id);
+      if (ch?.name && ch?.id) next.set(String(ch.name), String(ch.id));
     }
+    // Only a non-empty result replaces the map. Assigning an empty map would
+    // latch: every name-based filter would reject forever, and the map is
+    // non-null so nothing would ever retry.
+    if (next.size === 0) {
+      process.stderr.write(
+        `bridge channel: channel map response had no channels — keeping previous map\n`
+      );
+      return;
+    }
+    channelNameToId = next;
   } catch (err) {
     process.stderr.write(`bridge channel: failed to load channel map: ${err}\n`);
   }
 }
 
-function shouldDeliverChannel(channelId: string): boolean {
-  // Personal task channel always passes through (it's your inbox)
-  if (agentId && channelId === `${agentId}-tasks`) return true;
-  // No filter set = deliver everything
-  if (CHANNELS_FILTER.length === 0) return true;
-  // Match by channel ID directly
-  if (CHANNELS_FILTER.includes(channelId)) return true;
-  // Match by channel name (resolved via map)
-  if (channelNameToId) {
-    for (const name of CHANNELS_FILTER) {
-      if (channelNameToId.get(name) === channelId) return true;
-    }
+// Single in-flight load, rate-limited. Resolves once the map is as fresh as
+// it is going to get.
+function ensureChannelMap(): Promise<void> {
+  if (channelMapPromise) return channelMapPromise;
+  if (Date.now() - channelMapAttemptedAt < CHANNEL_MAP_MIN_REFRESH_MS) {
+    return Promise.resolve();
   }
-  return false;
+  const p = loadChannelMap().finally(() => {
+    if (channelMapPromise === p) channelMapPromise = null;
+  });
+  channelMapPromise = p;
+  return p;
+}
+
+// "unknown" = the name filter can't be evaluated yet (map not loaded, or the
+// channel post-dates it). Callers must refresh and re-ask rather than drop.
+type ChannelDecision = "deliver" | "drop" | "unknown";
+
+function channelDecision(channelId: string): ChannelDecision {
+  // Personal task channel always passes through (it's your inbox)
+  if (agentId && channelId === `${agentId}-tasks`) return "deliver";
+  // No filter set = deliver everything
+  if (CHANNELS_FILTER.length === 0) return "deliver";
+  // Match by channel ID directly
+  if (CHANNELS_FILTER.includes(channelId)) return "deliver";
+  // Match by channel name (resolved via map)
+  if (!channelNameToId) return "unknown";
+  let known = false;
+  for (const [name, id] of channelNameToId) {
+    if (id !== channelId) continue;
+    known = true;
+    if (CHANNELS_FILTER.includes(name)) return "deliver";
+  }
+  // A channel the map has never heard of was likely created after the map was
+  // built — resolve it before dropping.
+  return known ? "drop" : "unknown";
 }
 
 function connectWs(): void {
@@ -333,14 +484,17 @@ function connectWs(): void {
   sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;
-    reconnectAttempt = 0;
+    // reconnectAttempt is NOT reset here: the handshake succeeding proves
+    // nothing. A server that accepts the socket and then rejects auth (revoked
+    // token) would reset the backoff on every attempt and spin at ~1s forever.
+    // It resets in the "authenticated" frame instead.
     try {
       sock.send(
         JSON.stringify({
           type: "auth",
           token: TOKEN,
           since: sinceParam(),
-          sessionInfo: await getSessionInfo(),
+          sessionInfo: await getSessionInfoForAuth(),
         })
       );
     } catch (err) {
@@ -354,10 +508,22 @@ function connectWs(): void {
 
   sock.addEventListener("message", (event) => {
     lastInboundAt = Date.now();
+    let data: any;
     try {
-      const data = JSON.parse(String(event.data));
+      data = JSON.parse(String(event.data));
+    } catch (err) {
+      process.stderr.write(`bridge channel: dropped unparseable frame: ${err}\n`);
+      return;
+    }
+    // Separate catch: a bug in the inbound path must be visible, not
+    // indistinguishable from a malformed frame.
+    try {
       handleWsMessage(data);
-    } catch {}
+    } catch (err) {
+      process.stderr.write(
+        `bridge channel: inbound handler failed (type=${data?.type}): ${err}\n`
+      );
+    }
   });
 
   sock.addEventListener("close", () => {
@@ -368,6 +534,7 @@ function connectWs(): void {
       livenessTimer = null;
     }
     wsConnected = false;
+    authenticated = false;
     process.stderr.write(`bridge channel: WebSocket closed\n`);
     scheduleReconnect();
   });
@@ -391,6 +558,7 @@ function connectWs(): void {
     if (ws === sock) {
       ws = null;
       wsConnected = false;
+      authenticated = false;
       scheduleReconnect();
     }
   }, 30000);
@@ -410,12 +578,37 @@ function scheduleReconnect(): void {
   }, delay);
 }
 
+// Live connection state, for tools to report. Written state that nothing reads
+// is not observability: without this, a deaf socket looks identical to silence.
+function connectionState(): string {
+  if (wsConnected && authenticated) return "connected";
+  if (wsConnected) return "connected, not authenticated";
+  if (reconnectTimer) return `disconnected (reconnect attempt ${reconnectAttempt})`;
+  return "disconnected";
+}
+
+function connectionStatus(): Record<string, unknown> {
+  return {
+    websocket: connectionState(),
+    receiving_messages: wsConnected && authenticated,
+    agent: agentName || agentId || null,
+    context_id: myContextId || null,
+    channel_filter: CHANNELS_FILTER.length > 0 ? CHANNELS_FILTER : "all",
+    ...(lastServerError ? { last_server_error: lastServerError } : {}),
+  };
+}
+
 function handleWsMessage(data: any): void {
   switch (data.type) {
     case "authenticated":
       agentId = data.data?.agentId ?? "";
       agentName = data.data?.agentName ?? "";
       myContextId = data.data?.contextId ?? "";
+      authenticated = true;
+      lastServerError = "";
+      // Backoff resets only here — a completed auth round-trip is the only
+      // proof the connection is actually usable.
+      reconnectAttempt = 0;
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
       // delivered (the flush triggers are one-shot per gate)
@@ -425,8 +618,11 @@ function handleWsMessage(data: any): void {
           (myContextId ? ` context ${myContextId}` : "") +
           `\n`
       );
-      // Load channel name→id map for name-based filtering
-      if (!channelNameToId) loadChannelMap();
+      // Load channel name→id map for name-based filtering. Only needed when a
+      // filter is configured; inbound delivery awaits this when it must.
+      if (CHANNELS_FILTER.length > 0) {
+        ensureChannelMap().catch(() => {});
+      }
       break;
 
     case "message":
@@ -477,12 +673,13 @@ function handleWsMessage(data: any): void {
       // Notify the model when a tracked ask it sent gets its FIRST "seen" —
       // the moment "did they get it?" is answered (task/question only)
       const r = data.data ?? {};
-      const sentType = r.messageId ? sentMessageTypes.get(r.messageId) : undefined;
-      if (
-        r.firstSeen &&
-        r.state === "seen" &&
-        (sentType === "task" || sentType === "question")
-      ) {
+      const sent = r.messageId ? sentAsks.get(r.messageId) : undefined;
+      if (sent && r.firstSeen && r.state === "seen") {
+        const sentType = sent.type;
+        // Client-side dedupe: the server's firstSeen is per-context and a
+        // receipt can be replayed after a reconnect. Dropping the entry before
+        // dispatch means one notification per ask, ever.
+        sentAsks.delete(r.messageId);
         mcp
           .notification({
             method: "notifications/claude/channel",
@@ -501,6 +698,41 @@ function handleWsMessage(data: any): void {
       break;
     }
 
+    case "error": {
+      // A server error frame is usually a rejected auth (bad or revoked
+      // token). Silently dropping it produced a plugin that looked healthy,
+      // delivered nothing, and only confessed when a tool call returned 401.
+      // Frame shape varies by server version — take the first string-ish field
+      // and fall back to the whole frame rather than printing [object Object].
+      const detail = [data.error, data.message, data.data?.message, data.data?.error].find(
+        (v) => typeof v === "string" && v
+      );
+      lastServerError = detail ?? JSON.stringify(data).slice(0, 500);
+      process.stderr.write(`bridge channel: server error: ${lastServerError}\n`);
+      // Notify once per distinct error per window: a rejected token repeats on
+      // every reconnect, and the state stays visible via list_channels anyway.
+      const now = Date.now();
+      if (
+        lastServerError !== notifiedServerError ||
+        now - notifiedServerErrorAt > SERVER_ERROR_NOTIFY_INTERVAL_MS
+      ) {
+        notifiedServerError = lastServerError;
+        notifiedServerErrorAt = now;
+        mcp
+          .notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: `⚠️ Bridge server error: ${lastServerError}${
+                authenticated ? "" : " (not authenticated — check BRIDGE_TOKEN in ~/.claude/channels/bridge/.env)"
+              }`,
+              meta: { type: "error", sender: "bridge" },
+            },
+          })
+          .catch(() => {});
+      }
+      break;
+    }
+
     case "presence":
     case "agent_state":
     case "agent_activity":
@@ -508,6 +740,18 @@ function handleWsMessage(data: any): void {
     case "task_update":
       // Silently consume non-message events
       break;
+
+    default: {
+      // Unknown frame types are logged, never dropped on the floor: a new
+      // server-side frame going unhandled must be diagnosable from stderr.
+      // Once per type — a high-frequency frame must not flood the log.
+      const t = String(data?.type);
+      if (!loggedUnknownFrameTypes.has(t)) {
+        loggedUnknownFrameTypes.add(t);
+        process.stderr.write(`bridge channel: unhandled frame type: ${t}\n`);
+      }
+      break;
+    }
   }
 }
 
@@ -544,14 +788,7 @@ function handleInboundMessage(msg: any): void {
     );
     return;
   }
-  if (msg.id) {
-    seenMessageIds.add(msg.id);
-    // Cap the set so it doesn't grow forever
-    if (seenMessageIds.size > 500) {
-      const first = seenMessageIds.values().next().value;
-      if (first) seenMessageIds.delete(first);
-    }
-  }
+  if (msg.id) markSeen(msg.id);
 
   // Track time for replay on reconnect (memory + disk). Advance only, never
   // rewind: redelivered "missed" frames can be up to 48h old. Before the
@@ -562,12 +799,50 @@ function handleInboundMessage(msg: any): void {
     saveCursor(msg.createdAt);
   }
 
-  const channelId = msg.channelId ?? "";
-  if (!shouldDeliverChannel(channelId) && !targetsThisSession) {
+  // Our own send coming back. Checked before the targeting bypass below: the
+  // model can hand this session's own context_id to `reply`, and a targeted
+  // message is exempt from the agent-level echo suppression — so without this
+  // the session would surface and ack its own outbound message as inbound.
+  if (
+    (myContextId && metadata.senderContextId === myContextId) ||
+    (msg.id && ownSentIds.has(msg.id))
+  ) {
     process.stderr.write(
-      `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")})\n`
+      `bridge channel: SKIPPED own send id=${msg.id}\n`
     );
     return;
+  }
+
+  routeInbound(msg, metadata, targetsThisSession, false);
+}
+
+// Split from the dedupe/cursor path above so channel-name resolution can await
+// a map refresh without a second copy of the same message racing past dedupe.
+// `resolved` marks the one retry after a refresh.
+function routeInbound(
+  msg: any,
+  metadata: Record<string, any>,
+  targetsThisSession: boolean,
+  resolved: boolean
+): void {
+  const channelId = msg.channelId ?? "";
+  if (!targetsThisSession) {
+    const decision = channelDecision(channelId);
+    if (decision === "unknown" && !resolved) {
+      // Undecidable, not a rejection: the map is still loading (live messages
+      // used to be dropped in this window) or the channel post-dates it.
+      ensureChannelMap()
+        .then(() => routeInbound(msg, metadata, targetsThisSession, true))
+        .catch(() => {});
+      return;
+    }
+    if (decision !== "deliver") {
+      process.stderr.write(
+        `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")}` +
+          `${decision === "unknown" ? ", channel name unresolved" : ""})\n`
+      );
+      return;
+    }
   }
 
   // Don't echo own messages back — unless targeted at this session
@@ -635,24 +910,45 @@ function handleInboundMessage(msg: any): void {
 
 // ── HTTP helpers ────────────────────────────────────────────────────────────
 
+// Every outbound request is bounded. A host that accepts TCP but never answers
+// (wedged process, black-holing firewall) would otherwise hang the tool call —
+// and with it the model's whole turn — forever.
+const HTTP_TIMEOUT_MS = 20000;
+
 async function apiFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
-  return fetch(`${API_URL}${path}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${TOKEN}`,
-      "Content-Type": "application/json",
-      ...(opts.headers ?? {}),
-    },
-  });
+  try {
+    return await fetch(`${API_URL}${path}`, {
+      ...opts,
+      signal: opts.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": "application/json",
+        ...(opts.headers ?? {}),
+      },
+    });
+  } catch (err) {
+    // Distinguish "Bridge is unreachable/hung" from an HTTP-level failure, so
+    // the model reports something actionable instead of a bare fetch error.
+    const name = (err as any)?.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new Error(
+        `Bridge API timed out after ${HTTP_TIMEOUT_MS / 1000}s (${path}) — server unreachable or not responding`
+      );
+    }
+    throw new Error(
+      `Bridge API request failed (${path}): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
+// Version must stay in lockstep with .claude-plugin/plugin.json and package.json
 const mcp = new Server(
-  { name: "bridge", version: "0.7.0" },
+  { name: "bridge", version: "0.8.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -728,7 +1024,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_channels",
       description:
-        "List available Bridge channels with unread message counts.",
+        "List available Bridge channels with unread message counts, plus this session's Bridge connection state (use it to check whether inbound messages are actually being received).",
       inputSchema: {
         type: "object",
         properties: {},
@@ -793,6 +1089,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!contextId && !forceBroadcast && threadId) {
           contextId = senderContextByMessageId.get(threadId);
         }
+        // Self-targeting is a loop: a message targeted at this session bypasses
+        // own-message echo suppression, so it would come back as inbound.
+        let selfTargetNote = "";
+        if (contextId && myContextId && contextId === myContextId) {
+          contextId = undefined;
+          selfTargetNote =
+            ", self-targeting dropped (context_id was this session's own)";
+        }
 
         const body: Record<string, unknown> = {
           channelId,
@@ -818,17 +1122,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const result = (await res.json()) as any;
-        if (result.id) rememberSentMessage(result.id, type);
+        if (result.id) {
+          rememberOwnSend(result.id);
+          rememberSentMessage(result.id, type);
+        }
         const targetNote = result.contextFallback
           ? `, target session ${result.requestedContextId} gone — delivered untargeted`
           : result.contextId
             ? `, targeted: ${result.contextId}`
             : "";
+        // A send that lands while the socket is deaf gets no inbound reply:
+        // say so rather than let the model wait on silence.
+        const linkNote = wsConnected && authenticated
+          ? ""
+          : `\nwarning: Bridge WebSocket is ${connectionState()} — replies may not reach this session until it reconnects`;
         return {
           content: [
             {
               type: "text",
-              text: `sent (id: ${result.id}, channel: ${channelId}${targetNote})`,
+              text: `sent (id: ${result.id}, channel: ${channelId}${targetNote}${selfTargetNote})${linkNote}`,
             },
           ],
         };
@@ -845,9 +1157,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           unread: ch.unreadCount ?? 0,
           archived: ch.archived ?? false,
         }));
+        // Connection state rides along here: the HTTP API answering says
+        // nothing about the WebSocket, and a plugin that is silently deaf to
+        // inbound messages is otherwise undiagnosable from inside a session.
         return {
           content: [
-            { type: "text", text: JSON.stringify(channels, null, 2) },
+            {
+              type: "text",
+              text: JSON.stringify(
+                { connection: connectionStatus(), channels },
+                null,
+                2
+              ),
+            },
           ],
         };
       }
