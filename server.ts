@@ -772,8 +772,15 @@ function handleInboundMessage(msg: any): void {
   const targetsThisSession =
     !!metadata.contextId && !!myContextId && metadata.contextId === myContextId;
 
-  // Remember who sent this (by session) for default reply targeting
-  if (msg.id && metadata.senderContextId) {
+  // Remember who sent this (by session) for default reply targeting.
+  // Never record our OWN session. This map answers "whose session asked me, so
+  // I can reply back to them" — the answer is never ourselves. Cursor replay
+  // has no sender filter, so the server replays a session its own messages on
+  // reconnect, and this write happens BEFORE the own-message skip below.
+  // Without this guard every reconnect recorded our own context against our
+  // own message ids, and every later reply in those threads then targeted
+  // ourselves — a message for which no receipt can ever be recorded.
+  if (msg.id && metadata.senderContextId && metadata.senderContextId !== myContextId) {
     senderContextByMessageId.set(msg.id, metadata.senderContextId);
     if (senderContextByMessageId.size > 500) {
       const first = senderContextByMessageId.keys().next().value;
@@ -948,7 +955,7 @@ async function apiFetch(
 
 // Version must stay in lockstep with .claude-plugin/plugin.json and package.json
 const mcp = new Server(
-  { name: "bridge", version: "0.8.0" },
+  { name: "bridge", version: "0.8.1" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -1109,7 +1116,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // Stamp our own context so receivers can target their reply back at
         // this exact session (the server has no per-session sender identity —
         // agent tokens are shared across sessions)
-        if (myContextId) body.metadata = { senderContextId: myContextId };
+        // Top-level field, not metadata: this is protocol data the server
+        // validates against our own contexts. Older servers ignore the field,
+        // so also send the metadata form they understand.
+        if (myContextId) {
+          body.senderContextId = myContextId;
+          body.metadata = { senderContextId: myContextId };
+        }
 
         const res = await apiFetch("/api/messages", {
           method: "POST",
