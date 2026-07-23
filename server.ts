@@ -74,6 +74,17 @@ const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR ?? "";
 // CLAUDE_CODE_SESSION_ID is available (e.g. older Claude Code versions)
 const FALLBACK_SESSION_KEY = crypto.randomUUID();
 
+// Stable session key: the server reuses it as the context ID, so reconnects
+// resume the same context instead of minting a new one. Regex must match the
+// server's SESSION_KEY_REGEX (packages/api/src/ws.ts). Falls back to a
+// process-lifetime random key so WS reconnects within one plugin process
+// still resume the same context. Also keys the on-disk cursor.
+const SESSION_KEY = /^[a-zA-Z0-9_-]{1,64}$/.test(
+  process.env.CLAUDE_CODE_SESSION_ID ?? ""
+)
+  ? (process.env.CLAUDE_CODE_SESSION_ID as string)
+  : FALLBACK_SESSION_KEY;
+
 async function execOut(argv: string[]): Promise<string> {
   try {
     const proc = Bun.spawn(argv, {
@@ -102,15 +113,7 @@ async function collectSessionInfo(): Promise<Record<string, string>> {
   try {
     info.hostName = hostname();
   } catch {}
-  // Stable session key: the server reuses it as the context ID, so reconnects
-  // resume the same context instead of minting a new one. Regex must match
-  // the server's SESSION_KEY_REGEX (packages/api/src/ws.ts). Falls back to a
-  // process-lifetime random key so WS reconnects within one plugin process
-  // still resume the same context.
-  const sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? "";
-  info.sessionKey = /^[a-zA-Z0-9_-]{1,64}$/.test(sessionId)
-    ? sessionId
-    : FALLBACK_SESSION_KEY;
+  info.sessionKey = SESSION_KEY;
   if (PROJECT_DIR) {
     const worktreeName = PROJECT_DIR.split("/").filter(Boolean).pop() ?? "";
     const repoRoot = await git(["rev-parse", "--show-toplevel"]);
@@ -141,21 +144,36 @@ function getSessionInfo(): Promise<Record<string, string>> {
 // what was missed. On first-ever connect (no saved cursor), default to "now"
 // so the client doesn't get flooded with the full message history.
 
-const CURSOR_FILE = join(STATE_DIR, ".last_seen");
+// Keyed by session: STATE_DIR is machine-global, so a shared cursor would let
+// concurrent sessions overwrite each other's position and replay (and ack)
+// each other's messages.
+const CURSOR_FILE = join(
+  STATE_DIR,
+  `.last_seen-${SESSION_KEY.replace(/[^a-zA-Z0-9_-]/g, "_")}`
+);
+const LEGACY_CURSOR_FILE = join(STATE_DIR, ".last_seen");
 
-function loadCursor(): string | null {
+function readCursorFile(path: string): string | null {
   try {
-    const raw = readFileSync(CURSOR_FILE, "utf8").trim();
+    const raw = readFileSync(path, "utf8").trim();
     // Validate it looks like an ISO timestamp
     if (raw && !isNaN(Date.parse(raw))) return raw;
   } catch {}
   return null;
 }
 
+function loadCursor(): string | null {
+  // Fall back to the pre-per-session cursor once, so upgrading doesn't
+  // re-request the whole backlog
+  return readCursorFile(CURSOR_FILE) ?? readCursorFile(LEGACY_CURSOR_FILE);
+}
+
 function saveCursor(ts: string): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-    const tmp = CURSOR_FILE + ".tmp";
+    // pid in the tmp name: concurrent writers must not clobber each other's
+    // staged file before rename
+    const tmp = `${CURSOR_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, ts + "\n", { mode: 0o600 });
     renameSync(tmp, CURSOR_FILE);
   } catch (err) {
@@ -178,6 +196,11 @@ let ws: WebSocket | null = null;
 let wsConnected = false;
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Liveness watchdog for the current socket. The server pings every 30s, so a
+// healthy socket is never silent this long; a half-open one (laptop sleep,
+// NAT/tunnel timeout) is silent forever and never fires `close`.
+let livenessTimer: ReturnType<typeof setInterval> | null = null;
+const LIVENESS_TIMEOUT_MS = 90000;
 let agentId = "";
 let agentName = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
@@ -212,12 +235,14 @@ let replayFlushed = false;
 let replayFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
 function flushReplay(trigger: string): void {
-  if (replayFlushed) return;
-  replayFlushed = true;
+  // Clear before the gate check: leaving a dead handle here would block the
+  // `if (!replayFallbackTimer)` re-arm forever
   if (replayFallbackTimer) {
     clearTimeout(replayFallbackTimer);
     replayFallbackTimer = null;
   }
+  if (replayFlushed) return;
+  replayFlushed = true;
   if (pendingReplay.length === 0) return;
   process.stderr.write(
     `bridge channel: flushing ${pendingReplay.length} replay messages (trigger: ${trigger})\n`
@@ -286,6 +311,10 @@ function shouldDeliverChannel(channelId: string): boolean {
 }
 
 function connectWs(): void {
+  if (livenessTimer) {
+    clearInterval(livenessTimer);
+    livenessTimer = null;
+  }
   if (ws) {
     try {
       ws.close();
@@ -319,22 +348,53 @@ function connectWs(): void {
     }
   });
 
-  ws.addEventListener("message", (event) => {
+  // Per-socket, not a module global: a zombie socket must not be able to keep
+  // refreshing the liveness clock of the socket that replaced it.
+  let lastInboundAt = Date.now();
+
+  sock.addEventListener("message", (event) => {
+    lastInboundAt = Date.now();
     try {
       const data = JSON.parse(String(event.data));
       handleWsMessage(data);
     } catch {}
   });
 
-  ws.addEventListener("close", () => {
+  sock.addEventListener("close", () => {
+    // Ignore a late close from a socket we already replaced or gave up on
+    if (ws !== sock) return;
+    if (livenessTimer) {
+      clearInterval(livenessTimer);
+      livenessTimer = null;
+    }
     wsConnected = false;
     process.stderr.write(`bridge channel: WebSocket closed\n`);
     scheduleReconnect();
   });
 
-  ws.addEventListener("error", (err) => {
+  sock.addEventListener("error", (err) => {
     process.stderr.write(`bridge channel: WebSocket error: ${err}\n`);
   });
+
+  const liveness = setInterval(() => {
+    if (Date.now() - lastInboundAt < LIVENESS_TIMEOUT_MS) return;
+    clearInterval(liveness);
+    if (livenessTimer === liveness) livenessTimer = null;
+    process.stderr.write(
+      `bridge channel: no inbound frame for ${LIVENESS_TIMEOUT_MS / 1000}s — forcing reconnect\n`
+    );
+    try {
+      sock.close();
+    } catch {}
+    // A half-open socket may never emit `close`, so drive the reconnect here.
+    // Detaching ws makes the close handler above a no-op if it does fire.
+    if (ws === sock) {
+      ws = null;
+      wsConnected = false;
+      scheduleReconnect();
+    }
+  }, 30000);
+  livenessTimer = liveness;
 }
 
 function scheduleReconnect(): void {
@@ -376,25 +436,29 @@ function handleWsMessage(data: any): void {
     case "replay":
       if (Array.isArray(data.data?.messages) && data.data.messages.length > 0) {
         const msgs = data.data.messages;
+        // The gate exists only to hold notifications until the MCP client is
+        // ready. Once it's open (mid-session redelivery sweeps), queueing
+        // would strand these frames — deliver straight through.
+        if (replayFlushed) {
+          process.stderr.write(
+            `bridge channel: replay received ${msgs.length} messages, delivering now\n`
+          );
+          for (const msg of msgs) {
+            handleInboundMessage(msg);
+          }
+          break;
+        }
         process.stderr.write(
           `bridge channel: replay received ${msgs.length} messages, queuing for delivery\n`
         );
         // Queue replay messages. They'll be delivered either:
         // 1. When the first tool call succeeds (proves session is ready), or
         // 2. After a generous timeout as fallback
+        // The cursor is NOT advanced here: it must only move on delivery,
+        // otherwise a crash before flush loses these messages for good (disk
+        // says consumed, so the server never resends them).
         for (const msg of msgs) {
           pendingReplay.push(msg);
-        }
-        // Save cursors immediately so we don't re-fetch on next connect.
-        // Missed/redelivery frames can be up to 48h old — they must never
-        // move the cursor (and certainly not rewind it); normal frames only
-        // ever advance it (max guard protects the shared cursor file).
-        const lastMsg = msgs[msgs.length - 1];
-        if (!data.data.missed && lastMsg?.createdAt) {
-          if (!lastMessageTime || lastMsg.createdAt > lastMessageTime) {
-            lastMessageTime = lastMsg.createdAt;
-            saveCursor(lastMsg.createdAt);
-          }
         }
         // Fallback: deliver after 10s even if no tool call happens
         if (!replayFallbackTimer) {
@@ -473,22 +537,6 @@ function handleInboundMessage(msg: any): void {
     }
   }
 
-  const channelId = msg.channelId ?? "";
-  if (!shouldDeliverChannel(channelId) && !targetsThisSession) {
-    process.stderr.write(
-      `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")})\n`
-    );
-    return;
-  }
-
-  // Don't echo own messages back — unless targeted at this session
-  if (msg.agentId === agentId && !targetsThisSession) {
-    process.stderr.write(
-      `bridge channel: SKIPPED own msg id=${msg.id} agent=${msg.agentId}\n`
-    );
-    return;
-  }
-
   // Deduplicate: skip if we already processed this exact message
   if (msg.id && seenMessageIds.has(msg.id)) {
     process.stderr.write(
@@ -505,10 +553,29 @@ function handleInboundMessage(msg: any): void {
     }
   }
 
-  // Track time for replay on reconnect (memory + disk)
-  if (msg.createdAt) {
+  // Track time for replay on reconnect (memory + disk). Advance only, never
+  // rewind: redelivered "missed" frames can be up to 48h old. Before the
+  // filters below, so a session with a channel filter still advances instead
+  // of re-requesting an ever-growing backlog on every reconnect.
+  if (msg.createdAt && (!lastMessageTime || msg.createdAt > lastMessageTime)) {
     lastMessageTime = msg.createdAt;
     saveCursor(msg.createdAt);
+  }
+
+  const channelId = msg.channelId ?? "";
+  if (!shouldDeliverChannel(channelId) && !targetsThisSession) {
+    process.stderr.write(
+      `bridge channel: FILTERED ch=${channelId} (filter=${CHANNELS_FILTER.join(",")})\n`
+    );
+    return;
+  }
+
+  // Don't echo own messages back — unless targeted at this session
+  if (msg.agentId === agentId && !targetsThisSession) {
+    process.stderr.write(
+      `bridge channel: SKIPPED own msg id=${msg.id} agent=${msg.agentId}\n`
+    );
+    return;
   }
 
   const senderName = msg.agentName ?? msg.senderName ?? msg.agentId ?? "unknown";
@@ -585,7 +652,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.6.0" },
+  { name: "bridge", version: "0.7.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -929,6 +996,7 @@ function shutdown(): void {
   shuttingDown = true;
   process.stderr.write("bridge channel: shutting down\n");
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (livenessTimer) clearInterval(livenessTimer);
   try {
     ws?.close();
   } catch {}
