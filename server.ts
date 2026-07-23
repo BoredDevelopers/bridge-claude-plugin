@@ -25,16 +25,24 @@ import {
   chmodSync,
   renameSync,
   existsSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
 } from "fs";
 import { homedir, hostname } from "os";
 import { join } from "path";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const STATE_DIR =
-  process.env.BRIDGE_STATE_DIR ??
-  join(homedir(), ".claude", "channels", "bridge");
+const DEFAULT_STATE_DIR = join(homedir(), ".claude", "channels", "bridge");
+const STATE_DIR = process.env.BRIDGE_STATE_DIR ?? DEFAULT_STATE_DIR;
 const ENV_FILE = join(STATE_DIR, ".env");
+
+// Captured from the *real* environment, before the .env load below folds
+// ENV_FILE into process.env. ENV_FILE is machine-global: a single
+// BRIDGE_SESSION_KEY line in it would silently collapse every session on this
+// box into one shared Bridge context. Only a per-process env var may override.
+const SESSION_KEY_OVERRIDE = (process.env.BRIDGE_SESSION_KEY ?? "").trim();
 
 // Load .env (real env wins)
 try {
@@ -70,20 +78,136 @@ if (!API_URL || !TOKEN) {
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR ?? "";
 
-// Stable for the lifetime of this plugin process — used when no
-// CLAUDE_CODE_SESSION_ID is available (e.g. older Claude Code versions)
+// Stable for the lifetime of this plugin process — used when no session id is
+// available at all (e.g. older Claude Code versions)
 const FALLBACK_SESSION_KEY = crypto.randomUUID();
 
-// Stable session key: the server reuses it as the context ID, so reconnects
-// resume the same context instead of minting a new one. Regex must match the
-// server's SESSION_KEY_REGEX (packages/api/src/ws.ts). Falls back to a
-// process-lifetime random key so WS reconnects within one plugin process
-// still resume the same context. Also keys the on-disk cursor.
-const SESSION_KEY = /^[a-zA-Z0-9_-]{1,64}$/.test(
-  process.env.CLAUDE_CODE_SESSION_ID ?? ""
-)
-  ? (process.env.CLAUDE_CODE_SESSION_ID as string)
-  : FALLBACK_SESSION_KEY;
+// Session key: the Bridge server reuses it as the context ID, so anything that
+// changes it mints a new context and orphans messages targeted at the old one.
+// Regex must match the server's SESSION_KEY_REGEX (packages/api/src/ws.ts).
+// Also keys the on-disk cursor.
+//
+// This process's CLAUDE_CODE_SESSION_ID is per *launch*: it changes on every
+// `claude --continue`, so using it alone means a resumed conversation silently
+// loses its context. The plugin's SessionStart hook (hooks/session-map.ts) runs
+// where CLAUDE_CODE_SESSION_ID is the *stable* conversation id and publishes it
+// under the one identifier both processes share: CLAUDE_CODE_SSE_PORT.
+//
+// Not process.ppid, and not CLAUDE_PID. .mcp.json runs `bun run … start`, and
+// that script is `bun install && bun server.ts` — the `&&` forces a spawn, so a
+// wrapper process always sits between Claude Code and this one:
+//   claude (CLAUDE_PID) → bun run … start → bun server.ts   ← us
+// process.ppid is the wrapper, never Claude's pid, and this process's
+// environment has no CLAUDE_PID at all — only CLAUDE_CODE_SSE_PORT, which the
+// hook also sees.
+const SESSION_KEY_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+
+// The correlation key, on both sides. Numeric-only, so it can never escape the
+// mapping directory. Ports are reused across sessions — see readSessionMapping.
+const SESSION_MAP_KEY = (process.env.CLAUDE_CODE_SSE_PORT ?? "").trim();
+
+// Both directories the hook could have chosen, most specific first: the hook
+// may not inherit CLAUDE_PLUGIN_DATA even though this process does, and a
+// mapping written where nothing looks for it is a mapping that doesn't exist.
+// Must stay in step with MAP_DIR in hooks/session-map.ts.
+const SESSION_MAP_DIRS = [
+  ...(process.env.CLAUDE_PLUGIN_DATA ? [process.env.CLAUDE_PLUGIN_DATA] : []),
+  DEFAULT_STATE_DIR,
+].map((dir) => join(dir, "sessions"));
+
+// The hook and this process are started concurrently in unspecified order, so
+// a missing mapping is not yet an answer. Bounded hard: a plugin that waits on
+// a hook that isn't installed must still come up.
+const SESSION_MAP_WAIT_MS = 3000;
+const SESSION_MAP_POLL_MS = 100;
+
+function pidAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but belongs to someone else — alive.
+    return (err as any)?.code === "EPERM";
+  }
+}
+
+function readSessionMapping(key: string): string | null {
+  for (const dir of SESSION_MAP_DIRS) {
+    let raw: string;
+    try {
+      raw = readFileSync(join(dir, `${key}.json`), "utf8");
+    } catch {
+      continue;
+    }
+    try {
+      const m = JSON.parse(raw) as Record<string, unknown>;
+      const id = typeof m.sessionId === "string" ? m.sessionId : "";
+      if (!SESSION_KEY_REGEX.test(id)) continue;
+      // SSE ports are reused. A session that was SIGKILLed never ran its
+      // SessionEnd hook, so its mapping outlives it — and a later session that
+      // binds the same port would adopt the dead conversation's id, putting two
+      // conversations in one Bridge context. That is worse than having no
+      // stable identity, so the recorded pid must be there AND still alive; a
+      // mapping without one cannot be validated and is refused outright.
+      if (!pidAlive(m.claudePid)) continue;
+      // Deliberately no freshness window on updatedAt: Claude Code restarts a
+      // crashed MCP server (so does /mcp reconnect), and a window anchored to
+      // this process's start would fail every conversation older than it and
+      // silently drop back to a per-launch identity. Liveness above, the
+      // SessionEnd unlink and the hook's sweeper are the freshness guarantees.
+      return id;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+// `/clear` is a known and accepted divergence: it fires SessionEnd (the hook
+// unlinks the mapping) then SessionStart (the hook writes the new conversation
+// id under the same port) WITHOUT restarting this process, so from then on the
+// file names a conversation this process is not using. Left as-is on purpose —
+// re-keying a live WS connection would mint a second context and strand
+// messages already targeted at the first — and it is self-healing: the mapping
+// on disk is the current conversation's, so the next MCP server start (restart,
+// /mcp reconnect, next launch) picks up the right one.
+async function resolveSessionKey(): Promise<{ key: string; source: string }> {
+  // An explicit operator override wins over anything discovered. Read from the
+  // real environment only (see SESSION_KEY_OVERRIDE).
+  if (SESSION_KEY_REGEX.test(SESSION_KEY_OVERRIDE)) {
+    return { key: SESSION_KEY_OVERRIDE, source: "BRIDGE_SESSION_KEY override" };
+  }
+
+  // The hook and this process start concurrently in unspecified order, so a
+  // missing mapping is not yet an answer — but only wait when there is a key to
+  // wait on. Without an SSE port no mapping can ever be found, and burning 3s
+  // on a lookup that cannot succeed just delays the first connect.
+  if (/^[0-9]+$/.test(SESSION_MAP_KEY)) {
+    const deadline = Date.now() + SESSION_MAP_WAIT_MS;
+    for (;;) {
+      const id = readSessionMapping(SESSION_MAP_KEY);
+      if (id) {
+        return { key: id, source: `session map (sse port ${SESSION_MAP_KEY})` };
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, SESSION_MAP_POLL_MS));
+    }
+  }
+
+  // No hook (older plugin install, hooks disabled), no SSE port, or a mapping
+  // that failed validation: the per-launch id still keeps one context for the
+  // life of this launch, which is exactly the pre-0.9.0 behaviour.
+  const launchId = process.env.CLAUDE_CODE_SESSION_ID ?? "";
+  if (SESSION_KEY_REGEX.test(launchId)) {
+    return { key: launchId, source: "CLAUDE_CODE_SESSION_ID (per-launch)" };
+  }
+  return { key: FALLBACK_SESSION_KEY, source: "random (no session id available)" };
+}
+
+// Settled by the startup path below, before the first auth frame is sent and
+// before the cursor path is derived — both are keyed by it.
+let SESSION_KEY = FALLBACK_SESSION_KEY;
 
 // Hard bound on every child process. A `git` invocation can block forever
 // (index.lock contention, a credential helper prompting on a tty, a stale
@@ -216,12 +340,33 @@ async function getSessionInfoForAuth(): Promise<Record<string, string>> {
 
 // Keyed by session: STATE_DIR is machine-global, so a shared cursor would let
 // concurrent sessions overwrite each other's position and replay (and ack)
-// each other's messages.
-const CURSOR_FILE = join(
-  STATE_DIR,
-  `.last_seen-${SESSION_KEY.replace(/[^a-zA-Z0-9_-]/g, "_")}`
-);
-const LEGACY_CURSOR_FILE = join(STATE_DIR, ".last_seen");
+// each other's messages. Assigned once the session key is settled — with a
+// mapping the key is per *conversation*, so the cursor survives a restart too.
+function cursorFileFor(key: string): string {
+  return join(STATE_DIR, `.last_seen-${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+}
+let CURSOR_FILE = cursorFileFor(SESSION_KEY);
+
+// Cursor files are keyed by session key, and a stable key makes them long-lived
+// — nothing else prunes them. Swept on the same terms as the hook's sessions/
+// directory: opportunistic, age-based, never this launch's own file. Losing an
+// idle cursor costs nothing: a missing cursor starts at "now", and the replay
+// clamp in sinceParam() caps the window at an hour anyway.
+const CURSOR_SWEEP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function sweepCursors(): void {
+  try {
+    const cutoff = Date.now() - CURSOR_SWEEP_MAX_AGE_MS;
+    for (const name of readdirSync(STATE_DIR)) {
+      if (!name.startsWith(".last_seen-")) continue;
+      const path = join(STATE_DIR, name);
+      if (path === CURSOR_FILE) continue;
+      try {
+        if (statSync(path).mtimeMs < cutoff) unlinkSync(path);
+      } catch {}
+    }
+  } catch {}
+}
 
 function readCursorFile(path: string): string | null {
   try {
@@ -233,9 +378,12 @@ function readCursorFile(path: string): string | null {
 }
 
 function loadCursor(): string | null {
-  // Fall back to the pre-per-session cursor once, so upgrading doesn't
-  // re-request the whole backlog
-  return readCursorFile(CURSOR_FILE) ?? readCursorFile(LEGACY_CURSOR_FILE);
+  // No fallback to the legacy shared `.last_seen`. Nothing above 0.7.0 writes
+  // it, so on an up-to-date machine it is frozen at whatever instant the last
+  // old build ran — and every newly keyed session would replay, and ack, the
+  // entire backlog from that instant. No cursor means "start at now", which is
+  // the safe first-run behaviour.
+  return readCursorFile(CURSOR_FILE);
 }
 
 function saveCursor(ts: string): void {
@@ -366,8 +514,10 @@ function flushReplay(trigger: string): void {
   pendingReplay.length = 0;
 }
 // In-memory cursor: updated on every inbound message.
-// Seeded from disk on startup, falls back to "now" on first-ever connect.
-let lastMessageTime: string | null = loadCursor();
+// Seeded from disk by the startup path (the cursor file is named after the
+// session key, so it cannot be read until that is settled), falls back to
+// "now" on first-ever connect.
+let lastMessageTime: string | null = null;
 
 function wsUrl(): string {
   // Token and since are sent in the first-message auth (not query params) so
@@ -375,17 +525,26 @@ function wsUrl(): string {
   return `${API_URL.replace(/^http/, "ws")}/ws`;
 }
 
+// With a stable session key the cursor now survives the gap between launches,
+// so `since` can legitimately point at last week — where a per-launch key
+// always collapsed it to "now". Cap the replay window so a long absence cannot
+// dump an unbounded backlog into the conversation (every replayed message is
+// surfaced and acked).
+const MAX_REPLAY_AGE_MS = 60 * 60 * 1000;
+
 function sinceParam(): string {
   // Always send a since value. On first-ever connect (no saved cursor),
   // use "now" so the server returns zero replay messages.
   // Subtract 1ms from saved cursor to avoid missing messages with the
   // exact same timestamp (server uses gt, not gte).
+  const now = Date.now();
   if (lastMessageTime) {
-    const t = new Date(lastMessageTime);
-    t.setMilliseconds(t.getMilliseconds() - 1);
-    return t.toISOString();
+    const t = new Date(lastMessageTime).getTime() - 1;
+    if (Number.isFinite(t)) {
+      return new Date(Math.max(t, now - MAX_REPLAY_AGE_MS)).toISOString();
+    }
   }
-  return new Date().toISOString();
+  return new Date(now).toISOString();
 }
 
 // Channel name→id map, populated on first connect for name-based filtering
@@ -955,7 +1114,7 @@ async function apiFetch(
 
 // Version must stay in lockstep with .claude-plugin/plugin.json and package.json
 const mcp = new Server(
-  { name: "bridge", version: "0.8.1" },
+  { name: "bridge", version: "0.9.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -1321,10 +1480,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 await mcp.connect(new StdioServerTransport());
 
-// Connect to Bridge WebSocket
-connectWs();
-
-// Clean shutdown when Claude Code closes the MCP connection
+// Clean shutdown when Claude Code closes the MCP connection. Registered before
+// the session-key wait below: a stdin close during that window would otherwise
+// have no listener and leave this process orphaned.
 let shuttingDown = false;
 function shutdown(): void {
   if (shuttingDown) return;
@@ -1341,3 +1499,20 @@ process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
+
+// Settle the session key before anything that is keyed by it: the auth frame
+// carries it (the Bridge server reuses it as the context ID) and the cursor
+// file is named after it. Deliberately after mcp.connect, so tools stay
+// answerable while this waits on the hook.
+const resolvedSessionKey = await resolveSessionKey();
+SESSION_KEY = resolvedSessionKey.key;
+CURSOR_FILE = cursorFileFor(SESSION_KEY);
+lastMessageTime = loadCursor();
+sweepCursors();
+// The one line someone debugging a lost context will need.
+process.stderr.write(
+  `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
+);
+
+// Connect to Bridge WebSocket
+if (!shuttingDown) connectWs();

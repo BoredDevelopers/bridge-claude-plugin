@@ -1,0 +1,27 @@
+{
+  "description": "Publishes the stable conversation id so the Bridge MCP server keeps one context across --continue/--resume",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v bun >/dev/null 2>&1 || exit 0; exec bun \"${CLAUDE_PLUGIN_ROOT}/hooks/session-map.ts\" start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v bun >/dev/null 2>&1 || exit 0; exec bun \"${CLAUDE_PLUGIN_ROOT}/hooks/session-map.ts\" end",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
