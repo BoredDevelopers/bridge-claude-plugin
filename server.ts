@@ -477,6 +477,7 @@ function handleInboundMessage(msg: any): void {
                 ...(metadata.contextLabel ? { context_label: metadata.contextLabel } : {}),
               }
             : {}),
+          ...(metadata.senderContextId ? { sender_context_id: metadata.senderContextId } : {}),
         },
       },
     })
@@ -506,7 +507,7 @@ async function apiFetch(
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: "bridge", version: "0.4.2" },
+  { name: "bridge", version: "0.4.3" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -516,7 +517,7 @@ const mcp = new Server(
       "",
       "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool fetches recent messages from a specific channel.",
       "",
-      "Agents can run multiple sessions (contexts). Use list_contexts to see them, and pass context_id to reply to target one specific session — other sessions of that agent won't see the message. Inbound messages targeted at this session carry context_id/context_label in their metadata.",
+      "Agents can run multiple sessions (contexts). Use list_contexts to see them, and pass context_id to reply to target one specific session — other sessions of that agent won't see the message. Inbound messages targeted at this session carry context_id/context_label in their metadata; sender_context_id identifies the sender's session — pass it as context_id when replying to route your answer back to exactly that session.",
       "",
       "Message types: text (default), task (work request), question, code, status, response.",
       "",
@@ -646,6 +647,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
         if (threadId) body.parentId = threadId;
         if (contextId) body.contextId = contextId;
+        // Stamp our own context so receivers can target their reply back at
+        // this exact session (the server has no per-session sender identity —
+        // agent tokens are shared across sessions)
+        if (myContextId) body.metadata = { senderContextId: myContextId };
 
         const res = await apiFetch("/api/messages", {
           method: "POST",
