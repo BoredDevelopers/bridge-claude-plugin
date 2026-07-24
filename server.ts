@@ -1114,7 +1114,7 @@ async function apiFetch(
 
 // Version must stay in lockstep with .claude-plugin/plugin.json and package.json
 const mcp = new Server(
-  { name: "bridge", version: "0.9.0" },
+  { name: "bridge", version: "0.10.0" },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -1227,6 +1227,65 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["channel_id"],
+      },
+    },
+    {
+      name: "claim_task",
+      description:
+        "Claim a task assigned to you (or an open, unassigned task) so you can drive it. Address a task by the message id of the task-typed message. Fails with 409 if another agent already owns it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message_id: { type: "string", description: "The task message id." },
+        },
+        required: ["message_id"],
+      },
+    },
+    {
+      name: "update_task_status",
+      description:
+        "Report progress on a task you are the assignee of. Legal transitions: submitted→working, working→(input_required|auth_required|completed|failed|canceled), input_required/auth_required→working. A repeat of the current state with a `message` is a heartbeat. `failed` is terminal (a retry is a new task).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message_id: { type: "string", description: "The task message id." },
+          state: {
+            type: "string",
+            enum: [
+              "submitted", "working", "input_required", "auth_required",
+              "completed", "failed", "canceled", "rejected",
+            ],
+            description: "The new task state (A2A vocabulary).",
+          },
+          message: { type: "string", description: "Optional human-readable progress note." },
+          artifacts: { type: "array", description: "Optional output artifacts (stored on completion/failure)." },
+        },
+        required: ["message_id", "state"],
+      },
+    },
+    {
+      name: "cancel_task",
+      description:
+        "Cancel a task you created or are assigned to (force → canceled). Idempotent — re-canceling a canceled task succeeds. Already-completed/failed/rejected tasks cannot be canceled (400).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message_id: { type: "string", description: "The task message id." },
+          reason: { type: "string", description: "Optional cancellation reason." },
+        },
+        required: ["message_id"],
+      },
+    },
+    {
+      name: "list_my_tasks",
+      description:
+        "List tasks assigned to you, optionally filtered by state. Use this to discover work you were directed to do.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          status: { type: "string", description: "Optional state filter (e.g. 'submitted', 'working')." },
+        },
+        required: [],
       },
     },
   ],
@@ -1457,6 +1516,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             { type: "text", text: JSON.stringify(messages, null, 2) },
           ],
         };
+      }
+
+      case "claim_task": {
+        const res = await apiFetch(`/api/tasks/${args.message_id as string}/claim`, { method: "POST" });
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+
+      case "update_task_status": {
+        const body: Record<string, unknown> = { status: args.state as string };
+        if (args.message !== undefined) body.message = args.message;
+        if (args.artifacts !== undefined) body.result = { artifacts: args.artifacts };
+        const res = await apiFetch(`/api/tasks/${args.message_id as string}/status`, {
+          method: "PUT",
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+
+      case "cancel_task": {
+        const res = await apiFetch(`/api/tasks/${args.message_id as string}/cancel`, {
+          method: "POST",
+          body: JSON.stringify(args.reason ? { reason: args.reason } : {}),
+        });
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+
+      case "list_my_tasks": {
+        // The plugin can't know its own agent id before WS auth; the server
+        // resolves the `me` sentinel to the token's agent (RFC-004 §3).
+        const params = new URLSearchParams({ assignee: "me" });
+        if (args.status) params.set("status", args.status as string);
+        const res = await apiFetch(`/api/tasks?${params}`);
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
       }
 
       default:
