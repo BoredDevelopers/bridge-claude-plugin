@@ -211,7 +211,10 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 
 // Settled by the startup path below, before the first auth frame is sent and
 // before the cursor path is derived — both are keyed by it.
-let SESSION_KEY = FALLBACK_SESSION_KEY;
+// Annotated `string`, not inferred: `crypto.randomUUID()` returns the template
+// literal type `${string}-${string}-…`, which a resolved session key (a repo
+// slug, an env override) does not satisfy.
+let SESSION_KEY: string = FALLBACK_SESSION_KEY;
 
 // Hard bound on every child process. A `git` invocation can block forever
 // (index.lock contention, a credential helper prompting on a tty, a stale
@@ -234,7 +237,9 @@ async function execOut(argv: string[]): Promise<string> {
     // Race the read, not just the process: a child that keeps the pipe open
     // hangs the read even after it stops making progress.
     const out = await Promise.race([
-      new Response(proc.stdout).text(),
+      // `stdout: "pipe"` above guarantees a stream; Bun types it as a union
+      // because the shape depends on the spawn options.
+      new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
       new Promise<null>((resolve) => {
         timer = setTimeout(() => resolve(null), EXEC_TIMEOUT_MS);
       }),
@@ -442,6 +447,38 @@ let notifiedServerError = "";
 let notifiedServerErrorAt = 0;
 const SERVER_ERROR_NOTIFY_INTERVAL_MS = 5 * 60 * 1000;
 const loggedUnknownFrameTypes = new Set<string>();
+
+/**
+ * Inbound-path failures, surfaced to the MODEL rather than only to stderr.
+ *
+ * A crash in the inbound handler means messages are being dropped, which is
+ * indistinguishable from "nobody is talking" — the exact ambiguity that hid a
+ * total delivery outage in 0.11.0. Rate-limited because a systematic bug throws
+ * on every frame, and a notification storm is its own outage.
+ */
+let inboundFailureCount = 0;
+let notifiedInboundFailureAt = 0;
+const INBOUND_FAILURE_NOTIFY_INTERVAL_MS = 60 * 1000;
+
+function notifyInboundFailure(frameType: unknown, err: unknown): void {
+  inboundFailureCount++;
+  const now = Date.now();
+  if (notifiedInboundFailureAt && now - notifiedInboundFailureAt < INBOUND_FAILURE_NOTIFY_INTERVAL_MS) return;
+  notifiedInboundFailureAt = now;
+  const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  mcp
+    .notification({
+      method: "notifications/claude/channel",
+      params: {
+        content:
+          `⚠️ Bridge INBOUND DELIVERY IS FAILING — ${inboundFailureCount} message(s) dropped so far ` +
+          `(frame type: ${String(frameType ?? "unknown")}). ${detail}. ` +
+          `Messages sent to this session are NOT arriving. This is a client bug, not a quiet channel.`,
+        meta: { type: "error", sender: "bridge", dropped: inboundFailureCount },
+      },
+    })
+    .catch(() => {});
+}
 
 // Dedupe of surfaced messages. Time-based, not a small FIFO: a replay larger
 // than the bound would evict its own earliest ids and re-deliver (and re-ack)
@@ -698,12 +735,19 @@ function connectWs(): void {
     }
     // Separate catch: a bug in the inbound path must be visible, not
     // indistinguishable from a malformed frame.
+    //
+    // "Visible" used to mean stderr only — which the MCP host discards unless
+    // the process dies. So 0.11.0 threw `ReferenceError: senderContextId is not
+    // defined` on EVERY inbound message, delivered nothing for hours, and looked
+    // exactly like a quiet channel. Silence is the one failure mode a messaging
+    // client must never have: tell the model, not just the log.
     try {
       handleWsMessage(data);
     } catch (err) {
       process.stderr.write(
         `bridge channel: inbound handler failed (type=${data?.type}): ${err}\n`
       );
+      notifyInboundFailure(data?.type, err);
     }
   });
 
@@ -1059,7 +1103,7 @@ function handleInboundMessage(msg: any): void {
     return;
   }
 
-  routeInbound(msg, metadata, targetsThisSession, false);
+  routeInbound(msg, metadata, targetsThisSession, senderContextId, false);
 }
 
 // Split from the dedupe/cursor path above so channel-name resolution can await
@@ -1069,6 +1113,15 @@ function routeInbound(
   msg: any,
   metadata: Record<string, any>,
   targetsThisSession: boolean,
+  /**
+   * Which SESSION wrote this, already normalised by the caller (sentinels
+   * mapped to ""). Passed explicitly rather than read from an outer scope:
+   * it is computed in handleInboundMessage, and referencing it here without
+   * a parameter threw `ReferenceError: senderContextId is not defined` on
+   * EVERY inbound message — silently, because the caller wraps this in a
+   * try/catch whose log goes to stderr, which the MCP host discards.
+   */
+  senderContextId: string,
   resolved: boolean
 ): void {
   const channelId = msg.channelId ?? "";
@@ -1078,7 +1131,7 @@ function routeInbound(
       // Undecidable, not a rejection: the map is still loading (live messages
       // used to be dropped in this window) or the channel post-dates it.
       ensureChannelMap()
-        .then(() => routeInbound(msg, metadata, targetsThisSession, true))
+        .then(() => routeInbound(msg, metadata, targetsThisSession, senderContextId, true))
         .catch(() => {});
       return;
     }
@@ -1536,7 +1589,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                   }`,
                 }
           )
-          .filter((entry) => entry.error || entry.contexts.length > 0);
+          // `in` rather than property access: the two arms are a discriminated
+          // union, and reading `.contexts` off the error arm was only legal
+          // because nothing typechecked this file.
+          .filter((entry) => ("error" in entry ? true : entry.contexts.length > 0));
 
         return {
           content: [{ type: "text", text: JSON.stringify(listing, null, 2) }],
