@@ -14,6 +14,10 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import pkg from "./package.json" with { type: "json" };
+
+/** Single source of truth for the version reported over MCP. */
+const PLUGIN_VERSION: string = pkg.version;
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
@@ -422,6 +426,16 @@ const LIVENESS_TIMEOUT_MS = 90000;
 let agentId = "";
 let agentName = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
+/**
+ * This session's SEND credential, from the `authenticated` frame.
+ *
+ * The agent token proves which AGENT we are; every session of this agent holds
+ * the same one. This proves which SESSION, so the server can record who wrote a
+ * message rather than trusting a field we fill in ourselves.
+ *
+ * Held in memory only — it is minted per context and dies with it. Never logged.
+ */
+let mySendToken = "";
 let authenticated = false;
 let lastServerError = ""; // most recent server error frame, surfaced to tools
 let notifiedServerError = "";
@@ -654,6 +668,14 @@ function connectWs(): void {
           token: TOKEN,
           since: sinceParam(),
           sessionInfo: await getSessionInfoForAuth(),
+          // Re-present our credential to prove we are the SAME session
+          // reconnecting, not a sibling claiming this session key. Under
+          // BRIDGE_CONTEXT_CLAIM_MODE=enforce a claim on a live context without
+          // it is refused and we are renamed to a connection id — we keep
+          // working, but lose our stable identity until the old row expires.
+          // Empty on a first connect, which is correct: there is nothing to
+          // prove yet. The server never requires it to authenticate.
+          ...(mySendToken ? { sendToken: mySendToken } : {}),
         })
       );
     } catch (err) {
@@ -762,7 +784,29 @@ function handleWsMessage(data: any): void {
     case "authenticated":
       agentId = data.data?.agentId ?? "";
       agentName = data.data?.agentName ?? "";
-      myContextId = data.data?.contextId ?? "";
+      {
+        const newContextId = data.data?.contextId ?? "";
+        // A DIFFERENT context id means this is not our old session resumed —
+        // the server renamed us (our claim was refused, or the key collided),
+        // so the credential we were holding belongs to a context that is no
+        // longer ours. Keeping it would attach our sends to somebody else's
+        // session id, which is the exact confusion this mechanism exists to
+        // remove. Drop it and take whatever this frame issues.
+        if (myContextId && newContextId && newContextId !== myContextId) {
+          process.stderr.write(
+            `bridge channel: context changed ${myContextId} -> ${newContextId}, dropping stale credential\n`
+          );
+          mySendToken = "";
+        }
+        myContextId = newContextId;
+      }
+      // Present only when the server just MINTED it — an existing context's
+      // credential is never re-disclosed, so a reconnect that PROVED ownership
+      // of a live context may legitimately get nothing back and must keep the
+      // one it holds. Hence the guard: never overwrite a good token with "".
+      if (typeof data.data?.sendToken === "string" && data.data.sendToken) {
+        mySendToken = data.data.sendToken;
+      }
       authenticated = true;
       lastServerError = "";
       // Backoff resets only here — a completed auth round-trip is the only
@@ -900,6 +944,26 @@ function handleWsMessage(data: any): void {
       // Silently consume non-message events
       break;
 
+    case "context_rebound": {
+      // The server recreated our context row (it had vanished — GC sweep, or a
+      // restart) and minted a fresh credential. Take it, or every subsequent
+      // send fails with a token that no longer resolves: a silent, delayed
+      // break that reads like an unrelated auth bug.
+      if (typeof data.data?.sendToken === "string" && data.data.sendToken) {
+        // Keep the id in step with the credential. They are one identity; a
+        // rebound that moved the id while we kept the old one would leave us
+        // targeting replies at a context we no longer are.
+        if (typeof data.data?.contextId === "string" && data.data.contextId) {
+          myContextId = data.data.contextId;
+        }
+        mySendToken = data.data.sendToken;
+        process.stderr.write(
+          `bridge channel: context ${data.data?.contextId ?? myContextId} rebound, credential refreshed\n`
+        );
+      }
+      break;
+    }
+
     default: {
       // Unknown frame types are logged, never dropped on the floor: a new
       // server-side frame going unhandled must be diagnosable from stderr.
@@ -931,6 +995,22 @@ function handleInboundMessage(msg: any): void {
   const targetsThisSession =
     !!metadata.contextId && !!myContextId && metadata.contextId === myContextId;
 
+  /**
+   * Which SESSION wrote this — a top-level field now that the server derives it
+   * from a credential rather than trusting a claim in the blob. The metadata
+   * form is read as a fallback so this build still works against a server that
+   * predates the column.
+   *
+   * The `unattributed_` sentinels are values, not addresses: they mean "we could
+   * not attribute this". Replying to one would target a session that does not
+   * exist, so they are treated as absent.
+   */
+  const rawSender: unknown = msg.senderContextId ?? metadata.senderContextId;
+  const senderContextId =
+    typeof rawSender === "string" && rawSender && !rawSender.startsWith("unattributed_")
+      ? rawSender
+      : "";
+
   // Remember who sent this (by session) for default reply targeting.
   // Never record our OWN session. This map answers "whose session asked me, so
   // I can reply back to them" — the answer is never ourselves. Cursor replay
@@ -939,8 +1019,8 @@ function handleInboundMessage(msg: any): void {
   // Without this guard every reconnect recorded our own context against our
   // own message ids, and every later reply in those threads then targeted
   // ourselves — a message for which no receipt can ever be recorded.
-  if (msg.id && metadata.senderContextId && metadata.senderContextId !== myContextId) {
-    senderContextByMessageId.set(msg.id, metadata.senderContextId);
+  if (msg.id && senderContextId && senderContextId !== myContextId) {
+    senderContextByMessageId.set(msg.id, senderContextId);
     if (senderContextByMessageId.size > 500) {
       const first = senderContextByMessageId.keys().next().value;
       if (first) senderContextByMessageId.delete(first);
@@ -970,7 +1050,7 @@ function handleInboundMessage(msg: any): void {
   // message is exempt from the agent-level echo suppression — so without this
   // the session would surface and ack its own outbound message as inbound.
   if (
-    (myContextId && metadata.senderContextId === myContextId) ||
+    (myContextId && senderContextId === myContextId) ||
     (msg.id && ownSentIds.has(msg.id))
   ) {
     process.stderr.write(
@@ -1056,7 +1136,7 @@ function routeInbound(
                 ...(metadata.contextLabel ? { context_label: metadata.contextLabel } : {}),
               }
             : {}),
-          ...(metadata.senderContextId ? { sender_context_id: metadata.senderContextId } : {}),
+          ...(senderContextId ? { sender_context_id: senderContextId } : {}),
           ...(metadata.contextUnavailable ? { context_unavailable: metadata.contextUnavailable } : {}),
         },
       },
@@ -1092,6 +1172,12 @@ async function apiFetch(
       headers: {
         Authorization: `Bearer ${TOKEN}`,
         "Content-Type": "application/json",
+        // Which SESSION is calling. The bearer token above is shared by every
+        // session of this agent and so cannot answer that; this can. Sent on
+        // every request rather than only on sends, so any future write endpoint
+        // is attributable without another round of client changes. Servers that
+        // predate it ignore an unknown header.
+        ...(mySendToken ? { "X-Bridge-Context": mySendToken } : {}),
         ...(opts.headers ?? {}),
       },
     });
@@ -1112,9 +1198,13 @@ async function apiFetch(
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
-// Version must stay in lockstep with .claude-plugin/plugin.json and package.json
+// Read from package.json rather than restated here. The comment that used to
+// sit in this spot asked whoever bumped the version to remember three places,
+// and it had already drifted — package.json said 0.10.1 while the handshake
+// reported 0.10.0, which is the one number an operator can actually see when
+// checking whether the new plugin is live.
 const mcp = new Server(
-  { name: "bridge", version: "0.10.0" },
+  { name: "bridge", version: PLUGIN_VERSION },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
@@ -1331,16 +1421,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (threadId) body.parentId = threadId;
         if (contextId) body.contextId = contextId;
         if (forceBroadcast) body.broadcast = true;
-        // Stamp our own context so receivers can target their reply back at
-        // this exact session (the server has no per-session sender identity —
-        // agent tokens are shared across sessions)
-        // Top-level field, not metadata: this is protocol data the server
-        // validates against our own contexts. Older servers ignore the field,
-        // so also send the metadata form they understand.
-        if (myContextId) {
-          body.senderContextId = myContextId;
-          body.metadata = { senderContextId: myContextId };
-        }
+        // Our own session, so receivers can target a reply back at this exact
+        // session. Servers that support the X-Bridge-Context header (sent by
+        // apiFetch) DERIVE this and ignore the field entirely — it is kept for
+        // servers that predate the credential, where a self-asserted claim is
+        // still better than nothing.
+        //
+        // Not written into `metadata`: that form was an assignment, so it
+        // clobbered any caller metadata, and the server now stores the sender
+        // in its own column rather than in the blob.
+        if (myContextId) body.senderContextId = myContextId;
 
         const res = await apiFetch("/api/messages", {
           method: "POST",
