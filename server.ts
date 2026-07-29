@@ -125,6 +125,16 @@ const SESSION_MAP_DIRS = [
 const SESSION_MAP_WAIT_MS = 3000;
 const SESSION_MAP_POLL_MS = 100;
 
+/** Start time of a live process, for the pid-reuse check. "" if unknown. */
+function procStartOf(pid: number): string {
+  try {
+    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
+    return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 function pidAlive(pid: unknown): boolean {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -134,6 +144,48 @@ function pidAlive(pid: unknown): boolean {
     // EPERM means the process exists but belongs to someone else — alive.
     return (err as any)?.code === "EPERM";
   }
+}
+
+/**
+ * The pid of the Claude Code CLI that owns this MCP server, found by walking
+ * our own process ancestry.
+ *
+ * The header above is right that `process.ppid` is the `bun run` wrapper — and
+ * it stops one level too early. Measured 2026-07-29:
+ *
+ *   bun server.ts(55353) -> bun run(55346) -> claude(55250) == CLAUDE_PID
+ *
+ * We do not identify "the claude process" by name, which would be brittle.
+ * Instead every ancestor is probed against the mapping directory and the FIRST
+ * hit wins. First-hit is load-bearing, not a shortcut: a nested session's chain
+ * contains its own CLI *and* the outer one (verified: 72712 then 55250), and
+ * the nearest is always the right one.
+ *
+ * Costs one `ps` per level, bounded. Returns null where `ps` does not exist
+ * (Windows) — the caller then falls back rather than pretending.
+ */
+function parentPid(pid: number): number | null {
+  try {
+    const r = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)]);
+    if (!r.success) return null;
+    const n = Number(new TextDecoder().decode(r.stdout).trim());
+    return Number.isSafeInteger(n) && n > 1 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+const ANCESTRY_MAX_DEPTH = 8;
+
+/** Mapping written by the hook against any ancestor of ours, nearest first. */
+function readMappingByAncestry(): { id: string; pid: number } | null {
+  let pid: number | null = process.pid;
+  for (let depth = 0; depth < ANCESTRY_MAX_DEPTH && pid; depth++) {
+    const id = readSessionMapping(`pid-${pid}`);
+    if (id) return { id, pid };
+    pid = parentPid(pid);
+  }
+  return null;
 }
 
 function readSessionMapping(key: string): string | null {
@@ -155,6 +207,17 @@ function readSessionMapping(key: string): string | null {
       // stable identity, so the recorded pid must be there AND still alive; a
       // mapping without one cannot be validated and is refused outright.
       if (!pidAlive(m.claudePid)) continue;
+      // Liveness is not enough on a pid key: pids are recycled, so a mapping a
+      // SIGKILLed session left behind can name a pid that is alive again as
+      // somebody else. Comparing the recorded start time against the running
+      // process distinguishes "still us" from "same number, different process".
+      // An empty recorded value means the writer could not determine it (no
+      // `ps`); accept it rather than discarding an otherwise-valid mapping.
+      const recordedStart = typeof m.procStart === "string" ? m.procStart : "";
+      if (recordedStart) {
+        const actualStart = procStartOf(m.claudePid as number);
+        if (actualStart && actualStart !== recordedStart) continue;
+      }
       // Deliberately no freshness window on updatedAt: Claude Code restarts a
       // crashed MCP server (so does /mcp reconnect), and a window anchored to
       // this process's start would fail every conversation older than it and
@@ -187,16 +250,33 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
   // missing mapping is not yet an answer — but only wait when there is a key to
   // wait on. Without an SSE port no mapping can ever be found, and burning 3s
   // on a lookup that cannot succeed just delays the first connect.
-  if (/^[0-9]+$/.test(SESSION_MAP_KEY)) {
-    const deadline = Date.now() + SESSION_MAP_WAIT_MS;
-    for (;;) {
-      const id = readSessionMapping(SESSION_MAP_KEY);
-      if (id) {
-        return { key: id, source: `session map (sse port ${SESSION_MAP_KEY})` };
-      }
-      if (Date.now() >= deadline) break;
-      await new Promise((resolve) => setTimeout(resolve, SESSION_MAP_POLL_MS));
+  // Two keys, tried in order of how widely they work.
+  //
+  // 1. pid — the Claude Code CLI process that owns us, found by walking our own
+  //    ancestry. Works headless, which is the case the SSE port cannot serve:
+  //    CLAUDE_CODE_SSE_PORT exists only when an INTERACTIVE session is attached
+  //    to an IDE whose workspace contains the cwd (measured — a plain terminal
+  //    or tmux session has none). Headless is also where the bug is worst: on a
+  //    `--continue` the MCP env carries a per-launch id that names NO
+  //    conversation at all, while the hook still sees the real one.
+  // 2. sse port — kept for IDE sessions and as the fallback wherever the
+  //    ancestry walk cannot run (no `ps`, i.e. Windows).
+  //
+  // The hook writes both files when it can, so this order is a preference, not
+  // a dependency.
+  const deadline = Date.now() + SESSION_MAP_WAIT_MS;
+  const haveSseKey = /^[0-9]+$/.test(SESSION_MAP_KEY);
+  for (;;) {
+    const byPid = readMappingByAncestry();
+    if (byPid) {
+      return { key: byPid.id, source: `session map (cli pid ${byPid.pid})` };
     }
+    if (haveSseKey) {
+      const id = readSessionMapping(`sse-${SESSION_MAP_KEY}`);
+      if (id) return { key: id, source: `session map (sse port ${SESSION_MAP_KEY})` };
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, SESSION_MAP_POLL_MS));
   }
 
   // No hook (older plugin install, hooks disabled), no SSE port, or a mapping
