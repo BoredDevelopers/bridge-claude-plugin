@@ -219,9 +219,41 @@ async function main(): Promise<void> {
   // its environment. CLAUDE_PID is recorded in the file instead, as the
   // liveness signal the server uses to reject a mapping a killed session left
   // behind on a since-reused port.
+  /*
+   * ⚠️ KNOWN LIMITATION — this whole mechanism is IDE-only.
+   *
+   * Measured 2026-07-29. `CLAUDE_CODE_SSE_PORT` is set by the CLI on ITSELF (the
+   * VS Code integrated-terminal shell that spawns `claude` does not export it —
+   * checked directly on the parent shell's environment), and only when BOTH
+   * hold:
+   *
+   *   1. an IDE is attached — the value is always the port of a
+   *      `~/.claude/ide/<port>.lock` whose `workspaceFolders` contains the
+   *      session's cwd. Two live sessions matched their workspace's lock
+   *      exactly, 2/2, and every lock on this machine carries
+   *      `"ideName": "Visual Studio Code"`.
+   *   2. the session is interactive — `claude -p` gets no port even when run
+   *      from a directory that HAS a matching lock.
+   *
+   * So a plain-terminal / tmux / ssh session has no correlation key, this hook
+   * returns here, and the MCP server falls back to the per-launch
+   * CLAUDE_CODE_SESSION_ID. That is harmless on a fresh start (launch id ==
+   * conversation id) and wrong after `--continue`/`--resume`, which is exactly
+   * the case this hook exists for.
+   *
+   * Fixing it needs a correlation key both processes can see without an IDE.
+   * The hard constraint is the server side: it sits behind a `bun run` wrapper,
+   * so its ppid is the wrapper and its environment carries no CLAUDE_PID — it
+   * has only CLAUDE_PROJECT_DIR, CLAUDE_PLUGIN_DATA and the launch id.
+   * CLAUDE_PROJECT_DIR alone is not unique (several sessions per project is
+   * normal), so the likely shape is a two-phase handshake: the server announces
+   * {project, launch id, pid} and the hook claims the newest unclaimed
+   * announcement for its project and writes the conversation id back. Not built
+   * — it is a protocol change, not a guard fix.
+   */
   const key = String(ssePort ?? "");
   if (!KEY_REGEX.test(key)) {
-    log("no CLAUDE_CODE_SSE_PORT — cannot correlate with the MCP server");
+    log("no CLAUDE_CODE_SSE_PORT — no IDE attached; falling back to the per-launch session id");
     return;
   }
   const file = join(MAP_DIR, `${key}.json`);

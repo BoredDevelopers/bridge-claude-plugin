@@ -113,6 +113,9 @@ describe("session map hook", () => {
     expect(code).toBe(0); // never fail the user's session start
     expect(existsSync(mapFile())).toBe(false);
     expect(stderr).toContain("CLAUDE_CODE_SSE_PORT");
+    // IDE-only by construction: the port exists only when an interactive session
+    // is attached to an IDE whose workspace contains the cwd. A terminal session
+    // lands here and keeps the per-launch id — documented in session-map.ts.
   });
 
   test("refuses a session id the Bridge server would reject", async () => {
