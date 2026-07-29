@@ -26,6 +26,10 @@
     "verbatimModuleSyntax": false,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["server.ts"],
+  // Widened 2026-07-29 from ["server.ts"]. The hook that publishes this
+  // plugin's session identity sat outside every check in the repo — no
+  // typecheck, no test — and was a no-op in every session from the day it
+  // shipped. Narrow scope is how the same phantom-green recurs in a new file.
+  "include": ["server.ts", "hooks/**/*.ts", "test/**/*.ts"],
   "exclude": ["node_modules"]
 }

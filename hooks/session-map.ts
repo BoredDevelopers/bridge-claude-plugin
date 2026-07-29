@@ -178,16 +178,40 @@ function removeMapping(file: string): void {
 }
 
 async function main(): Promise<void> {
-  // A subagent inherits the parent's CLAUDE_PID and SSE port but carries its
-  // OWN CLAUDE_CODE_SESSION_ID. Publishing from here would overwrite the real
-  // conversation's mapping with a child's id — and deleting from here would
-  // strip a live conversation of its identity. Neither is recoverable, so a
-  // child context does nothing at all.
-  if ((process.env.CLAUDE_CODE_CHILD_SESSION ?? "") !== "") {
-    log("child session — leaving the parent conversation's mapping alone");
-    return;
-  }
-
+  /*
+   * REMOVED 2026-07-29 — a `CLAUDE_CODE_CHILD_SESSION` guard that made this hook
+   * a no-op in EVERY session since it shipped. It read:
+   *
+   *     if ((process.env.CLAUDE_CODE_CHILD_SESSION ?? "") !== "") return;
+   *
+   * justified as "a subagent inherits the parent's CLAUDE_PID and SSE port but
+   * carries its OWN CLAUDE_CODE_SESSION_ID, so publishing from here would
+   * overwrite the real conversation's mapping". Both halves are wrong, and each
+   * is independently fatal:
+   *
+   * 1. `CLAUDE_CODE_CHILD_SESSION` is `1` in EVERY session, top-level included.
+   *    Measured by launching `claude` with every CLAUDE_* variable scrubbed from
+   *    the environment (`env -u …`): the SessionStart hook still received
+   *    `CLAUDE_CODE_CHILD_SESSION=1`. It is undocumented — absent from both the
+   *    hooks and plugins references — and does not mean what its name suggests.
+   *    So this returned early every single time.
+   * 2. The scenario it defends against cannot occur: **SessionStart does not
+   *    fire for subagents.** They fire `SubagentStart`, a separate event this
+   *    hook is not registered for.
+   *
+   * Consequence: the mapping directory was empty across every session ever run,
+   * the server's 3s wait always timed out, and every session fell back to the
+   * per-launch `CLAUDE_CODE_SESSION_ID`. Invisible on a fresh start — where the
+   * launch id and the conversation id happen to be equal — and broken on exactly
+   * the case this hook exists for: after `--continue` the server registers a
+   * context under the launch id while the conversation carries another, so
+   * replies targeted at the session stop reaching it.
+   *
+   * The whole feature rested on an undocumented environment variable whose
+   * meaning was inferred from its name, and nothing asserted a mapping had ever
+   * been written. The regression test added with this change asserts the FILE
+   * EXISTS, which is the only claim that matters.
+   */
   const claudePid = numericEnv("CLAUDE_PID");
   const ssePort = numericEnv("CLAUDE_CODE_SSE_PORT");
   // The SSE port is the only identifier the MCP server also has: it sits behind
