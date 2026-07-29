@@ -241,15 +241,42 @@ async function main(): Promise<void> {
    * conversation id) and wrong after `--continue`/`--resume`, which is exactly
    * the case this hook exists for.
    *
-   * Fixing it needs a correlation key both processes can see without an IDE.
-   * The hard constraint is the server side: it sits behind a `bun run` wrapper,
-   * so its ppid is the wrapper and its environment carries no CLAUDE_PID — it
-   * has only CLAUDE_PROJECT_DIR, CLAUDE_PLUGIN_DATA and the launch id.
-   * CLAUDE_PROJECT_DIR alone is not unique (several sessions per project is
-   * normal), so the likely shape is a two-phase handshake: the server announces
-   * {project, launch id, pid} and the hook claims the newest unclaimed
-   * announcement for its project and writes the conversation id back. Not built
-   * — it is a protocol change, not a guard fix.
+   * ── If you are about to fix this, read the rest of this comment first. ──
+   *
+   * A two-phase handshake (server announces {project, launch id, pid}; hook
+   * claims the newest unclaimed announcement for its project) was designed and
+   * REJECTED. It is ambiguous exactly where it matters: several sessions per
+   * project is normal, and "newest unclaimed" cannot tell them apart.
+   *
+   * There is an unambiguous key. Both processes are descendants of the same
+   * Claude Code CLI process, so its pid identifies the session uniquely, and
+   * each side can derive it alone — measured 2026-07-29:
+   *
+   *   server: bun server.ts(55353) → bun run wrapper(55346) → claude(55250)
+   *   hook:   /bin/sh(72810) → claude(72712)          == CLAUDE_PID (72712)
+   *
+   * The existing note that "process.ppid is the wrapper, never Claude's pid" is
+   * true and stops one level too early. Shape: the hook writes
+   * sessions/<cli-pid>.json; the server walks up its own ancestry probing for a
+   * mapping at each level and takes the FIRST hit. First-hit is required, not a
+   * shortcut — a nested session's chain contains its own CLI *and* the outer
+   * one (verified: 72712 then 55250), and the nearest is always correct.
+   * Needs a CLI start-time field too, or pid reuse after a SIGKILL adopts a
+   * dead conversation.
+   *
+   * NOT BUILT, DELIBERATELY — there is no consumer. Checked against the Bridge
+   * ledger 2026-07-29: across 397 messages the only agents that have ever
+   * registered a context are jorgen-mac, aio and claude-code, all IDE-attached.
+   * The five headless ACP agents (fred/ben/dan/rita/mira) have never registered
+   * a context or sent a message, so this would serve nobody — while adding a
+   * dependency on process-ancestry shape and `ps`, on top of env vars that are
+   * already undocumented. That is the same bet that produced the
+   * CLAUDE_CODE_CHILD_SESSION bug above.
+   *
+   * BUILD IT WHEN: a headless session that uses --continue/--resume actually
+   * registers a Bridge context. The check is one query — group the receipts on
+   * recent messages by agentId and look for an agent that is not one of the
+   * three above.
    */
   const key = String(ssePort ?? "");
   if (!KEY_REGEX.test(key)) {
