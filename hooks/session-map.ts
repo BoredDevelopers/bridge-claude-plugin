@@ -94,6 +94,28 @@ async function readHookPayload(): Promise<Record<string, any>> {
   }
 }
 
+/**
+ * The CLI process's start time, as the OS reports it.
+ *
+ * Pids are recycled. A session killed with SIGKILL never runs its SessionEnd
+ * hook, so its mapping outlives it, and a later CLI that lands on the same pid
+ * would otherwise adopt a dead conversation's identity — worse than having none,
+ * because it is wrong rather than absent. Liveness alone cannot catch that: the
+ * pid IS alive, it is simply somebody else. The start time distinguishes them.
+ *
+ * Empty string when it cannot be determined (no `ps`, e.g. Windows); the reader
+ * treats that as "cannot verify" and falls back rather than trusting it.
+ */
+function cliProcStart(pid: number | null): string {
+  if (!pid) return "";
+  try {
+    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
+    return new TextDecoder().decode(r.stdout).trim();
+  } catch {
+    return "";
+  }
+}
+
 function pidAlive(pid: unknown): boolean {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -264,26 +286,42 @@ async function main(): Promise<void> {
    * Needs a CLI start-time field too, or pid reuse after a SIGKILL adopts a
    * dead conversation.
    *
-   * NOT BUILT, DELIBERATELY — there is no consumer. Checked against the Bridge
-   * ledger 2026-07-29: across 397 messages the only agents that have ever
-   * registered a context are jorgen-mac, aio and claude-code, all IDE-attached.
-   * The five headless ACP agents (fred/ben/dan/rita/mira) have never registered
-   * a context or sent a message, so this would serve nobody — while adding a
-   * dependency on process-ancestry shape and `ps`, on top of env vars that are
-   * already undocumented. That is the same bet that produced the
-   * CLAUDE_CODE_CHILD_SESSION bug above.
+   * BUILT 2026-07-29, after measuring all three claims in ONE headless session
+   * (hook and MCP probe in the same run, fresh then `--continue`):
    *
-   * BUILD IT WHEN: a headless session that uses --continue/--resume actually
-   * registers a Bridge context. The check is one query — group the receipts on
-   * recent messages by agentId and look for an agent that is not one of the
-   * three above.
+   *   MCP  [FRESH]  env=0a5efca9  cliPid=23559
+   *   HOOK [FRESH]  payload_sid=0a5efca9  CLAUDE_PID=23559  source=startup
+   *   MCP  [RESUME] env=45e53e25  cliPid=23805      <- diverged, no transcript
+   *   HOOK [RESUME] payload_sid=0a5efca9  CLAUDE_PID=23805  source=resume
+   *                              ^ stable, and the ONLY transcript on disk
+   *
+   * So headless: the hook keeps the true conversation id across a resume, the
+   * MCP server does not, and both derive the same CLI pid. The bug is real
+   * without an IDE and the pid is a sound key.
+   *
+   * `~/.claude/sessions/<cli-pid>.json` — Claude Code's own registry — was
+   * evaluated as a way to skip this hook entirely. Rejected: on a headless
+   * resume its `sessionId` is the SAME per-launch id the MCP env carries
+   * (measured), so it cannot supply what the hook can.
    */
   const key = String(ssePort ?? "");
-  if (!KEY_REGEX.test(key)) {
-    log("no CLAUDE_CODE_SSE_PORT — no IDE attached; falling back to the per-launch session id");
+  const haveSseKey = KEY_REGEX.test(key);
+  if (!haveSseKey && !claudePid) {
+    log("neither CLAUDE_CODE_SSE_PORT nor CLAUDE_PID — cannot correlate with the MCP server");
     return;
   }
-  const file = join(MAP_DIR, `${key}.json`);
+  // Keys are namespaced because a pid and a port are both bare integers and
+  // would otherwise collide in one directory.
+  //
+  // BOTH keys are written when both are available, not one or the other. The
+  // pid key is the one that works everywhere; the SSE key is kept so an
+  // already-running server that only knows how to look up a port still
+  // resolves, and as a fallback wherever the ancestry walk cannot run (no
+  // `ps`, i.e. Windows). Writing one file costs nothing; guessing which one
+  // the reader will use costs a session its identity.
+  const files: string[] = [];
+  if (claudePid) files.push(join(MAP_DIR, `pid-${claudePid}.json`));
+  if (haveSseKey) files.push(join(MAP_DIR, `sse-${key}.json`));
 
   // argv is authoritative — hooks.json states the intent explicitly, so this is
   // known before stdin is read and the start branch can write immediately.
@@ -293,14 +331,14 @@ async function main(): Promise<void> {
     // Unlabelled invocation: the payload is the only way to tell the branches
     // apart, so this one path does pay the stdin wait before acting.
     const payload = await readHookPayload();
-    await runStart(file, claudePid, ssePort, payload, {
+    await runStart(files, claudePid, ssePort, payload, {
       ending: payload.hook_event_name === "SessionEnd",
     });
     return;
   }
 
   if (argMode === "end") {
-    removeMapping(file);
+    for (const f of files) removeMapping(f);
     return;
   }
 
@@ -311,21 +349,25 @@ async function main(): Promise<void> {
   const envId = String(process.env.CLAUDE_CODE_SESSION_ID ?? "");
   let written = "";
   if (SESSION_ID_REGEX.test(envId)) {
-    try {
-      writeMapping(file, {
-        sessionId: envId,
-        source: "",
-        claudePid,
-        ssePort,
-        updatedAt: new Date().toISOString(),
-      });
-      written = envId;
-    } catch (err) {
-      log(`failed to write ${file}: ${err}`);
+    const procStart = cliProcStart(claudePid);
+    for (const f of files) {
+      try {
+        writeMapping(f, {
+          sessionId: envId,
+          source: "",
+          claudePid,
+          procStart,
+          ssePort,
+          updatedAt: new Date().toISOString(),
+        });
+        written = envId;
+      } catch (err) {
+        log(`failed to write ${f}: ${err}`);
+      }
     }
   }
 
-  await runStart(file, claudePid, ssePort, await readHookPayload(), {
+  await runStart(files, claudePid, ssePort, await readHookPayload(), {
     ending: false,
     written,
   });
@@ -334,14 +376,14 @@ async function main(): Promise<void> {
 // The start branch's payload half: rewrite the mapping from the documented
 // stable id once it arrives. Shared with the unlabelled-invocation path.
 async function runStart(
-  file: string,
+  files: string[],
   claudePid: number | null,
   ssePort: number | null,
   payload: Record<string, any>,
   opts: { ending: boolean; written?: string }
 ): Promise<void> {
   if (opts.ending) {
-    removeMapping(file);
+    for (const f of files) removeMapping(f);
     return;
   }
 
@@ -355,13 +397,20 @@ async function runStart(
     sweep();
     return;
   }
-  writeMapping(file, {
-    sessionId,
-    source: typeof payload.source === "string" ? payload.source : "",
-    claudePid,
-    ssePort,
-    updatedAt: new Date().toISOString(),
-  });
+  for (const f of files) {
+    try {
+      writeMapping(f, {
+        sessionId,
+        source: typeof payload.source === "string" ? payload.source : "",
+        claudePid,
+        procStart: cliProcStart(claudePid),
+        ssePort,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      log(`failed to write ${f}: ${err}`);
+    }
+  }
   sweep();
 }
 
