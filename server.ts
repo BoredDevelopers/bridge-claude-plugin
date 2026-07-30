@@ -356,7 +356,19 @@ async function git(args: string[]): Promise<string | null> {
 // Everything the server needs to register the context. Repo/branch details are
 // enrichment only, so auth can proceed without them.
 function minimalSessionInfo(): Record<string, string> {
-  const info: Record<string, string> = { clientName: "Claude Code" };
+  // Reported so the SERVER can tell which build each session is running. Same
+  // pair MCP's own `initialize` exchanges (`clientInfo: {name, version}`), and
+  // the version was already computed for that handshake — it simply was never
+  // told to Bridge, which is why "who is on what" has been answered all week by
+  // reading installed_plugins.json and ps output by hand.
+  //
+  // It matters beyond upgrade nags: 0.11.4 surfaces addressed messages that
+  // 0.11.3 receives and bins, so a `delivered` receipt means different things
+  // depending on the build, and nothing recorded which.
+  const info: Record<string, string> = {
+    clientName: "Claude Code",
+    clientVersion: PLUGIN_VERSION,
+  };
   try {
     info.hostName = hostname();
   } catch {}
@@ -1690,6 +1702,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 label: c.label,
                 state: c.state,
                 lastHeartbeatAt: c.lastHeartbeatAt,
+                // Third explicit projection this value has to survive (server
+                // column -> toPublicContext -> here). Each one is an allowlist,
+                // and omitting it anywhere stores the version and never shows
+                // it — a feature shipped invisible.
+                clientVersion: c.clientVersion ?? null,
               }));
             return { agentId: id, contexts };
           })
