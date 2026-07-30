@@ -727,6 +727,28 @@ function ensureChannelMap(): Promise<void> {
   return p;
 }
 
+/**
+ * Reasons the SERVER selected this session, carried on the frame beside the
+ * message (`deliveryReasons`). The addressed tier means the server picked us
+ * specifically; the broadcast tier means we matched a standing subscription.
+ *
+ * BRIDGE_CHANNELS is a subscription preference and may narrow the broadcast
+ * tier only. It must never suppress the addressed tier — that is the bug this
+ * exists to close: a thread reply the server routed here was binned because its
+ * CHANNEL was not in the list, while the receipt still read `delivered`, so the
+ * ledger claimed we had a message the model never saw.
+ *
+ * Ranked, not special-cased. A reason added server-side later (`assignee` was
+ * added in the same change) inherits the guarantee by being in the list rather
+ * than needing another branch here.
+ */
+const ADDRESSED_REASONS = new Set(["target", "assignee", "mention", "thread"]);
+
+function isAddressed(reasons: unknown): boolean {
+  if (!Array.isArray(reasons)) return false;
+  return reasons.some((r) => typeof r === "string" && ADDRESSED_REASONS.has(r));
+}
+
 // "unknown" = the name filter can't be evaluated yet (map not loaded, or the
 // channel post-dates it). Callers must refresh and re-ask rather than drop.
 type ChannelDecision = "deliver" | "drop" | "unknown";
@@ -953,7 +975,7 @@ function handleWsMessage(data: any): void {
       break;
 
     case "message":
-      handleInboundMessage(data.data);
+      handleInboundMessage(data.data, data.deliveryReasons);
       break;
 
     case "replay":
@@ -1102,7 +1124,7 @@ function handleWsMessage(data: any): void {
   }
 }
 
-function handleInboundMessage(msg: any): void {
+function handleInboundMessage(msg: any, deliveryReasons?: unknown): void {
   if (!msg) return;
 
   // Parse metadata first: a message targeted at THIS session bypasses both
@@ -1118,6 +1140,21 @@ function handleInboundMessage(msg: any): void {
   }
   const targetsThisSession =
     !!metadata.contextId && !!myContextId && metadata.contextId === myContextId;
+
+  /**
+   * Bypass the channel filter for anything the server ADDRESSED to us.
+   *
+   * `targetsThisSession` already covered explicit context targeting, and it was
+   * the only bypass — so `mention` and `thread` had none, which is exactly how
+   * an in-thread reply in a channel outside BRIDGE_CHANNELS was received and
+   * dropped. On a batch the reason rides on each message; on a live frame it is
+   * a sibling of the message, so both spellings are read here.
+   *
+   * A server that predates this sends neither, and then this is false and the
+   * old channel-only behaviour applies unchanged — no version negotiation.
+   */
+  const addressedToUs =
+    targetsThisSession || isAddressed(deliveryReasons) || isAddressed(msg.deliveryReasons);
 
   /**
    * Which SESSION wrote this — a top-level field now that the server derives it
@@ -1183,7 +1220,7 @@ function handleInboundMessage(msg: any): void {
     return;
   }
 
-  routeInbound(msg, metadata, targetsThisSession, senderContextId, false);
+  routeInbound(msg, metadata, addressedToUs, senderContextId, false);
 }
 
 // Split from the dedupe/cursor path above so channel-name resolution can await
@@ -1192,7 +1229,7 @@ function handleInboundMessage(msg: any): void {
 function routeInbound(
   msg: any,
   metadata: Record<string, any>,
-  targetsThisSession: boolean,
+  addressedToUs: boolean,
   /**
    * Which SESSION wrote this, already normalised by the caller (sentinels
    * mapped to ""). Passed explicitly rather than read from an outer scope:
@@ -1205,13 +1242,13 @@ function routeInbound(
   resolved: boolean
 ): void {
   const channelId = msg.channelId ?? "";
-  if (!targetsThisSession) {
+  if (!addressedToUs) {
     const decision = channelDecision(channelId);
     if (decision === "unknown" && !resolved) {
       // Undecidable, not a rejection: the map is still loading (live messages
       // used to be dropped in this window) or the channel post-dates it.
       ensureChannelMap()
-        .then(() => routeInbound(msg, metadata, targetsThisSession, senderContextId, true))
+        .then(() => routeInbound(msg, metadata, addressedToUs, senderContextId, true))
         .catch(() => {});
       return;
     }
@@ -1225,7 +1262,7 @@ function routeInbound(
   }
 
   // Don't echo own messages back — unless targeted at this session
-  if (msg.agentId === agentId && !targetsThisSession) {
+  if (msg.agentId === agentId && !addressedToUs) {
     process.stderr.write(
       `bridge channel: SKIPPED own msg id=${msg.id} agent=${msg.agentId}\n`
     );
