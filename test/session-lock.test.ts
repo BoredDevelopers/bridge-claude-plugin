@@ -163,6 +163,40 @@ describe("single instance per session key", () => {
     expect(r.connected).toBe(true);
   }, 30_000);
 
+  test("WITHOUT `ps`, an unverifiable holder still fails OPEN", async () => {
+    // FOUND BY MUTATION: deleting `if (!rec.procStart) return false` changed
+    // nothing, because the comparison below it already rejects an empty recorded
+    // value against a real one. There is exactly one input where only that guard
+    // runs — when `procStartOf` ALSO returns "" — and it is reachable: `ps` off
+    // PATH. Then "" === "" matches, every holder reads as live, and the box
+    // locks every session out of Bridge. `pidAlive` uses process.kill(pid, 0)
+    // and does not need `ps`, so the pid genuinely is alive here.
+    // A `ps` that fails, shadowing the real one. PATH cannot simply be emptied —
+    // `bun` is resolved through it too, and the spawn would fail for an unrelated
+    // reason and score as "declined".
+    const shimBin = join(dir, "shim");
+    mkdirSync(shimBin, { recursive: true });
+    writeFileSync(join(shimBin, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    writeLock({ pid: process.pid, procStart: "", sessionKey: SESSION_ID, at: new Date().toISOString() });
+    const p = Bun.spawn(["bun", SERVER], {
+      env: {
+        ...process.env,
+        PATH: `${shimBin}:${process.env.PATH}`, // `ps` resolves to the failing shim
+        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
+        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t",
+        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+      } as Record<string, string>,
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    let err = "";
+    (async () => { const d = new TextDecoder(); for await (const c of p.stderr as any) err += d.decode(c, { stream: true }); })();
+    const deadline = Date.now() + 9000;
+    while (Date.now() < deadline && !/DUPLICATE INSTANCE|session lock acquired/.test(err)) await Bun.sleep(100);
+    p.kill();
+    expect(/DUPLICATE INSTANCE/.test(err), "no `ps` must not mean no Bridge").toBe(false);
+    expect(/session lock acquired/.test(err)).toBe(true);
+  }, 30_000);
+
   test("a corrupt lock file fails OPEN rather than stranding the session", async () => {
     mkdirSync(join(dir, "locks"), { recursive: true });
     writeFileSync(lockFile(), "{ this is not json");
