@@ -73,7 +73,7 @@ function startStub(): Stub {
     },
   });
   return {
-    port: server.port,
+    port: server.port!,
     send: (frame) => socket?.send(JSON.stringify(frame)),
     connected: () => socket !== null,
     stop: () => server.stop(true),
@@ -187,6 +187,39 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
     // bypass is false, and the filter applies exactly as before.
     stub.send({ type: "message", data: message("msg-legacy-1", { parentId: "root-1" }) });
     expect(await surfaced("msg-legacy-1", 2000)).toBe(false);
+  }, 30_000);
+
+  test("THE ECHO GUARD: our own message never surfaces just because reasons exist", async () => {
+    // The own-message skip used to read `!targetsThisSession` and now reads
+    // `!addressedToUs`, which is a WIDER condition — so this is the regression
+    // that change could cause: the session surfacing its own outbound message
+    // back to itself.
+    //
+    // It holds because the server excludes the sender from the reason map, so an
+    // own message carries [] or, when self-targeted, ["target"] — exactly what
+    // the old condition covered. That is an invariant of the OTHER repo, which
+    // is the kind of reasoning that is true right up until it isn't, so it gets
+    // a test on this side of the seam rather than a comment.
+    // IN `general`, which IS in the filter — deliberately. The first version of
+    // this test put it in the filtered channel, where the channel filter drops it
+    // before the own-message check ever runs: it would have passed against a
+    // plugin with no echo guard at all. The message has to CLEAR the filter so
+    // that the own-message skip is the only thing left that can stop it.
+    stub.send({
+      type: "message",
+      data: message("msg-own-1", { agentId: "jorgen-mac", channelId: "general", parentId: "root-1" }),
+      deliveryReasons: [],
+    });
+    expect(await surfaced("msg-own-1", 2000)).toBe(false);
+
+    // Proof the channel was not what stopped it: the same channel, a different
+    // sender, surfaces.
+    stub.send({
+      type: "message",
+      data: message("msg-own-control", { channelId: "general" }),
+      deliveryReasons: ["channel"],
+    });
+    expect(await surfaced("msg-own-control", 3000), "general must be deliverable").toBe(true);
   }, 30_000);
 
   test("REPLAY: an addressed message surfaces on catch-up too", async () => {
