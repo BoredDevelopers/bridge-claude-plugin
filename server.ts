@@ -1842,6 +1842,167 @@ await mcp.connect(new StdioServerTransport());
 // Clean shutdown when Claude Code closes the MCP connection. Registered before
 // the session-key wait below: a stdin close during that window would otherwise
 // have no listener and leave this process orphaned.
+// ── Single instance per session key ─────────────────────────────────────────
+//
+// WHY. Two plugin copies can load into ONE Claude Code session — the marketplace
+// plugin from `enabledPlugins` plus either a user-scope MCP entry in
+// `~/.claude.json` or `--dangerously-load-development-channels`. Both resolve the
+// SAME session key and both open a socket; the server gives the key to the first
+// and renames the second to a connection id. Cost so far: an hour of misdiagnosis
+// on 2026-07-29 and a repeat on 2026-07-30, plus every inbound message handled
+// twice and one session shown as two in the directory. Twice from one cause is a
+// design defect, so the second instance now declines instead of competing.
+//
+// PRIMITIVE, chosen by measurement rather than by reputation. The textbook answer
+// is a unix-domain socket, whose liveness the kernel guarantees — but measured
+// against Bun 1.3.5, `Bun.listen({unix})` on an already-bound path SUCCEEDS
+// (Bun unlinks and steals it) and connecting to a stale path also succeeds. It
+// provides neither mutual exclusion nor a liveness probe here. `writeFileSync`
+// with flag "wx" (O_EXCL) does: 40 concurrent processes racing one path yielded
+// exactly one winner.
+//
+// THE INVARIANT THIS MUST NOT BREAK: never lock a session OUT of Bridge. That is
+// strictly worse than the duplicate it prevents. So every failure path below
+// fails OPEN — an unreadable holder, an unwritable directory, an unexpected
+// throw, all connect anyway — and a process that loses the race does NOT exit.
+// It stays up serving tools and retries, so a holder that dies or shuts down
+// hands over rather than stranding the session.
+const LOCK_DIR = join(STATE_DIR, "locks");
+const LOCK_RETRY_MS = 30_000;
+// A holder renews while it lives, so this only expires a process that is alive
+// but wedged. Generous against a renew interval of 30s: a reconnect loop is a
+// legitimate holder and must not be evicted mid-backoff.
+const LOCK_STALE_MS = 5 * 60_000;
+
+function lockPathFor(key: string): string {
+  return join(LOCK_DIR, `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.lock`);
+}
+
+type LockRecord = { pid: number; procStart: string; sessionKey: string; at: string };
+
+let lockHeld = false;
+let lockRenewTimer: ReturnType<typeof setInterval> | null = null;
+let lockRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Is the recorded holder a live process, and still the SAME process? */
+function holderIsLive(rec: LockRecord, lockFile: string): boolean {
+  if (!pidAlive(rec.pid)) return false;
+  // pid reuse: same number, different process. Same guard 0.11.3 uses for the
+  // session map. An empty recorded procStart is treated as unverifiable and
+  // therefore NOT live — it cannot pin anything, and holding on it would be the
+  // lockout this is built to avoid.
+  if (!rec.procStart) return false;
+  if (procStartOf(rec.pid) !== rec.procStart) return false;
+  try {
+    if (Date.now() - statSync(lockFile).mtimeMs > LOCK_STALE_MS) return false; // alive but wedged
+  } catch {}
+  return true;
+}
+
+function writeLockExclusive(lockFile: string): boolean {
+  const rec: LockRecord = {
+    pid: process.pid,
+    procStart: procStartOf(process.pid),
+    sessionKey: SESSION_KEY,
+    at: new Date().toISOString(),
+  };
+  try {
+    writeFileSync(lockFile, JSON.stringify(rec), { flag: "wx" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True if this process may open a Bridge socket for SESSION_KEY. */
+function acquireSessionLock(): boolean {
+  const lockFile = lockPathFor(SESSION_KEY);
+  try {
+    mkdirSync(LOCK_DIR, { recursive: true });
+    if (!writeLockExclusive(lockFile)) {
+      let rec: LockRecord | null = null;
+      try {
+        rec = JSON.parse(readFileSync(lockFile, "utf8"));
+      } catch {
+        rec = null; // unreadable or truncated -> treat as stale, not as a holder
+      }
+      if (rec && rec.pid !== process.pid && holderIsLive(rec, lockFile)) return false;
+      if (rec && rec.pid === process.pid) { lockHeld = true; return true; } // already ours
+      // Stale. Clear it and take it.
+      try { unlinkSync(lockFile); } catch {}
+      if (!writeLockExclusive(lockFile)) return false; // a sibling got there first
+    }
+    // CONFIRM OWNERSHIP. Two processes can both find the same stale lock, both
+    // unlink, and both create — the second unlink removes the first's fresh file.
+    // Re-reading settles it: the file holds exactly ONE pid, so at most one
+    // process can see its own, and whoever wrote last is that one. Without this
+    // the stale path silently degrades to the duplicate it is meant to prevent.
+    try {
+      const back: LockRecord = JSON.parse(readFileSync(lockFile, "utf8"));
+      if (back.pid !== process.pid) return false;
+    } catch {
+      // Cannot confirm: fail OPEN. Connecting twice beats not connecting.
+    }
+    lockHeld = true;
+    if (!lockRenewTimer) {
+      lockRenewTimer = setInterval(() => {
+        // Renewal is an mtime touch, and it REWRITES rather than utimes so a
+        // holder that somehow lost its file re-establishes it.
+        try { writeFileSync(lockFile, JSON.stringify({ ...JSON.parse(readFileSync(lockFile, "utf8")), at: new Date().toISOString() })); } catch {}
+      }, LOCK_RETRY_MS);
+      lockRenewTimer.unref?.();
+    }
+    return true;
+  } catch {
+    return true; // the lock mechanism itself must never take Bridge down
+  }
+}
+
+function releaseSessionLock(): void {
+  if (lockRenewTimer) { clearInterval(lockRenewTimer); lockRenewTimer = null; }
+  if (!lockHeld) return;
+  lockHeld = false;
+  const lockFile = lockPathFor(SESSION_KEY);
+  try {
+    // Only remove OUR lock — a stale-path race may have handed it to a sibling,
+    // and unlinking theirs on our way out would let a third instance in.
+    const rec: LockRecord = JSON.parse(readFileSync(lockFile, "utf8"));
+    if (rec.pid === process.pid) unlinkSync(lockFile);
+  } catch {}
+}
+
+/**
+ * Connect, or stand by until the holder goes away.
+ *
+ * Standing by rather than exiting is deliberate: the MCP host treats a server
+ * that exits as a failure (-32000) and does not respawn it, so exiting would
+ * turn a duplicate into a broken session the moment the holder shut down first.
+ */
+function connectUnlessDuplicate(): void {
+  if (shuttingDown) return;
+  if (acquireSessionLock()) {
+    if (lockRetryTimer) { clearTimeout(lockRetryTimer); lockRetryTimer = null; }
+    // Say which process owns the key. Without this there is no way to tell two
+    // instances apart from outside — which is most of why the duplicate cost an
+    // hour twice: the symptom (a session addressed by a connection id) was
+    // visible on the SERVER while the cause was a second local process nobody
+    // could see. An operator greps for this line; so does the test.
+    process.stderr.write(
+      `bridge channel: session lock acquired for ${SESSION_KEY} (pid ${process.pid})\n`
+    );
+    connectWs();
+    return;
+  }
+  process.stderr.write(
+    `bridge channel: DUPLICATE INSTANCE — another process on this box already holds session key ` +
+      `${SESSION_KEY}. Not connecting; standing by and retrying every ${LOCK_RETRY_MS / 1000}s. ` +
+      `This session is loaded twice (marketplace plugin + a user-scope MCP entry or ` +
+      `--dangerously-load-development-channels); remove one.\n`
+  );
+  lockRetryTimer = setTimeout(connectUnlessDuplicate, LOCK_RETRY_MS);
+  lockRetryTimer.unref?.();
+}
+
 let shuttingDown = false;
 function shutdown(): void {
   if (shuttingDown) return;
@@ -1849,6 +2010,8 @@ function shutdown(): void {
   process.stderr.write("bridge channel: shutting down\n");
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (livenessTimer) clearInterval(livenessTimer);
+  if (lockRetryTimer) clearTimeout(lockRetryTimer);
+  releaseSessionLock();
   try {
     ws?.close();
   } catch {}
@@ -1873,5 +2036,5 @@ process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
 );
 
-// Connect to Bridge WebSocket
-if (!shuttingDown) connectWs();
+// Connect to Bridge WebSocket — unless a sibling instance already owns this key.
+if (!shuttingDown) connectUnlessDuplicate();
