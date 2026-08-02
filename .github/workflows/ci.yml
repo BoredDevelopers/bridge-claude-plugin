@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  plugin:
+    name: Plugin (Bun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned to the minor, not `latest`. `latest` is a standing risk: a new
+          # Bun release lands here unannounced and can turn CI red with no code
+          # change. 1.3 is the family this suite was verified against — 28 pass /
+          # 1 skip / 0 fail on both macOS (1.3.5) and Linux (oven/bun:1.3),
+          # measured 2026-08-02 before this file was written.
+          bun-version: "1.3"
+
+      # NOT `--frozen-lockfile`, unlike the server repo's CI, and deliberately:
+      # `bun.lock` is in .gitignore here, so there is no committed lockfile to
+      # freeze against and the flag would fail outright.
+      #
+      # That is also the right behaviour rather than merely the available one.
+      # This plugin's `start` script is `bun install --no-summary && bun
+      # server.ts` — every user resolves dependencies fresh at every launch. An
+      # unpinned resolve IS this package's production. Freezing CI against a
+      # committed lockfile would test something no user ever runs, and would hide
+      # the breakage users hit first: a semver-range dependency publishing
+      # something incompatible.
+      - run: bun install --no-summary
+
+      # BLOCKING. 28 tests across 4 files, ~50s on Linux.
+      #
+      # Plain `bun test`, no pipe. An earlier draft teed this to a log so a later
+      # step could grep it for skipped tests; that was removed after measuring
+      # that bun prints ONLY the summary when stdout is not a TTY — the per-test
+      # `(skip)` lines simply are not there to grep. The skip check below now
+      # tests the cause instead, which needs no pipe, so this step keeps `bash -e`
+      # semantics and cannot mask a failure through a pipeline exit code.
+      - run: bun test
+
+      # ⚠️ GREEN HERE DOES NOT MEAN INBOUND DELIVERY IS COVERED.
+      #
+      # test/inbound-routing.test.ts is wrapped in `describe.skipIf(!HAVE_SERVER)`
+      # and HAVE_SERVER requires BRIDGE_API_DIR pointing at a checkout of the
+      # Bridge server repo. Nothing sets it here, so that tier does not run and
+      # the suite reports green having never exercised inbound routing — the very
+      # subsystem that shipped broken once already (0.11.1, "fix total inbound
+      # delivery outage in 0.11.0").
+      #
+      # Measured 2026-08-02: wiring BRIDGE_API_DIR up does not currently work
+      # either. The test seeds SQLite via `bun:sqlite`, and the server repo
+      # retired SQLite for Postgres, so it fails with `no such table: agents`.
+      # Covering this tier needs a cross-org checkout, a Postgres service, and a
+      # rewrite of the seed. Until then this warning is the honest statement of
+      # what this job does and does not prove.
+      #
+      # Conditioned on the env var, not on test output: if someone later wires
+      # BRIDGE_API_DIR up, the warning silences itself rather than lying.
+      - name: warn that the integration tier did not run
+        if: always()
+        run: |
+          if [ -z "${BRIDGE_API_DIR:-}" ]; then
+            echo "::warning::inbound-routing integration tests did NOT run (BRIDGE_API_DIR unset). This job does not cover inbound delivery."
+          fi
+
+      # BLOCKING, and deliberately just the compiler.
+      #
+      # The server repo counts errors against a baseline of 10 because it has 10
+      # known Elysia route-typing errors it cannot yet fix. This repo typechecks
+      # CLEAN — measured 0 errors on 0.11.6 — so that baseline machinery would be
+      # cargo-culted complexity here. With a baseline of zero, tsc's own exit code
+      # is the assertion.
+      - run: bunx tsc --noEmit
