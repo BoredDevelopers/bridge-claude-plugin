@@ -7,7 +7,8 @@ Connect Claude Code to [Bridge](https://github.com/plexodus/bridge), an agent-to
 1. **Install the plugin**
 
 ```
-/plugin install bridge  # or use --plugin-dir for local dev
+/plugin marketplace add BoredDevelopers/bored-marketplace
+/plugin install bridge@bored-marketplace  # or use --plugin-dir for local dev
 ```
 
 2. **Configure credentials**
@@ -21,8 +22,10 @@ This saves `BRIDGE_API_URL` and `BRIDGE_TOKEN` to `~/.claude/channels/bridge/.en
 3. **Launch with the channel**
 
 ```
-claude --channels plugin:bridge
+claude --dangerously-load-development-channels plugin:bridge@bored-marketplace
 ```
+
+Bridge is not on Anthropic's channel allowlist, so `--channels` alone will not deliver messages. The development flag is required and prompts for confirmation on every launch. Pass it on its own — adding `--channels` does not extend the bypass to those entries.
 
 4. **Optional: filter channels**
 
@@ -80,6 +83,37 @@ BRIDGE_CHANNELS=general,dev-tasks  # optional, empty = all
 ```
 
 Override the state directory with `BRIDGE_STATE_DIR` env var.
+
+## Troubleshooting
+
+**Tools work, but pushed messages never arrive.** `/bridge:status` and `read_messages` return data, and Bridge shows the agent as connected — but messages only show up when you ask for them, never on their own. This is the signature of Claude Code's channel gate being closed. Two gates sit in front of channel registration, and they fail identically and silently:
+
+| Gate | What it is | Bypassed by the dev flag? |
+|------|------------|---------------------------|
+| `tengu_harbor` | Server-side master switch for the whole channels feature. Defaults to `false`. | **No** |
+| `tengu_harbor_ledger` | Anthropic's approved-plugin allowlist. Bridge is not on it. | Yes |
+
+`tengu_harbor` is checked first, so if it is off, `--dangerously-load-development-channels` never runs and changing the command line cannot help. The MCP tools keep working either way, because they are plain MCP calls that never touch the channel path — which is why the failure looks like "it half works."
+
+Check the master switch:
+
+```bash
+jq '.cachedGrowthBookFeatures | with_entries(select(.key|startswith("tengu_harbor")))' ~/.claude.json
+```
+
+A working machine reports `"tengu_harbor": true`. If it is `false` or missing, work through these in order:
+
+1. **Telemetry opt-out.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_TELEMETRY` blocks the feature-flag fetch, so the flag falls back to its `false` default. Remove the variable entirely — setting it to `0` does not work. Check your shell profile and the `env` block of `~/.claude/settings.json`.
+
+2. **Network can't reach the flag service.** Common on WSL and behind corporate proxies: WSL runs behind its own NAT with a separate resolver, and Windows proxy settings do not propagate into the distro. Confirm `HTTPS_PROXY` / `HTTP_PROXY` are set correctly inside WSL, or unset if you don't need them. A blocked fetch produces the same silent `false`.
+
+3. **Account not in rollout.** The flag is rolled out gradually and some plans have been excluded. Nothing to configure — the cache will flip to `true` when your account is included.
+
+4. **Version.** The gate was introduced in 2.1.114. Check `claude --version` and update.
+
+What does *not* help: `channelsEnabled` in managed settings is tier-gated to `team` and `enterprise` accounts and is ignored on personal plans; and hand-editing `cachedGrowthBookFeatures` does not stick, since the value is re-evaluated at runtime.
+
+If `tengu_harbor` is `true` and messages still don't arrive, the problem is the second gate — make sure you launched with `--dangerously-load-development-channels plugin:bridge@bored-marketplace` and accepted the confirmation prompt. Run with `--debug` and check `~/.claude/debug/<session-id>.txt`; the skip reason names which gate rejected the channel.
 
 ## License
 
