@@ -53,12 +53,13 @@ jobs:
       # subsystem that shipped broken once already (0.11.1, "fix total inbound
       # delivery outage in 0.11.0").
       #
-      # Measured 2026-08-02: wiring BRIDGE_API_DIR up does not currently work
-      # either. The test seeds SQLite via `bun:sqlite`, and the server repo
-      # retired SQLite for Postgres, so it fails with `no such table: agents`.
-      # Covering this tier needs a cross-org checkout, a Postgres service, and a
-      # rewrite of the seed. Until then this warning is the honest statement of
-      # what this job does and does not prove.
+      # The test itself is healthy: it was ported to Postgres on 2026-08-02 and
+      # passes when wired up (1 pass / 7 assertions / ~14s), having previously
+      # rotted unnoticed behind this same skip. What is still missing is only the
+      # CI plumbing — a cross-org checkout of the server repo (BoredDevelopers ->
+      # plexodus, which needs a token) and a Postgres 18 service for it to create
+      # scratch databases in. Until both exist this warning is the honest
+      # statement of what this job does and does not prove.
       #
       # Conditioned on the env var, not on test output: if someone later wires
       # BRIDGE_API_DIR up, the warning silences itself rather than lying.

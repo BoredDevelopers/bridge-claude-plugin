@@ -21,11 +21,31 @@
  * arrive regardless of channel subscriptions. B is its control — without it,
  * "C surfaced" could just mean the filter never ran.
  *
- * Requires the Bridge server repo. Set BRIDGE_API_DIR to
- * <bridge>/packages/api, or the suite skips rather than passing vacuously.
+ * ── HOW TO RUN IT ────────────────────────────────────────────────────────────
+ * Two things are required, and the test SKIPS rather than passing vacuously if
+ * either is missing:
+ *
+ *   BRIDGE_API_DIR            <bridge>/packages/api
+ *   BRIDGE_TEST_PG_ADMIN_URL  a Postgres 18 to create scratch databases in.
+ *                             Defaults to the server repo's test container
+ *                             (`docker compose -f docker-compose.test.yml up -d`
+ *                             in that repo, or `bun run test` there).
+ *
+ * ⚠️ REWRITTEN 2026-08-02, AND THE REASON MATTERS. This test seeded SQLite via
+ * `bun:sqlite` and a `DB_PATH`, relying on `src/db/index.ts` building the schema
+ * as an import side effect. The server repo retired SQLite for Postgres, which
+ * deleted DB_PATH and moved schema creation into `runMigrations()`. Because the
+ * gate above is an env var nobody sets, NONE of that was noticed: the test kept
+ * reporting `(skip)` and the suite kept reporting green, for the one subsystem
+ * that has already shipped a total outage. Wired up, it failed with `no such
+ * table: agents`.
+ *
+ * The seeding below therefore goes through the SERVER'S OWN drizzle schema
+ * rather than hand-written SQL. Hand-written column lists are exactly what
+ * rotted: they keep parsing long after the schema has moved. Going through
+ * `schema.pg` means a rename breaks this file loudly instead of silently.
  */
-import { test, expect, describe } from "bun:test";
-import { Database } from "bun:sqlite";
+import { test, expect, describe, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -34,47 +54,97 @@ import { createHash } from "node:crypto";
 const API_DIR = process.env.BRIDGE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
 
+// Same default as the server repo's scripts/run-tests.ts, so a developer who
+// has that suite working already has this one working.
+const ADMIN_URL =
+  process.env.BRIDGE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+
+/** Is there actually a Postgres behind ADMIN_URL? Probe, don't assume. */
+async function pgReachable(): Promise<boolean> {
+  try {
+    const probe = new Bun.SQL(ADMIN_URL);
+    await probe`SELECT 1`;
+    await probe.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
+
 const sha = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe.skipIf(!HAVE_SERVER)("inbound routing", () => {
+// Torn down in afterAll so a failed assertion cannot leak a scratch database.
+let dropDb: (() => Promise<void>) | null = null;
+afterAll(async () => {
+  if (dropDb) await dropDb();
+});
+
+describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
   test(
     "targeted messages bypass the channel filter; untargeted ones respect it",
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "bridge-plugin-test-"));
-      const dbPath = join(dir, "t.db");
 
-      const seed = Bun.spawn(
-        ["bun", "-e", `import("${join(API_DIR, "src/db/index.ts")}").then(()=>process.exit(0))`],
-        { env: { ...process.env, DB_PATH: dbPath }, stdout: "ignore", stderr: "pipe" }
-      );
-      if ((await seed.exited) !== 0) throw new Error(await new Response(seed.stderr).text());
+      // ── a scratch database, created and dropped by this test ───────────────
+      // A unique name per run: this suite may run concurrently with the server
+      // repo's own, which uses `bridge_test_*` against the same instance.
+      const dbName = `bridge_plugin_it_${Date.now()}_${process.pid}`;
+      const admin = new Bun.SQL(ADMIN_URL);
+      await admin.unsafe(`CREATE DATABASE "${dbName}"`);
+      const dbUrl = ADMIN_URL.replace(/\/[^/?]+(\?|$)/, `/${dbName}$1`);
+
+      // The pool below must be closed before the database can be dropped, so
+      // both live in the teardown closure rather than in the test body.
+      let closeApiPool: (() => Promise<void>) | null = null;
+      dropDb = async () => {
+        try { if (closeApiPool) await closeApiPool(); } catch {}
+        try { await admin.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`); } catch {}
+        try { await admin.close(); } catch {}
+        dropDb = null;
+      };
+
+      // ⚠️ MIGRATE EXPLICITLY. `src/index.ts` — what `bun start` and the spawn
+      // below run — does NOT create the schema; only `entrypoint.ts` calls
+      // `runMigrations()`, and that is the Docker path. Starting the server
+      // against an empty database without this line yields a server that boots
+      // and then fails on every query.
+      process.env.DATABASE_URL = dbUrl;
+      const api: any = await import(join(API_DIR, "src/db/index.ts"));
+      await api.runMigrations();
+      closeApiPool = async () => { await api.closePool(); };
 
       const TOK_ME = "tok-me", TOK_OTHER = "tok-other";
-      const db = new Database(dbPath);
-      db.prepare("INSERT INTO agents (id,name,token_hash,created_at) VALUES (?,?,?,?)")
-        .run("me", "Me", sha(TOK_ME), Date.now());
-      db.prepare("INSERT INTO agents (id,name,token_hash,created_at) VALUES (?,?,?,?)")
-        .run("other", "Other", sha(TOK_OTHER), Date.now());
+      const { db, schema } = api;
+
+      // Only the NOT NULL columns are set; `created_at` and friends carry schema
+      // defaults. Fewer fields named here is fewer things to rot.
+      await db.insert(schema.agents).values([
+        { id: "me", name: "Me", tokenHash: sha(TOK_ME) },
+        { id: "other", name: "Other", tokenHash: sha(TOK_OTHER) },
+      ]);
+
       // NOT `me-tasks`: an agent's own task channel bypasses the filter by
       // design (it is its inbox), so using it as the "filtered" case would be a
       // control that cannot fail. `other-tasks` models the real situation —
       // another agent's channel that we are not subscribed to.
       for (const c of ["general", "other-tasks"]) {
-        db.prepare("INSERT INTO channels (id,name,created_at) VALUES (?,?,?)").run(c, c, Date.now());
+        await db.insert(schema.channels).values({ id: c, name: c });
         // Interest in BOTH, including the filtered one: without it the server
         // never routes the untargeted message at all, and case B would pass
         // because nothing was sent rather than because the client dropped it.
-        db.prepare(
-          "INSERT OR IGNORE INTO agent_interests (agent_id, interest_type, interest_value) VALUES (?, 'channel', ?)"
-        ).run("me", c);
+        await db
+          .insert(schema.agentInterests)
+          .values({ agentId: "me", interestType: "channel", interestValue: c })
+          .onConflictDoNothing();
       }
 
       const PORT = String(4700 + Math.floor(Number(process.hrtime.bigint() % 200n)));
       const URL_ = `http://localhost:${PORT}`;
       const server = Bun.spawn(["bun", join(API_DIR, "src/index.ts")], {
         env: {
-          ...process.env, DB_PATH: dbPath, PORT,
+          ...process.env, DATABASE_URL: dbUrl, PORT,
           FORGE_OIDC_CLIENT_SECRET: "x",
           BETTER_AUTH_SECRET: "test-secret-at-least-32-characters-long",
           NODE_ENV: "test",
@@ -126,7 +196,12 @@ describe.skipIf(!HAVE_SERVER)("inbound routing", () => {
       rpc({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
       await sleep(3500);
 
-      const ctx = (db.prepare("SELECT id FROM agent_contexts WHERE agent_id='me'").get() as any)?.id;
+      // `pool` is the documented raw escape hatch for the few statements drizzle
+      // cannot express; a one-column lookup does not warrant importing drizzle's
+      // operators into this repo. Parameterised, and deliberately UNNAMED — a
+      // named prepared statement is the pg footgun the server repo warns about.
+      const ctxRows = await api.pool.query("SELECT id FROM agent_contexts WHERE agent_id = $1", ["me"]);
+      const ctx = ctxRows.rows[0]?.id;
       expect(ctx, "plugin never registered a context").toBeTruthy();
 
       const post = (channelId: string, content: string, contextId?: string) =>
