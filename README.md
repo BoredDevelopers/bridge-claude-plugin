@@ -103,7 +103,9 @@ jq '.cachedGrowthBookFeatures | with_entries(select(.key|startswith("tengu_harbo
 
 A working machine reports `"tengu_harbor": true`. If it is `false` or missing, work through these in order:
 
-1. **Telemetry opt-out.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_TELEMETRY` blocks the feature-flag fetch, so the flag falls back to its `false` default. Remove the variable entirely — setting it to `0` does not work. Check your shell profile and the `env` block of `~/.claude/settings.json`.
+1. **Telemetry opt-out — check this first.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_TELEMETRY` blocks the feature-flag fetch, so the flag falls back to its `false` default. Remove the variable **entirely** — setting it to `0` does not work, because the key merely existing is enough. Check your shell profile and the `env` block of `~/.claude/settings.json`.
+
+   *This was the confirmed cause of the one real-world case we have (WSL, 2026-08-03). Rule it out before working through the rest.*
 
 2. **Network can't reach the flag service.** Common on WSL and behind corporate proxies: WSL runs behind its own NAT with a separate resolver, and Windows proxy settings do not propagate into the distro. Confirm `HTTPS_PROXY` / `HTTP_PROXY` are set correctly inside WSL, or unset if you don't need them. A blocked fetch produces the same silent `false`.
 
