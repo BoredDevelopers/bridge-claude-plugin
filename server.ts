@@ -1394,7 +1394,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. Use thread_id to reply in a thread (set to the parent message_id).",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool fetches recent messages from a specific channel.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -1481,9 +1481,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "read_messages",
       description:
         "Read messages from a Bridge channel, oldest first. Every message carries a `seq` — " +
-        "a counter that is dense and gap-free within its channel. To read the rest without " +
-        "gaps or repeats, call again with since_seq set to the `next_since_seq` from the " +
-        "previous result.",
+        "unique and increasing within its channel. Gaps in the returned seqs are normal: they " +
+        "are thread replies, which this tool does not return. With no since_seq you get the " +
+        "NEWEST page and older messages are not returned; pass since_seq: 0 to read a channel " +
+        "from the start, or the `next_since_seq` from a previous result to continue exactly " +
+        "where you left off.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1493,6 +1495,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           limit: {
             type: "number",
+            // Bounds declared, not just prose: the handler clamps to the same
+            // range the server does, and an out-of-range value silently
+            // becoming something else is how `has_more` came to lie.
+            minimum: 1,
+            maximum: 200,
             description: "Max messages to return (default 20, max 200).",
           },
           since_seq: {
@@ -1777,22 +1784,56 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "read_messages": {
         const channelId = args.channel_id as string;
-        const limit = Math.min(Number(args.limit) || 20, 200);
+        /**
+         * ⚠️ MIRRORS THE SERVER'S CLAMP EXACTLY (`messages.ts:531` —
+         * `Math.min(Math.max(Math.trunc(limit || DEFAULT_LIMIT), 1), MAX_LIMIT)`).
+         *
+         * This was `Math.min(Number(args.limit) || 20, 200)`: no lower bound,
+         * no truncation. The wire stayed safe because the server re-clamps —
+         * but `hasMore` below compares `messages.length` against THIS number,
+         * so `limit: -5` returned one row with `has_more: false` and "Caught
+         * up." on a channel holding 99 unread. Measured. Any divergence from
+         * the server's arithmetic comes back as a lie in the hint.
+         */
+        const limit = Math.min(Math.max(Math.trunc(Number(args.limit) || 20), 1), 200);
         const since = args.since as string | undefined;
-        // `!= null` so that since_seq: 0 survives — it is the legitimate "from
-        // the beginning" cursor, since a real seq starts at 1.
+        /**
+         * `!= null` so `since_seq: 0` survives — the legitimate "from the
+         * beginning" cursor, since a real seq starts at 1.
+         *
+         * ⚠️ The `typeof` guard is not pedantry. `Number(true)` is 1 and
+         * `Number([])` is 0, and BOTH pass `Number.isInteger` — measured,
+         * `since_seq: []` silently read the whole channel from the start.
+         */
+        if (
+          args.since_seq != null &&
+          typeof args.since_seq !== "number" &&
+          typeof args.since_seq !== "string"
+        ) {
+          throw new Error(`since_seq must be a number, got ${JSON.stringify(args.since_seq)}`);
+        }
         const sinceSeq = args.since_seq != null ? Number(args.since_seq) : undefined;
 
         // Two cursors making different claims, and no way to tell which one
         // answered. The server refuses this too; refusing here as well means
         // the model gets told what it did wrong instead of an HTTP status.
-        if (sinceSeq !== undefined && since !== undefined) {
+        //
+        // ⚠️ `since !== undefined` here and `since` truthiness at the send below
+        // used to disagree: `{since_seq: 5, since: ""}` was refused as "two
+        // cursors" although the empty string would have been ignored. Both
+        // now test the same thing.
+        const hasSince = since !== undefined && since !== "";
+        if (sinceSeq !== undefined && hasSince) {
           throw new Error(
             "Pass either since_seq or since, not both. since_seq resumes exactly; since is a coarse time filter."
           );
         }
-        if (sinceSeq !== undefined && !Number.isInteger(sinceSeq)) {
-          throw new Error(`since_seq must be a whole number, got ${JSON.stringify(args.since_seq)}`);
+        if (sinceSeq !== undefined && (!Number.isInteger(sinceSeq) || sinceSeq < 0)) {
+          // Bounded here as well as server-side so the model gets a sentence it
+          // can act on rather than a bare 422.
+          throw new Error(
+            `since_seq must be a whole number >= 0, got ${JSON.stringify(args.since_seq)}`
+          );
         }
 
         const params = new URLSearchParams({
@@ -1800,10 +1841,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           limit: String(limit),
         });
         if (sinceSeq !== undefined) params.set("sinceSeq", String(sinceSeq));
-        else if (since) params.set("since", since);
+        else if (hasSince) params.set("since", since!);
 
         const res = await apiFetch(`/api/messages?${params}`);
-        if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
+        // ⚠️ CARRY THE SERVER'S TEXT. A bare status is unactionable for the
+        // model: `since: "yesterday"` is a 400 whose BODY says "Invalid 'since'
+        // timestamp", and the description invites natural language, so that
+        // sentence is the whole clue. Four other call sites in this file
+        // already append the body; this one did not.
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
         const data = (await res.json()) as any;
         const messages = (data.messages ?? []).map((m: any) => ({
           id: m.id,
@@ -1840,7 +1886,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
          * (Zero rows needs no check: an old server returning the newest N would
          * have returned rows, so an empty result is honest either way.)
          */
-        if (sinceSeq !== undefined && messages.length > 0 && messages[0].seq === undefined) {
+        // ⚠️ THE WHOLE PAGE, AND A LOOSE CHECK. Two holes in the earlier version,
+        // both measured:
+        //   - it tested `=== undefined`, and `seq: null` is neither undefined
+        //     nor a number, so a null sailed through and became
+        //     `since_seq: null` in the hint — which `!= null` then treats as no
+        //     cursor at all, producing exactly the tail-of-channel read this
+        //     guard exists to stop, reached via the hint the guard printed.
+        //   - it tested `messages[0]` while the cursor is taken from the LAST
+        //     row, so a mixed page passed the guard and then reported no cursor.
+        if (sinceSeq !== undefined && messages.some((m: any) => typeof m.seq !== "number")) {
           throw new Error(
             "This Bridge server does not support since_seq — it ignored the cursor and returned " +
               "the most recent messages instead. Upgrade the server, or read without since_seq."
@@ -1865,40 +1920,80 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         /**
-         * The result is an OBJECT now, not a bare array, so the next cursor has
+         * The result is an OBJECT, not a bare array, so the next cursor has
          * somewhere to live.
          *
-         * Both modes return oldest-first, so the last row carries the highest
-         * seq — that is the cursor for the next call.
+         * ⚠️ A FULL PAGE MEANS OPPOSITE THINGS IN THE TWO MODES, and conflating
+         * them was a measured lie on the DEFAULT read.
          *
-         * ⚠️ `has_more` is a HEURISTIC and is named honestly. A full page means
-         * there is probably more; it cannot mean there certainly is, because the
-         * server returns no total. Not inventing a `remaining` count for the
-         * same reason — a fabricated number the model would then reason about is
-         * worse than an absent one.
+         *   cursor mode — the server filters `seq > cursor`, orders ASC, takes
+         *     the first `limit`. A full page means more messages AHEAD.
+         *   no cursor  — the server orders `desc(created_at), desc(seq)`, takes
+         *     the NEWEST `limit`, then `rows.reverse()` (messages.ts:640). Both
+         *     modes hand back oldest-first, which is what made this easy to get
+         *     wrong: a full page here means more messages BEHIND.
+         *
+         * The earlier version said `has_more = messages.length === limit` and
+         * always pointed the hint forward. Measured on a 100-message channel:
+         * `read_messages(limit: 20)` returned seq 81..100 with `has_more: true`
+         * and "Next: since_seq: 100" — a call that returns zero rows and reports
+         * "Caught up", with seq 1..80 never read and nothing saying so.
+         *
+         * `next_since_seq` is still the LAST row in both modes (highest seq
+         * either way), so it remains the right value to poll from — it is the
+         * INTERPRETATION that differed, not the number.
          */
+        const cursorMode = sinceSeq !== undefined || hasSince;
         const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
-        const nextSinceSeq = last?.seq;
-        const hasMore = messages.length === limit;
+        // ⚠️ `?? sinceSeq` — the empty poll. Resuming from 100 on a channel
+        // whose head is 100 returns no rows, and the earlier version dropped
+        // `next_since_seq` entirely and said "Nothing to resume from", which is
+        // false: 100 is exactly what to resume from. RFC-008 Decision 7 prefers
+        // an integer seq over an opaque token because "seq stamped on every
+        // message has N carriers" — at zero messages there are zero carriers,
+        // so echoing the cursor back is the only thing keeping it alive.
+        const nextSinceSeq = last?.seq ?? sinceSeq;
+        // Honest heuristic, and only meaningful forward. The server returns no
+        // total, so a full page means "probably", never "certainly" — and no
+        // `remaining` is invented, because a fabricated number the model would
+        // then reason about is worse than an absent one.
+        const hasMore = cursorMode && messages.length === limit;
+        const olderNotReturned = !cursorMode && messages.length === limit;
+
+        let hint: string;
+        if (olderNotReturned) {
+          hint =
+            `Showing the NEWEST ${messages.length}. Older messages exist and were not returned — ` +
+            `read from the start with read_messages(channel_id: "${channelId}", since_seq: 0). ` +
+            `To poll for new ones later: since_seq: ${nextSinceSeq}`;
+        } else if (nextSinceSeq === undefined) {
+          hint = "No messages in this channel. Nothing to resume from.";
+        } else if (messages.length === 0) {
+          hint = `No new messages. Poll again with read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`;
+        } else if (hasMore) {
+          hint = `More may be waiting. Next: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`;
+        } else {
+          hint = `Caught up. To resume later: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`;
+        }
 
         return {
           content: [
             {
               type: "text",
+              // ⚠️ CURSOR FIELDS FIRST. JSON.stringify preserves insertion
+              // order, and with `messages` first a 200-row page buried
+              // `next_since_seq` thousands of tokens below the fold — the one
+              // field the next call needs.
               text: JSON.stringify(
                 {
-                  messages,
                   count: messages.length,
                   next_since_seq: nextSinceSeq,
                   has_more: hasMore,
+                  older_not_returned: olderNotReturned,
                   // A literal next call, because a cursor the model has to
                   // assemble is a cursor it can assemble wrong.
-                  hint:
-                    nextSinceSeq === undefined
-                      ? "No messages. Nothing to resume from."
-                      : hasMore
-                        ? `More may be waiting. Next: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`
-                        : `Caught up. To resume later: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`,
+                  hint,
+                  messages,
                 },
                 null,
                 2
