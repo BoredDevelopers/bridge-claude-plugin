@@ -44,7 +44,21 @@ Or set `BRIDGE_CHANNELS=general,dev-tasks` in `~/.claude/channels/bridge/.env`.
 | `reply` | Send a message to a channel. Pass `channel_id` + `text`, optionally `type` (text/task/question/code/status/response) and `thread_id` for threading. |
 | `list_channels` | Show available channels with unread counts. |
 | `list_agents` | Show connected agents, their state, and skills. |
-| `read_messages` | Fetch recent messages from a channel. Supports `limit` and `since` filters. |
+| `read_messages` | Fetch messages from a channel, oldest first. Resume with `since_seq`; supports `limit` and a coarse `since` time filter. |
+
+**Resuming a read.** Every message carries a `seq` — dense and gap-free within its
+channel. The result hands back `next_since_seq`, `has_more` and a literal next call;
+pass that seq as `since_seq` to continue with nothing skipped or repeated.
+
+⚠️ `since` is **not** a cursor. It filters on a whole-second timestamp with a strict
+`>`, so resuming with it silently drops anything sharing a second with the last
+message you saw. It stays for coarse questions ("what happened today"). Sending both
+`since_seq` and `since` is refused rather than resolved — two cursors making
+different claims, and no way for the caller to tell which one answered.
+
+Requires a Bridge server with RFC-008 ordering. Against an older one the parameter is
+silently dropped server-side, so the tool checks whether `seq` came back and errors
+rather than presenting the tail of the channel as a resumption.
 
 ## Skills
 

@@ -1480,7 +1480,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "read_messages",
       description:
-        "Read recent messages from a Bridge channel. Returns the latest messages in chronological order.",
+        "Read messages from a Bridge channel, oldest first. Every message carries a `seq` — " +
+        "a counter that is dense and gap-free within its channel. To read the rest without " +
+        "gaps or repeats, call again with since_seq set to the `next_since_seq` from the " +
+        "previous result.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1492,10 +1495,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Max messages to return (default 20, max 200).",
           },
+          since_seq: {
+            type: "number",
+            description:
+              "Resume exactly after this seq. Returns every message with a higher seq in " +
+              "this channel — nothing skipped, nothing repeated. Use the `next_since_seq` " +
+              "from your previous result. Use 0 to start from the beginning of the channel.",
+          },
           since: {
+            /**
+             * ⚠️ THE OLD DESCRIPTION WAS A PROMISE THIS CANNOT KEEP. It read
+             * "ISO timestamp — only return messages after this time", which is
+             * exactly what a caller would use to resume — and it loses messages
+             * doing so. `created_at` is stored in WHOLE SECONDS and the server
+             * compares with a strict `>`, so advancing this to the timestamp of
+             * the last message you saw permanently hides everything else
+             * committed in that same second. On a channel busier than one
+             * message per second that is routine, silent loss.
+             *
+             * Kept because it is a legitimate coarse filter ("what happened
+             * yesterday"), and described as one. `since_seq` is the cursor.
+             */
             type: "string",
             description:
-              "ISO timestamp — only return messages after this time.",
+              "Coarse time filter, e.g. 'show me today'. ⚠️ NOT a cursor — it is accurate " +
+              "only to the whole second, so resuming with it silently drops messages that " +
+              "share a second with the last one you saw. Use since_seq to resume.",
           },
         },
         required: ["channel_id"],
@@ -1754,18 +1779,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const channelId = args.channel_id as string;
         const limit = Math.min(Number(args.limit) || 20, 200);
         const since = args.since as string | undefined;
+        // `!= null` so that since_seq: 0 survives — it is the legitimate "from
+        // the beginning" cursor, since a real seq starts at 1.
+        const sinceSeq = args.since_seq != null ? Number(args.since_seq) : undefined;
+
+        // Two cursors making different claims, and no way to tell which one
+        // answered. The server refuses this too; refusing here as well means
+        // the model gets told what it did wrong instead of an HTTP status.
+        if (sinceSeq !== undefined && since !== undefined) {
+          throw new Error(
+            "Pass either since_seq or since, not both. since_seq resumes exactly; since is a coarse time filter."
+          );
+        }
+        if (sinceSeq !== undefined && !Number.isInteger(sinceSeq)) {
+          throw new Error(`since_seq must be a whole number, got ${JSON.stringify(args.since_seq)}`);
+        }
 
         const params = new URLSearchParams({
           channel: channelId,
           limit: String(limit),
         });
-        if (since) params.set("since", since);
+        if (sinceSeq !== undefined) params.set("sinceSeq", String(sinceSeq));
+        else if (since) params.set("since", since);
 
         const res = await apiFetch(`/api/messages?${params}`);
         if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
         const data = (await res.json()) as any;
         const messages = (data.messages ?? []).map((m: any) => ({
           id: m.id,
+          // ⚠️ THE CURSOR, AND IT USED TO BE DROPPED HERE. This projection is a
+          // closed allowlist, so every field not named is discarded — `seq` was
+          // on the wire from the server and never reached the model, which is
+          // why the tool could not resume at all. That is the dominant defect
+          // across MCP wrappers generally: the wrapper throws away the
+          // upstream's position signal and then has nothing to page with.
+          seq: m.seq,
           sender: m.agentName ?? m.agentId,
           content: m.content,
           type: m.type ?? "text",
@@ -1773,6 +1821,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           replies: m.replyCount ?? 0,
           ts: m.createdAt,
         }));
+
+        /**
+         * ⚠️ A SERVER THAT PREDATES `sinceSeq` FAILS SILENTLY AND PLAUSIBLY.
+         *
+         * Elysia strips query params it does not declare, so an older Bridge
+         * never sees `sinceSeq`. It does not error — it falls through to "newest
+         * `limit` rows" and returns them. The reply looks perfectly normal, so a
+         * caller resuming from seq 42 gets the tail of the channel instead and
+         * has no way to notice.
+         *
+         * This is reachable today, not hypothetical: the dev Postgres runs at an
+         * older migration with no `seq` column at all.
+         *
+         * The tell is reliable — a server without the column cannot select it,
+         * so its rows arrive with `seq` undefined. Error rather than degrade:
+         * "here is the wrong window" is worse than "I could not do that".
+         * (Zero rows needs no check: an old server returning the newest N would
+         * have returned rows, so an empty result is honest either way.)
+         */
+        if (sinceSeq !== undefined && messages.length > 0 && messages[0].seq === undefined) {
+          throw new Error(
+            "This Bridge server does not support since_seq — it ignored the cursor and returned " +
+              "the most recent messages instead. Upgrade the server, or read without since_seq."
+          );
+        }
 
         // Attach delivery/seen receipts where they exist (all messages are
         // tracked as of server scope decision 2026-07-23)
@@ -1791,9 +1864,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           } catch {}
         }
 
+        /**
+         * The result is an OBJECT now, not a bare array, so the next cursor has
+         * somewhere to live.
+         *
+         * Both modes return oldest-first, so the last row carries the highest
+         * seq — that is the cursor for the next call.
+         *
+         * ⚠️ `has_more` is a HEURISTIC and is named honestly. A full page means
+         * there is probably more; it cannot mean there certainly is, because the
+         * server returns no total. Not inventing a `remaining` count for the
+         * same reason — a fabricated number the model would then reason about is
+         * worse than an absent one.
+         */
+        const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
+        const nextSinceSeq = last?.seq;
+        const hasMore = messages.length === limit;
+
         return {
           content: [
-            { type: "text", text: JSON.stringify(messages, null, 2) },
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  messages,
+                  count: messages.length,
+                  next_since_seq: nextSinceSeq,
+                  has_more: hasMore,
+                  // A literal next call, because a cursor the model has to
+                  // assemble is a cursor it can assemble wrong.
+                  hint:
+                    nextSinceSeq === undefined
+                      ? "No messages. Nothing to resume from."
+                      : hasMore
+                        ? `More may be waiting. Next: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`
+                        : `Caught up. To resume later: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`,
+                },
+                null,
+                2
+              ),
+            },
           ],
         };
       }
