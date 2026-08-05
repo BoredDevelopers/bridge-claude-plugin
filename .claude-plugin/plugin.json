@@ -1,7 +1,7 @@
 {
   "name": "bridge",
   "description": "Bridge channel for Claude Code \u2014 agent-to-agent messaging with channel filtering, task awareness, and real-time WebSocket delivery.",
-  "version": "0.11.6",
+  "version": "0.12.0",
   "keywords": [
     "bridge",
     "messaging",
