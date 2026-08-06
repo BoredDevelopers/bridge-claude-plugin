@@ -1462,7 +1462,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_channels",
       description:
-        "List available Bridge channels with unread message counts, plus this session's Bridge connection state (use it to check whether inbound messages are actually being received).",
+        "List available Bridge channels. Each carries hasUnread (someone else wrote something you have not read), last_read_seq (your own cursor — pass it to read_messages as since_seq to resume exactly) and last_seq (the channel's head, so you can see how far behind you are). hasUnread and last_read_seq are ABSENT if the server did not report read state; absent means unknown, not 'nothing unread'. Also returns this session's Bridge connection state — use it to check whether inbound messages are actually being received.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -1682,16 +1682,79 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_channels": {
-        const res = await apiFetch("/api/channels");
+        /**
+         * ⚠️ READ STATE IS A SECOND REQUEST NOW, AND THIS TOOL WAS SILENTLY
+         * WRONG WITHOUT IT.
+         *
+         * `GET /api/channels` used to carry `unreadCount` per channel. The
+         * server moved read state to `GET /api/channels/read-state` so the
+         * channel list is identical bytes for every member and can be cached.
+         * This handler kept reading `ch.unreadCount ?? 0` — and the `?? 0` is
+         * what made the breakage SILENT: every channel would report "0 unread",
+         * a perfectly plausible answer, so nothing errored and nothing looked
+         * wrong. A default is not a safe fallback when the thing it stands in
+         * for is a fact about the world.
+         *
+         * The two run together: the second is a small per-principal query, and
+         * serialising them would double the latency of the tool an agent calls
+         * to orient itself.
+         */
+        const [res, stateRes] = await Promise.all([
+          apiFetch("/api/channels"),
+          apiFetch("/api/channels/read-state"),
+        ]);
         if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
         const data = (await res.json()) as any;
-        const channels = (data.channels ?? []).map((ch: any) => ({
-          id: ch.id,
-          name: ch.name,
-          description: ch.description,
-          unread: ch.unreadCount ?? 0,
-          archived: ch.archived ?? false,
-        }));
+
+        /**
+         * ⚠️ ABSENT, NOT `false`, WHEN THE SERVER DID NOT SAY.
+         *
+         * A server predating `/read-state` 404s here, and any request can fail
+         * transiently. Defaulting to `false` would assert "nothing is waiting
+         * for you" on no evidence — the same shape of lie as the `?? 0` this
+         * replaces. An absent field is a question the agent can go and answer; a
+         * false one is an answer it will believe.
+         */
+        const readState = stateRes.ok
+          ? new Map<string, any>(
+              (((await stateRes.json()) as any).readState ?? []).map((r: any) => [
+                r.channelId,
+                r,
+              ])
+            )
+          : null;
+
+        const channels = (data.channels ?? []).map((ch: any) => {
+          const st = readState?.get(ch.id);
+          return {
+            id: ch.id,
+            name: ch.name,
+            description: ch.description,
+            /**
+             * A BOOLEAN, where it used to be a count — hence the new name.
+             * Unread is two units on Bridge now (RFC-008 Decision 3): a channel
+             * answers "is there anything?", a thread answers "how much?".
+             * Keeping the key `unread` would have turned an agent's `unread > 0`
+             * into a silently-false test; `hasUnread` makes a stale reader see
+             * `undefined` instead, which is loud.
+             *
+             * Your own messages never count, so this means "someone else wrote
+             * something you have not read", not "the channel moved".
+             */
+            ...(st ? { hasUnread: st.unread === true } : {}),
+            /**
+             * The agent's OWN cursor here — exactly what `read_messages` takes
+             * as `since_seq`. Handing it over is what lets a new session resume
+             * where the last one stopped without first reading a page to find
+             * out where that was.
+             */
+            ...(st ? { last_read_seq: st.lastReadSeq } : {}),
+            // The channel's head. With `last_read_seq` above, an agent can see
+            // how far behind it is without fetching anything.
+            last_seq: ch.lastSeq,
+            archived: ch.archived ?? false,
+          };
+        });
         // Connection state rides along here: the HTTP API answering says
         // nothing about the WebSocket, and a plugin that is silently deaf to
         // inbound messages is otherwise undiagnosable from inside a session.
