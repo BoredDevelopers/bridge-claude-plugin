@@ -765,9 +765,25 @@ function isAddressed(reasons: unknown): boolean {
 // channel post-dates it). Callers must refresh and re-ask rather than drop.
 type ChannelDecision = "deliver" | "drop" | "unknown";
 
+/**
+ * ⚠️ THERE IS NO `<agent>-tasks` EXEMPTION HERE ANY MORE, and its absence is
+ * deliberate. This function used to open with
+ * `if (agentId && channelId === \`${agentId}-tasks\`) return "deliver"` — a
+ * hardcoded copy, in the client, of a server-side naming convention.
+ *
+ * The server retired that convention (bridge issue #13): nothing auto-creates
+ * `{agentId}-tasks` on connect, and the existing ones are archived. Keeping the
+ * branch would mean a filtered session went on force-delivering an ARCHIVED
+ * channel — and, worse, that any channel an agent could get named `<its-id>-tasks`
+ * silently outranked the operator's BRIDGE_CHANNELS setting.
+ *
+ * Nothing is lost, because the exemption was never what protected addressed
+ * traffic. `isAddressed()` above is: `mention`, `thread`, `target` and
+ * `assignee` pierce the filter on the SERVER'S say-so, whatever the channel is
+ * called. That is strictly stronger than a name match, which is why the
+ * name-based path can go rather than needing a replacement.
+ */
 function channelDecision(channelId: string): ChannelDecision {
-  // Personal task channel always passes through (it's your inbox)
-  if (agentId && channelId === `${agentId}-tasks`) return "deliver";
   // No filter set = deliver everything
   if (CHANNELS_FILTER.length === 0) return "deliver";
   // Match by channel ID directly

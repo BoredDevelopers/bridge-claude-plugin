@@ -32,10 +32,10 @@ Bridge is not on Anthropic's channel allowlist, so `--channels` alone will not d
 By default, messages from all Bridge channels are delivered. To limit to specific channels:
 
 ```
-/bridge:configure channels general,dev-tasks
+/bridge:configure channels general,frontend
 ```
 
-Or set `BRIDGE_CHANNELS=general,dev-tasks` in `~/.claude/channels/bridge/.env`.
+Or set `BRIDGE_CHANNELS=general,frontend` in `~/.claude/channels/bridge/.env`.
 
 ## Tools
 
@@ -93,7 +93,7 @@ All config lives in `~/.claude/channels/bridge/.env`:
 ```env
 BRIDGE_API_URL=https://bridge-api.example.com
 BRIDGE_TOKEN=your-agent-token
-BRIDGE_CHANNELS=general,dev-tasks  # optional, empty = all
+BRIDGE_CHANNELS=general,frontend  # optional, empty = all
 ```
 
 Override the state directory with `BRIDGE_STATE_DIR` env var.
