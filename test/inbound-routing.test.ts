@@ -13,13 +13,20 @@
  *   - this file — catches ANY inbound regression behaviourally
  *
  * WHAT IT PINS
- *   A  subscribed channel, untargeted   -> surfaces
- *   B  other channel,     untargeted    -> filtered (BRIDGE_CHANNELS honoured)
- *   C  other channel,     TARGETED      -> surfaces anyway
+ *   A  subscribed channel,   untargeted   -> surfaces
+ *   B  other channel,       untargeted    -> filtered (BRIDGE_CHANNELS honoured)
+ *   C  other channel,       TARGETED      -> surfaces anyway
+ *   D  our own `me-tasks`,  untargeted    -> filtered, like any other channel
+ *   E  other channel,       @MENTION      -> surfaces anyway
  *
- * C is the one that matters most: a message addressed to THIS session must
- * arrive regardless of channel subscriptions. B is its control — without it,
- * "C surfaced" could just mean the filter never ran.
+ * C and E are the ones that matter most: a message addressed to THIS session
+ * must arrive regardless of channel subscriptions. B is their control — without
+ * it, "C surfaced" could just mean the filter never ran.
+ *
+ * D and E are the two halves of retiring the `<agent>-tasks` convention (bridge
+ * issue #13). D pins that an agent's own task channel lost its filter exemption;
+ * E pins what replaces it, and is strictly stronger — an `@mention` is delivered
+ * in ANY channel, not just one named after the agent.
  *
  * ── HOW TO RUN IT ────────────────────────────────────────────────────────────
  * Two things are required, and the test SKIPS rather than passing vacuously if
@@ -125,15 +132,33 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
         { id: "other", name: "Other", tokenHash: sha(TOK_OTHER) },
       ]);
 
-      // NOT `me-tasks`: an agent's own task channel bypasses the filter by
-      // design (it is its inbox), so using it as the "filtered" case would be a
-      // control that cannot fail. `other-tasks` models the real situation —
-      // another agent's channel that we are not subscribed to.
-      for (const c of ["general", "other-tasks"]) {
-        await db.insert(schema.channels).values({ id: c, name: c });
-        // Interest in BOTH, including the filtered one: without it the server
-        // never routes the untargeted message at all, and case B would pass
-        // because nothing was sent rather than because the client dropped it.
+      /**
+       * `me-tasks` IS NOW A REAL CASE, and used to be excluded from this list
+       * with the note "a control that cannot fail" — because `channelDecision()`
+       * exempted the agent's own `<id>-tasks` channel from the filter outright.
+       *
+       * That exemption is gone (bridge issue #13). A channel named after this
+       * agent is now an ordinary channel: unsubscribed and unaddressed, it drops
+       * like any other, which is case D below. `other-tasks` stays as the
+       * someone-else's-channel case so both sides of the old special-case are
+       * covered rather than swapped.
+       */
+      // ⚠️ `me-tasks` CARRIES `ownerAgentId: "me"`, which is not decoration. A
+      // real auto-provisioned `-tasks` channel was owned, and ownership is what
+      // produced the `owner` delivery reason — the ONLY broadcast-tier reason a
+      // card-less agent got in its own task channel. Seeding it without an owner
+      // would route case D via the channel interest instead, exercising a
+      // different reason than the one being retired.
+      for (const [c, owner] of [
+        ["general", null],
+        ["other-tasks", null],
+        ["me-tasks", "me"],
+      ] as const) {
+        await db.insert(schema.channels).values({ id: c, name: c, ownerAgentId: owner });
+        // Interest in ALL of them, including the filtered ones: without it the
+        // server never routes the untargeted message at all, and cases B and D
+        // would pass because nothing was sent rather than because the client
+        // dropped it.
         await db
           .insert(schema.agentInterests)
           .values({ agentId: "me", interestType: "channel", interestValue: c })
@@ -211,14 +236,72 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
           body: JSON.stringify({ channelId, content, ...(contextId ? { contextId } : {}) }),
         }).then((r) => r.json());
 
-      const count = () => notes.filter((n) => n.method === "notifications/claude/channel").length;
+      /**
+       * ⚠️ MATCH THE MESSAGE, DO NOT COUNT NOTIFICATIONS.
+       *
+       * This was `count() > before`, and that is unsound in a way that produces
+       * FALSE PASSES on exactly the negative assertions. Four sites emit
+       * `notifications/claude/channel` and only ONE of them is a delivered
+       * message — the others are the `✓✓` receipt, the server-error banner and
+       * the inbound-failure warning. Worse, the windows were fixed sleeps: a
+       * message that arrived merely LATE landed outside its own window and
+       * inside the NEXT case's, so one slow frame read as "D was filtered" AND
+       * "E arrived" — both wrong, both green.
+       *
+       * Matching a unique marker in the content decouples the cases from each
+       * other and from arrival order entirely. Markers are distinctive strings,
+       * not the old bare letters: "A" occurs inside plenty of other notification
+       * text.
+       */
+      const arrived = (marker: string) =>
+        notes.some(
+          (n) =>
+            n.method === "notifications/claude/channel" &&
+            String(n.params?.content ?? "").includes(marker)
+        );
 
-      const a0 = count(); await post("general", "A"); await sleep(2500);
-      const gotA = count() > a0;
-      const b0 = count(); await post("other-tasks", "B"); await sleep(2500);
-      const gotB = count() > b0;
-      const c0 = count(); await post("other-tasks", "C", ctx); await sleep(3000);
-      const gotC = count() > c0;
+      /**
+       * Poll rather than sleep a fixed span. A positive returns the moment the
+       * frame lands; a negative pays the full window — which is the right way
+       * round, since proving an absence is what actually needs the time. The old
+       * code gave the negatives the SHORTER wait.
+       */
+      const awaitArrival = async (marker: string, windowMs = 4000) => {
+        const deadline = Date.now() + windowMs;
+        while (Date.now() < deadline) {
+          if (arrived(marker)) return true;
+          await sleep(50);
+        }
+        return false;
+      };
+
+      await post("general", "case-A-subscribed-untargeted");
+      const gotA = await awaitArrival("case-A-subscribed-untargeted");
+
+      await post("other-tasks", "case-B-unsubscribed-untargeted");
+      const gotB = await awaitArrival("case-B-unsubscribed-untargeted");
+
+      await post("other-tasks", "case-C-targeted", ctx);
+      const gotC = await awaitArrival("case-C-targeted");
+
+      // D: OUR OWN `me-tasks`, unsubscribed and unaddressed. Delivered
+      // unconditionally before the exemption was removed.
+      await post("me-tasks", "case-D-own-tasks-channel");
+      const gotD = await awaitArrival("case-D-own-tasks-channel");
+
+      /**
+       * E: AN @MENTION IN AN UNSUBSCRIBED CHANNEL — the claim that justifies
+       * retiring `-tasks` at all.
+       *
+       * The argument for the retirement is that addressing already reaches an
+       * agent anywhere, so a per-agent channel buys nothing. That is only true
+       * if a `mention` survives a channel filter that excludes the channel, and
+       * B above proves the filter really does drop THIS channel — same channel,
+       * same filter, opposite outcome — so E is not vacuous. Mentions are on by
+       * default server-side; `@me` is matched as a whole token against the id.
+       */
+      await post("other-tasks", "@me case-E-mention-pierces-filter");
+      const gotE = await awaitArrival("case-E-mention-pierces-filter");
 
       // The inbound path must never throw. This is the assertion that would
       // have caught 0.11.0 on the very first message.
@@ -229,8 +312,12 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       expect(gotA, "subscribed + untargeted should surface").toBe(true);
       expect(gotB, "unsubscribed + untargeted should be filtered").toBe(false);
       expect(gotC, "TARGETED at this session must surface regardless of filter").toBe(true);
+      expect(gotD, "our own `-tasks` channel no longer bypasses the filter").toBe(false);
+      expect(gotE, "an @mention must pierce the channel filter").toBe(true);
       expect(errLines.some((l) => l.includes("FILTERED ch=other-tasks")),
         "expected the client filter to log the drop").toBe(true);
+      expect(errLines.some((l) => l.includes("FILTERED ch=me-tasks")),
+        "expected our own -tasks channel to be dropped by the filter too").toBe(true);
     },
     120_000
   );

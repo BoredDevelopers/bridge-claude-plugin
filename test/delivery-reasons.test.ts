@@ -14,6 +14,14 @@
  * arrives. That is the part that makes this worth a test rather than a patch:
  * the ledger asserted the client had a message the model never saw.
  *
+ * ⚠️ THE `-tasks` EXEMPTION DESCRIBED ABOVE NO LONGER EXISTS. It was deleted
+ * with the convention itself (bridge issue #13), so that paragraph is history,
+ * not a description of today's code. Nothing in this file needed changing when
+ * it went — which is the point: these tests were always about the REASON TIER,
+ * never the channel name. Note the exemption never fired here anyway (the stub
+ * authenticates as `jorgen-mac` while `CHANNEL` is `aio-tasks`), so nothing
+ * would have gone red to tell you the comment had rotted.
+ *
  * WHAT THESE ASSERT, AND WHY IT IS STDOUT
  * The observable is the MCP notification on stdout — `notifications/claude/channel`
  * — which is the actual model-facing surface. Asserting the absence of the

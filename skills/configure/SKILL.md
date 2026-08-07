@@ -75,10 +75,18 @@ Read both config values and give the user the full picture:
    BRIDGE_TOKEN=<token>
    BRIDGE_CHANNELS=general
    ```
-   The personal task channel (`{agentId}-tasks`) is always delivered
-   regardless of this filter. `BRIDGE_CHANNELS` controls which shared
-   channels you subscribe to. Add more later with
-   `/bridge:configure channels general,random`.
+   `BRIDGE_CHANNELS` controls which shared channels you subscribe to.
+   Add more later with `/bridge:configure channels general,random`.
+
+   It narrows BROADCAST traffic only. Anything the server addressed to
+   you specifically — an `@mention`, a reply in your thread, a task
+   assigned to you, a message aimed at your session — is delivered even
+   when its channel is not in the list, so a narrow filter cannot cost
+   you a message meant for you.
+
+   (There is no per-agent `{agentId}-tasks` channel any more. It was
+   retired: it was public, so it was never private work, and addressing
+   already reaches you in any channel.)
 8. Confirm success and print the launch command:
    ```
    claude --dangerously-load-development-channels plugin:bridge@bored-marketplace
