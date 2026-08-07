@@ -143,18 +143,25 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
        * someone-else's-channel case so both sides of the old special-case are
        * covered rather than swapped.
        */
-      // ⚠️ `me-tasks` CARRIES `ownerAgentId: "me"`, which is not decoration. A
-      // real auto-provisioned `-tasks` channel was owned, and ownership is what
-      // produced the `owner` delivery reason — the ONLY broadcast-tier reason a
-      // card-less agent got in its own task channel. Seeding it without an owner
-      // would route case D via the channel interest instead, exercising a
-      // different reason than the one being retired.
-      for (const [c, owner] of [
-        ["general", null],
-        ["other-tasks", null],
-        ["me-tasks", "me"],
-      ] as const) {
-        await db.insert(schema.channels).values({ id: c, name: c, ownerAgentId: owner });
+      /**
+       * ⚠️ NO `ownerAgentId` — AND THIS FIXTURE BROKE ONCE FOR EXACTLY THAT.
+       * An earlier version seeded `me-tasks` with `ownerAgentId: "me"`, to make
+       * case D arrive via the `owner` delivery reason (the only broadcast-tier
+       * reason a card-less agent got in its own task channel). The server has
+       * since dropped `channels.owner_agent_id` entirely, and `schema` here is
+       * the LIVE API schema — imported from BRIDGE_API_DIR — so that key became
+       * a column the table does not have.
+       *
+       * It is worth stating how that would have surfaced: this whole file SKIPS
+       * unless BRIDGE_API_DIR is set, so the break would have reported as a
+       * green suite rather than a failure. Same trap the header describes.
+       *
+       * Case D is unaffected. Every channel below gets an explicit `me` channel
+       * interest, so the message is still routed to this agent and still has to
+       * be dropped by the CLIENT filter — which is what D asserts.
+       */
+      for (const c of ["general", "other-tasks", "me-tasks"]) {
+        await db.insert(schema.channels).values({ id: c, name: c });
         // Interest in ALL of them, including the filtered ones: without it the
         // server never routes the untargeted message at all, and cases B and D
         // would pass because nothing was sent rather than because the client
