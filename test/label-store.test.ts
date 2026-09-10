@@ -56,6 +56,12 @@ describe("writeLabelFile / readLabelFile", () => {
   test("readLabelFile returns null when the file is missing", () => {
     expect(readLabelFile(dir, "does-not-exist")).toBeNull();
   });
+
+  test("creates a non-existent nested directory before writing", () => {
+    const nested = join(dir, "a", "b");
+    writeLabelFile(nested, "sess5", "Nested Dir Test");
+    expect(readLabelFile(nested, "sess5")).toBe("Nested Dir Test");
+  });
 });
 
 describe("clearLabelFile", () => {

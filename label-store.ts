@@ -15,7 +15,7 @@
  * settled and consumed by minimalSessionInfo(); the `set_session_label` tool
  * writes/clears the file through writeLabelFile/clearLabelFile below.
  */
-import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
 import { join } from "path";
 
 /** Same key-sanitisation rule as cursorFileFor. */
@@ -33,9 +33,13 @@ export function readLabelFile(dir: string, key: string): string | null {
 }
 
 /** Atomic write: tmp file (pid-suffixed so concurrent writers can't clobber
- * each other's staged file) then rename — same as saveCursor. */
+ * each other's staged file) then rename — same as saveCursor. Ensures `dir`
+ * exists first (same as saveCursor's `mkdirSync(STATE_DIR,{recursive:true,
+ * mode:0o700})`) — without it, a write against a fresh STATE_DIR silently
+ * no-ops inside the catch instead of persisting anything. */
 export function writeLabelFile(dir: string, key: string, label: string): void {
   try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     const target = labelFileFor(dir, key);
     const tmp = `${target}.${process.pid}.tmp`;
     writeFileSync(tmp, label + "\n", { mode: 0o600 });

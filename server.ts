@@ -2158,7 +2158,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!agentId || !myContextId) {
           throw new Error("not yet authenticated on Bridge");
         }
-        const label = String(args.label ?? "");
+        // Trimmed once, up front: a whitespace-only arg must read as a clear,
+        // matching the server's own sanitizeSessionLabel (trims -> empty ->
+        // clear). Otherwise the client would persist " " to the label file
+        // and report "renamed" for something the server treats as empty.
+        const label = String(args.label ?? "").trim();
         const res = await apiFetch(
           `/api/agents/${encodeURIComponent(agentId)}/contexts/${encodeURIComponent(myContextId)}/label`,
           { method: "PUT", body: JSON.stringify({ label }) }
@@ -2168,8 +2172,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const stored = data.label ?? "";
         // Effective immediately: the NEXT auth frame (a reconnect, or the
         // server rebinding this connection) carries the new value without
-        // requiring a process restart.
-        sessionLabel = label ? stored : "";
+        // requiring a process restart. Must be the RAW label, not `stored`
+        // (the server's suffixed "Name · #id" form) — `sessionLabel` feeds
+        // minimalSessionInfo().sessionLabel on that next auth frame, and the
+        // server re-suffixes whatever it receives. Storing `stored` here
+        // would compound the suffix on every subsequent reconnect. `label`
+        // is already "" on the clear path.
+        sessionLabel = label;
         // Store the RAW label the user typed, not the suffixed `Name · #id`
         // form the server just returned. On the next plugin launch this same
         // raw value feeds back into minimalSessionInfo().sessionLabel, and the
