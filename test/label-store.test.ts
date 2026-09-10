@@ -12,7 +12,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, utimesSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { labelFileFor, readLabelFile, writeLabelFile, sweepLabelFiles } from "../label-store";
+import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "../label-store";
 
 let dir = "";
 beforeEach(() => {
@@ -55,6 +55,20 @@ describe("writeLabelFile / readLabelFile", () => {
 
   test("readLabelFile returns null when the file is missing", () => {
     expect(readLabelFile(dir, "does-not-exist")).toBeNull();
+  });
+});
+
+describe("clearLabelFile", () => {
+  test("removes a stored label so readLabelFile returns null", () => {
+    writeLabelFile(dir, "sess4", "To Be Cleared");
+    expect(readLabelFile(dir, "sess4")).toBe("To Be Cleared");
+    clearLabelFile(dir, "sess4");
+    expect(readLabelFile(dir, "sess4")).toBeNull();
+  });
+
+  test("clearing a missing file is a no-op", () => {
+    expect(() => clearLabelFile(dir, "never-existed")).not.toThrow();
+    expect(readLabelFile(dir, "never-existed")).toBeNull();
   });
 });
 

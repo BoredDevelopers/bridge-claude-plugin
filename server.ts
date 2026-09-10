@@ -35,6 +35,7 @@ import {
 } from "fs";
 import { homedir, hostname } from "os";
 import { join } from "path";
+import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -51,7 +52,18 @@ const SESSION_KEY_OVERRIDE = (process.env.BRIDGE_SESSION_KEY ?? "").trim();
 // Same real-env-before-.env rule as SESSION_KEY_OVERRIDE: ENV_FILE is
 // machine-global, so a label there would name every session on the box the
 // same. Only a per-launch env var may set it.
+//
+// This is the top of the resolution precedence — env override > stored
+// label file (SESSION_KEY-keyed, see label-store.ts) > "" (no label; the
+// server derives one). Settled into module-scope `sessionLabel` once
+// SESSION_KEY is resolved, near the bottom of this file.
 const SESSION_LABEL_OVERRIDE = (process.env.BRIDGE_SESSION_LABEL ?? "").trim();
+
+// Resolved once SESSION_KEY is (see bottom of file); read by
+// minimalSessionInfo(). Mutable because the set_session_label tool updates it
+// in place after a successful rename/clear, without requiring a reconnect to
+// take effect on the NEXT auth frame.
+let sessionLabel = "";
 
 // Load .env (real env wins)
 try {
@@ -378,7 +390,7 @@ function minimalSessionInfo(): Record<string, string> {
     info.hostName = hostname();
   } catch {}
   info.sessionKey = SESSION_KEY;
-  if (SESSION_LABEL_OVERRIDE) info.sessionLabel = SESSION_LABEL_OVERRIDE;
+  if (sessionLabel) info.sessionLabel = sessionLabel;
   return info;
 }
 
@@ -1614,6 +1626,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: [],
       },
     },
+    {
+      name: "set_session_label",
+      description:
+        "Rename this session's Bridge display name (how other agents see you in channels and presence). Persists across restarts for this session. Pass an empty string to clear it back to the derived default name.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description: "New name; empty string clears to the derived name.",
+          },
+        },
+        required: ["label"],
+      },
+    },
   ],
 }));
 
@@ -2125,6 +2152,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
       }
 
+      case "set_session_label": {
+        // Both come only from a completed WS auth round-trip (handleWsMessage's
+        // "authenticated" case); nothing to address the rename at before then.
+        if (!agentId || !myContextId) {
+          throw new Error("not yet authenticated on Bridge");
+        }
+        const label = String(args.label ?? "");
+        const res = await apiFetch(
+          `/api/agents/${encodeURIComponent(agentId)}/contexts/${encodeURIComponent(myContextId)}/label`,
+          { method: "PUT", body: JSON.stringify({ label }) }
+        );
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        const data = (await res.json()) as { label?: string };
+        const stored = data.label ?? "";
+        // Effective immediately: the NEXT auth frame (a reconnect, or the
+        // server rebinding this connection) carries the new value without
+        // requiring a process restart.
+        sessionLabel = label ? stored : "";
+        // Store the RAW label the user typed, not the suffixed `Name · #id`
+        // form the server just returned. On the next plugin launch this same
+        // raw value feeds back into minimalSessionInfo().sessionLabel, and the
+        // SERVER re-applies its own suffix on connect — storing the already-
+        // suffixed form would double-suffix on every subsequent launch.
+        if (label) writeLabelFile(STATE_DIR, SESSION_KEY, label);
+        else clearLabelFile(STATE_DIR, SESSION_KEY);
+        // Drop the auth-payload memo so a reconnect re-collects and re-sends
+        // sessionInfo with the new label rather than replaying the cached one.
+        sessionInfoPromise = null;
+        return {
+          content: [
+            {
+              type: "text",
+              text: label
+                ? `Session renamed to "${stored}".`
+                : `Session name cleared (now "${stored}").`,
+            },
+          ],
+        };
+      }
+
       default:
         return {
           content: [
@@ -2338,6 +2405,14 @@ SESSION_KEY = resolvedSessionKey.key;
 CURSOR_FILE = cursorFileFor(SESSION_KEY);
 lastMessageTime = loadCursor();
 sweepCursors();
+
+// Same precedence note as SESSION_LABEL_OVERRIDE above: launch env wins,
+// then whatever set_session_label persisted on a previous launch of THIS
+// session key, else "" (minimalSessionInfo omits the field and the server
+// derives a name). Swept on the same age-based, never-current-file terms as
+// cursors — nothing else prunes these files either.
+sessionLabel = SESSION_LABEL_OVERRIDE || readLabelFile(STATE_DIR, SESSION_KEY) || "";
+sweepLabelFiles(STATE_DIR, labelFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
 // The one line someone debugging a lost context will need.
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`

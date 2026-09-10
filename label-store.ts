@@ -10,9 +10,10 @@
  * Keyed by SESSION_KEY (resume-stable), NOT CLAUDE_CODE_SESSION_ID — see
  * server.ts:94-111 for why the launch id changes on every `--continue`.
  *
- * Wiring this into server.ts (resolution precedence env > stored > "", and
- * the minimalSessionInfo() read) is a later task. This module only stores
- * and retrieves the label.
+ * Wired into server.ts: resolution precedence is env override > stored file
+ * > "" (derived), read into module-scope `sessionLabel` once SESSION_KEY is
+ * settled and consumed by minimalSessionInfo(); the `set_session_label` tool
+ * writes/clears the file through writeLabelFile/clearLabelFile below.
  */
 import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync } from "fs";
 import { join } from "path";
@@ -39,6 +40,14 @@ export function writeLabelFile(dir: string, key: string, label: string): void {
     const tmp = `${target}.${process.pid}.tmp`;
     writeFileSync(tmp, label + "\n", { mode: 0o600 });
     renameSync(tmp, target);
+  } catch {}
+}
+
+/** Delete the stored label file, if any. Clearing a missing file is a no-op —
+ * same try/catch-swallow idiom as every other write here. */
+export function clearLabelFile(dir: string, key: string): void {
+  try {
+    unlinkSync(labelFileFor(dir, key));
   } catch {}
 }
 
