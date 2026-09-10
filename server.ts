@@ -48,6 +48,11 @@ const ENV_FILE = join(STATE_DIR, ".env");
 // box into one shared Bridge context. Only a per-process env var may override.
 const SESSION_KEY_OVERRIDE = (process.env.BRIDGE_SESSION_KEY ?? "").trim();
 
+// Same real-env-before-.env rule as SESSION_KEY_OVERRIDE: ENV_FILE is
+// machine-global, so a label there would name every session on the box the
+// same. Only a per-launch env var may set it.
+const SESSION_LABEL_OVERRIDE = (process.env.BRIDGE_SESSION_LABEL ?? "").trim();
+
 // Load .env (real env wins)
 try {
   chmodSync(ENV_FILE, 0o600);
@@ -373,6 +378,7 @@ function minimalSessionInfo(): Record<string, string> {
     info.hostName = hostname();
   } catch {}
   info.sessionKey = SESSION_KEY;
+  if (SESSION_LABEL_OVERRIDE) info.sessionLabel = SESSION_LABEL_OVERRIDE;
   return info;
 }
 
