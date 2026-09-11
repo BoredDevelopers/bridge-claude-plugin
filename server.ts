@@ -72,6 +72,22 @@ let sessionLabel = "";
 // tools update it in place, the same way sessionLabel does.
 let wantConnected = false;
 
+// Set by `connect`/`disconnect` before they touch anything SESSION_KEY-keyed.
+// Tools are answerable before SESSION_KEY (and the wantConnected it is read
+// against) resolve — up to SESSION_MAP_WAIT_MS (see resolveSessionKey below).
+// A connect/disconnect issued in that window must not have its intent
+// silently overwritten once startup's own resolution runs; the startup
+// assignment at the bottom of this file only fires while this is still
+// false.
+let intentExplicitlySet = false;
+
+// Shared awaitable for SESSION_KEY resolution, assigned once (near the bottom
+// of this file) right after mcp.connect(). Both the startup sequence AND the
+// `connect`/`disconnect` handlers await this exact promise before reading or
+// writing anything keyed by SESSION_KEY, so a tool call in the pre-settle
+// window persists under the REAL resolved key instead of FALLBACK_SESSION_KEY.
+let sessionKeyReady: Promise<{ key: string; source: string }> | null = null;
+
 // Load .env (real env wins)
 try {
   chmodSync(ENV_FILE, 0o600);
@@ -2302,6 +2318,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (label) persistLabel(label);
 
         wantConnected = true;
+        // Mark BEFORE awaiting resolution below: this must win over the
+        // startup assignment regardless of how the two race (see
+        // intentExplicitlySet's declaration).
+        intentExplicitlySet = true;
+        // Wait for the real SESSION_KEY before persisting — a connect issued
+        // before it settles would otherwise write under FALLBACK_SESSION_KEY.
+        if (sessionKeyReady) await sessionKeyReady;
         writeConnectState(STATE_DIR, SESSION_KEY, true);
 
         if (!API_URL || !TOKEN) {
@@ -2327,6 +2350,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "disconnect": {
         wantConnected = false;
+        // Mark BEFORE awaiting resolution below — same reasoning as connect.
+        intentExplicitlySet = true;
+        // Wait for the real SESSION_KEY before persisting — a disconnect
+        // issued before it settles would otherwise write under
+        // FALLBACK_SESSION_KEY.
+        if (sessionKeyReady) await sessionKeyReady;
         writeConnectState(STATE_DIR, SESSION_KEY, false);
         // Cancel anything already scheduled — a socket mid-backoff must not
         // fire a reconnect after this tool returns. scheduleReconnect()'s own
@@ -2338,6 +2367,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (livenessTimer) {
           clearInterval(livenessTimer);
           livenessTimer = null;
+        }
+        // Also cancel a lock-retry loop armed by connectUnlessDuplicate()
+        // while a sibling held the session lock — that self-recursion reaches
+        // connectWs() WITHOUT going through scheduleReconnect(), so its
+        // `!wantConnected` guard above never sees it. Belt-and-suspenders
+        // with the `!wantConnected` guard now at the top of
+        // connectUnlessDuplicate() itself.
+        if (lockRetryTimer) {
+          clearTimeout(lockRetryTimer);
+          lockRetryTimer = null;
         }
         try {
           ws?.close();
@@ -2532,6 +2571,15 @@ function releaseSessionLock(): void {
  * turn a duplicate into a broken session the moment the holder shut down first.
  */
 function connectUnlessDuplicate(): void {
+  // This is its own self-recursion (via lockRetryTimer below), NOT a call
+  // routed through scheduleReconnect() — so scheduleReconnect()'s own
+  // `!wantConnected` guard never sees these retries. Without this guard, a
+  // `disconnect` while a sibling held the lock left lockRetryTimer armed;
+  // once the sibling freed the lock, the timer would still fire, win it, and
+  // reconnect — after an explicit disconnect. `disconnect` also clears
+  // lockRetryTimer directly (belt-and-suspenders), but this guard is what
+  // makes a stray fire inert regardless.
+  if (!wantConnected) return;
   if (shuttingDown) return;
   if (acquireSessionLock()) {
     if (lockRetryTimer) { clearTimeout(lockRetryTimer); lockRetryTimer = null; }
@@ -2579,9 +2627,18 @@ process.on("SIGINT", shutdown);
 // carries it (the Bridge server reuses it as the context ID) and the cursor
 // file is named after it. Deliberately after mcp.connect, so tools stay
 // answerable while this waits on the hook.
-const resolvedSessionKey = await resolveSessionKey();
-SESSION_KEY = resolvedSessionKey.key;
-CURSOR_FILE = cursorFileFor(SESSION_KEY);
+//
+// Assigned into the SHARED sessionKeyReady declared near wantConnected above:
+// the connect/disconnect handlers await this exact promise too, instead of
+// racing this resolution on their own — SESSION_KEY is set inside its `.then`
+// so anything awaiting it (here or from a handler) sees SESSION_KEY already
+// resolved by the time it resumes, regardless of who started waiting first.
+sessionKeyReady = resolveSessionKey().then((resolved) => {
+  SESSION_KEY = resolved.key;
+  CURSOR_FILE = cursorFileFor(SESSION_KEY);
+  return resolved;
+});
+const resolvedSessionKey = await sessionKeyReady;
 lastMessageTime = loadCursor();
 sweepCursors();
 
@@ -2596,9 +2653,14 @@ sweepLabelFiles(STATE_DIR, labelFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MA
 // Same precedence idea as sessionLabel above: whatever the connect/disconnect
 // tools persisted on a previous launch of THIS session key wins; else
 // BRIDGE_AUTOCONNECT decides. Swept on the same age-based, never-current-file
-// terms as cursors and labels.
-wantConnected = readConnectState(STATE_DIR, SESSION_KEY)
-  ?? (process.env.BRIDGE_AUTOCONNECT === "1");
+// terms as cursors and labels. Guarded on intentExplicitlySet: a
+// connect/disconnect already answered in the pre-settle window set
+// wantConnected (and persisted it under the now-resolved SESSION_KEY via the
+// same sessionKeyReady await) — this must not clobber that with a stale read.
+if (!intentExplicitlySet) {
+  wantConnected = readConnectState(STATE_DIR, SESSION_KEY)
+    ?? (process.env.BRIDGE_AUTOCONNECT === "1");
+}
 sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
 // The one line someone debugging a lost context will need.
 process.stderr.write(

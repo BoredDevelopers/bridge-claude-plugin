@@ -11,7 +11,7 @@
  * pipe) rather than resolving.
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -399,6 +399,192 @@ describe("connect-on-demand: connect/disconnect tools", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 40_000);
+});
+
+/**
+ * connect-on-demand: Finding 1 — disconnect must stop an ARMED lock-retry
+ * loop, not just the reconnect/liveness timers.
+ *
+ * `connectUnlessDuplicate()` self-recurses via `lockRetryTimer` when the
+ * session lock is held by a sibling — a path that reaches `connectWs()`
+ * WITHOUT going through `scheduleReconnect()`, so `scheduleReconnect`'s own
+ * `!wantConnected` guard never sees it. Before the fix, `disconnect` cleared
+ * `reconnectTimer` and `livenessTimer` but not `lockRetryTimer`: once the
+ * sibling holding the lock went away, the still-armed timer would win the
+ * freed lock and reconnect — after an explicit disconnect.
+ *
+ * Spawns a HOLDER that keeps the session lock (mirrors session-lock.test.ts),
+ * then a LOSER sharing its session key with BRIDGE_AUTOCONNECT=1 so it arms
+ * lockRetryTimer on startup, calls `disconnect` on the loser, frees the lock
+ * by killing the holder, waits past LOCK_RETRY_MS (30s, server.ts), and
+ * asserts the loser never sent an auth frame and its connect-state file
+ * reads "0".
+ */
+function pipeToString(stream: { on(event: "data", cb: (chunk: Buffer) => void): unknown } | null): () => string {
+  let acc = "";
+  stream?.on("data", (chunk: Buffer) => {
+    acc += chunk.toString();
+  });
+  return () => acc;
+}
+
+describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
+  test("disconnect stops the duplicate-instance lock-retry loop", async () => {
+    const key = "40000000-0000-0000-0000-000000000001";
+    const dir = mkdtempSync(join(tmpdir(), "cod-lockretry-"));
+    const stub = startToolStub();
+
+    // HOLDER: acquires and keeps the lock for `key` via the BRIDGE_SESSION_KEY
+    // override (settles immediately, unlike the loser below). Points at a
+    // closed port, like session-lock.test.ts's boot() — only the lock matters
+    // here, not whether the holder itself ever authenticates.
+    const holder = Bun.spawn(["bun", SERVER], {
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_DATA: dir,
+        BRIDGE_STATE_DIR: dir,
+        BRIDGE_API_URL: "http://127.0.0.1:1",
+        BRIDGE_TOKEN: "test-token",
+        BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_SESSION_KEY: key,
+        CLAUDE_CODE_SSE_PORT: "",
+      } as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let holderErr = "";
+    (async () => {
+      const d = new TextDecoder();
+      for await (const c of holder.stderr as any) holderErr += d.decode(c, { stream: true });
+    })();
+    const holderDeadline = Date.now() + 9_000;
+    while (Date.now() < holderDeadline && !/session lock acquired/.test(holderErr)) {
+      await Bun.sleep(100);
+    }
+    expect(holderErr, "holder must take the lock before the loser starts").toContain(
+      "session lock acquired"
+    );
+
+    // LOSER: same session key, resolved via CLAUDE_CODE_SESSION_ID — the
+    // BRIDGE_SESSION_KEY override is reserved for the holder above, so the
+    // loser goes through the normal ~3s resolution path like the Task 4/5
+    // tests. BRIDGE_AUTOCONNECT=1 so it attempts to connect on its own once
+    // SESSION_KEY settles, loses the lock race, and arms lockRetryTimer.
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_DATA: dir,
+        BRIDGE_STATE_DIR: dir,
+        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
+        BRIDGE_TOKEN: "test-token",
+        BRIDGE_AUTOCONNECT: "1",
+        CLAUDE_CODE_SESSION_ID: key,
+        CLAUDE_CODE_SSE_PORT: "",
+      } as Record<string, string>,
+    });
+    const loserErr = pipeToString(transport.stderr as any);
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+
+    try {
+      await client.connect(transport);
+
+      const duplicateDeadline = Date.now() + 15_000;
+      while (Date.now() < duplicateDeadline && !/DUPLICATE INSTANCE/.test(loserErr())) {
+        await Bun.sleep(100);
+      }
+      expect(loserErr(), "the loser must lose the lock race and arm lockRetryTimer").toContain(
+        "DUPLICATE INSTANCE"
+      );
+
+      const disconnectResult = await client.callTool({ name: "disconnect", arguments: {} });
+      expect(disconnectResult?.isError).not.toBe(true);
+      expect(readState(dir, key)).toBe("0");
+
+      // Free the lock the loser is standing by for.
+      holder.kill();
+      await holder.exited;
+
+      // Past LOCK_RETRY_MS (30s, server.ts): with the guard/clear both
+      // missing, the armed timer fires here, wins the now-free lock, and
+      // connects — exactly the bug this test exists for.
+      await Bun.sleep(35_000);
+
+      expect(stub.authFrame(), "an explicit disconnect must stick even after the lock frees").toBeNull();
+      expect(readState(dir, key)).toBe("0");
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+/**
+ * connect-on-demand: Finding 2 — connect/disconnect issued before SESSION_KEY
+ * settles.
+ *
+ * Tools are answerable (`await mcp.connect`) before SESSION_KEY and
+ * wantConnected resolve (`await resolveSessionKey()`, up to
+ * SESSION_MAP_WAIT_MS ≈ 3s — see server.ts). Before the fix, a
+ * connect/disconnect issued in that window (a) wrote its connect-state under
+ * FALLBACK_SESSION_KEY instead of the key the session actually settles on,
+ * and (b) had its in-memory `wantConnected` clobbered the moment startup's
+ * own resolution ran a few seconds later.
+ *
+ * This calls `disconnect` as the VERY FIRST tool call — no settling sleep
+ * before it, so SESSION_KEY is still FALLBACK_SESSION_KEY at the moment the
+ * handler starts — with BRIDGE_AUTOCONNECT=1 so the bug (a live clobber back
+ * to "connect") would be directly observable as an auth frame. Then it waits
+ * past the settle window and asserts: no auth frame was ever sent, the
+ * connect-state file under the REAL resolved key reads "0", it is the ONLY
+ * connect-state file written (nothing landed under the fallback key), and
+ * `status` reports wantConnected: false once everything has settled.
+ */
+describe("connect-on-demand: Finding 2 — pre-settle connect/disconnect intent", () => {
+  test("disconnect issued before SESSION_KEY settles persists under the real key and sticks", async () => {
+    const key = "50000000-0000-0000-0000-000000000001";
+    const dir = mkdtempSync(join(tmpdir(), "cod-presettle-"));
+    const stub = startToolStub();
+    const env = { ...connectToolEnv(dir, stub.port, key), BRIDGE_AUTOCONNECT: "1" };
+    const transport = new StdioClientTransport({ command: "bun", args: [SERVER], env });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+
+      // The very first tool call — no settling sleep before it.
+      const disconnectResult = await client.callTool({ name: "disconnect", arguments: {} });
+      expect(disconnectResult?.isError).not.toBe(true);
+
+      // Give resolution, the (would-be, buggy) startup overwrite, and any
+      // resulting connect attempt time to play out.
+      await Bun.sleep(SESSION_KEY_SETTLE_MS + NO_CONNECT_WINDOW_MS);
+
+      expect(
+        stub.authFrame(),
+        "an early disconnect must stick even with BRIDGE_AUTOCONNECT=1"
+      ).toBeNull();
+      expect(readState(dir, key)).toBe("0");
+
+      // Only the real key's connect-state file must exist — nothing under
+      // the fallback key. ".connect-state-" mirrors connect-store.ts's own
+      // (unexported) PREFIX constant.
+      const files = readdirSync(dir).filter((f) => f.startsWith(".connect-state-"));
+      const realKeyFile = connectStateFileFor(dir, key).split("/").pop() ?? "";
+      expect(files).toEqual([realKeyFile]);
+
+      const statusResult = await client.callTool({ name: "status", arguments: {} });
+      const statusBody = JSON.parse((statusResult?.content as any)?.[0]?.text ?? "{}");
+      expect(statusBody.wantConnected).toBe(false);
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 /**
