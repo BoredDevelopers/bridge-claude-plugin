@@ -36,6 +36,7 @@ import {
 import { homedir, hostname } from "os";
 import { join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
+import { readConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,12 @@ const SESSION_LABEL_OVERRIDE = (process.env.BRIDGE_SESSION_LABEL ?? "").trim();
 // in place after a successful rename/clear, without requiring a reconnect to
 // take effect on the NEXT auth frame.
 let sessionLabel = "";
+
+// Master switch for the startup connect (Task 3, connect-on-demand):
+// persisted per-session intent (connect-store.ts) wins, else BRIDGE_AUTOCONNECT.
+// Resolved once SESSION_KEY is (see bottom of file); the `connect`/`disconnect`
+// tools update it in place, the same way sessionLabel does.
+let wantConnected = false;
 
 // Load .env (real env wins)
 try {
@@ -2426,10 +2433,18 @@ sweepCursors();
 // cursors — nothing else prunes these files either.
 sessionLabel = SESSION_LABEL_OVERRIDE || readLabelFile(STATE_DIR, SESSION_KEY) || "";
 sweepLabelFiles(STATE_DIR, labelFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
+
+// Same precedence idea as sessionLabel above: whatever the connect/disconnect
+// tools persisted on a previous launch of THIS session key wins; else
+// BRIDGE_AUTOCONNECT decides. Swept on the same age-based, never-current-file
+// terms as cursors and labels.
+wantConnected = readConnectState(STATE_DIR, SESSION_KEY)
+  ?? (process.env.BRIDGE_AUTOCONNECT === "1");
+sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
 // The one line someone debugging a lost context will need.
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
 );
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-if (!shuttingDown && API_URL && TOKEN) connectUnlessDuplicate();
+if (!shuttingDown && wantConnected && API_URL && TOKEN) connectUnlessDuplicate();
