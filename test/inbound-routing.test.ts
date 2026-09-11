@@ -193,7 +193,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
         env: {
           ...process.env,
-          BRIDGE_API_URL: URL_, BRIDGE_TOKEN: TOK_ME,
+          BRIDGE_API_URL: URL_, BRIDGE_TOKEN: TOK_ME, BRIDGE_AUTOCONNECT: "1",
           BRIDGE_CHANNELS: "general",          // deliberately NOT other-tasks
           BRIDGE_SESSION_KEY: "test-session",
           BRIDGE_STATE_DIR: dir, CLAUDE_PLUGIN_DATA: dir, CLAUDE_PROJECT_DIR: dir,

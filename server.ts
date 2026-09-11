@@ -36,6 +36,7 @@ import {
 import { homedir, hostname } from "os";
 import { join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
+import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,28 @@ const SESSION_LABEL_OVERRIDE = (process.env.BRIDGE_SESSION_LABEL ?? "").trim();
 // take effect on the NEXT auth frame.
 let sessionLabel = "";
 
+// Master switch for the startup connect (Task 3, connect-on-demand):
+// persisted per-session intent (connect-store.ts) wins, else BRIDGE_AUTOCONNECT.
+// Resolved once SESSION_KEY is (see bottom of file); the `connect`/`disconnect`
+// tools update it in place, the same way sessionLabel does.
+let wantConnected = false;
+
+// Set by `connect`/`disconnect` before they touch anything SESSION_KEY-keyed.
+// Tools are answerable before SESSION_KEY (and the wantConnected it is read
+// against) resolve — up to SESSION_MAP_WAIT_MS (see resolveSessionKey below).
+// A connect/disconnect issued in that window must not have its intent
+// silently overwritten once startup's own resolution runs; the startup
+// assignment at the bottom of this file only fires while this is still
+// false.
+let intentExplicitlySet = false;
+
+// Shared awaitable for SESSION_KEY resolution, assigned once (near the bottom
+// of this file) right after mcp.connect(). Both the startup sequence AND the
+// `connect`/`disconnect` handlers await this exact promise before reading or
+// writing anything keyed by SESSION_KEY, so a tool call in the pre-settle
+// window persists under the REAL resolved key instead of FALLBACK_SESSION_KEY.
+let sessionKeyReady: Promise<{ key: string; source: string }> | null = null;
+
 // Load .env (real env wins)
 try {
   chmodSync(ENV_FILE, 0o600);
@@ -89,7 +112,11 @@ if (!API_URL || !TOKEN) {
       `    BRIDGE_API_URL=https://bridge-api.example.com\n` +
       `    BRIDGE_TOKEN=your-agent-token\n`
   );
-  process.exit(1);
+  // Stay alive rather than exit: the MCP host treats a server that exits as
+  // a failure and does not respawn it, so an unconfigured install must still
+  // answer tools/list with working tools + guidance instead of a dead
+  // session. The startup connect below is guarded on API_URL/TOKEN so it
+  // does not spin with empty creds.
 }
 
 // ── Session info ────────────────────────────────────────────────────────────
@@ -939,6 +966,11 @@ function connectWs(): void {
 }
 
 function scheduleReconnect(): void {
+  // The `disconnect` tool (and a persisted "0" at startup) sets this false —
+  // a single guard here covers every caller (WebSocket creation failure, the
+  // close handler, the liveness watchdog) rather than needing one at each
+  // call site.
+  if (!wantConnected) return;
   if (reconnectTimer) return;
   reconnectAttempt++;
   const delay = Math.min(1000 * reconnectAttempt, 30000);
@@ -1412,6 +1444,39 @@ async function apiFetch(
   }
 }
 
+/**
+ * Two-tier guard for the 9 Bridge REST tools (reply, list_channels,
+ * list_agents, list_contexts, read_messages, claim_task, update_task_status,
+ * cancel_task, list_my_tasks). Distinct hints because they are distinct
+ * fixes: unconfigured needs /bridge:configure, idle needs /bridge:connect.
+ *
+ * Gated on `wantConnected` (INTENT), not on whether the socket has actually
+ * finished its handshake — a session mid-reconnect still intends to be
+ * connected and must not be told to run /bridge:connect again; `reply`
+ * already warns separately when the socket happens to be down at send time.
+ *
+ * `connect`/`disconnect`/`set_session_label` are NOT gated — they are how a
+ * session gets OUT of the states this refuses.
+ */
+function requireBridge(): { content: { type: "text"; text: string }[] } | null {
+  if (!API_URL || !TOKEN)
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Bridge not configured — run /bridge:configure to set your API URL and token.",
+        },
+      ],
+    };
+  if (!wantConnected)
+    return {
+      content: [
+        { type: "text", text: "Bridge not connected — run /bridge:connect first." },
+      ],
+    };
+  return null;
+}
+
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 // Read from package.json rather than restated here. The comment that used to
@@ -1641,8 +1706,52 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["label"],
       },
     },
+    {
+      name: "connect",
+      description:
+        "Connect this session to Bridge. Idempotent — calling it while already connected is a no-op on the socket. Persists across restarts until disconnect is called. Optionally set a display label at the same time (applied before the connect handshake, so the very first auth frame already carries it).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description: "Optional display name to set at connect time.",
+          },
+        },
+      },
+    },
+    {
+      name: "disconnect",
+      description:
+        "Disconnect this session from Bridge and stop automatic reconnects. Idempotent. Persists across restarts until connect is called again.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
+      name: "status",
+      description:
+        "Show this session's Bridge connection/intent snapshot — configured, wantConnected (persisted intent), websocket state, and display label. Always answers, even when unconfigured or disconnected; unlike the other tools it is not gated.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
   ],
 }));
+
+// Shared by `set_session_label` and `connect`'s optional label: persist the
+// label file (keyed by SESSION_KEY) and patch the live `sessionLabel` so the
+// NEXT auth frame carries it without requiring a reconnect to take effect.
+// Dropping the sessionInfo memo makes that "next auth frame" the very next
+// one sent, rather than a cached payload from before the change.
+function persistLabel(label: string): void {
+  sessionLabel = label;
+  if (label) writeLabelFile(STATE_DIR, SESSION_KEY, label);
+  else clearLabelFile(STATE_DIR, SESSION_KEY);
+  sessionInfoPromise = null;
+}
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   // First tool call proves Claude Code session is fully initialized
@@ -1653,6 +1762,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     switch (req.params.name) {
       case "reply": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const channelId = args.channel_id as string;
         const text = args.text as string;
         const type = (args.type as string) ?? "text";
@@ -1731,6 +1841,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_channels": {
+        { const gate = requireBridge(); if (gate) return gate; }
         /**
          * ⚠️ READ STATE IS A SECOND REQUEST NOW, AND THIS TOOL WAS SILENTLY
          * WRONG WITHOUT IT.
@@ -1822,6 +1933,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_contexts": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const filterAgentId = args.agent_id as string | undefined;
 
         let agentIds: string[];
@@ -1878,6 +1990,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_agents": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const res = await apiFetch("/api/agents");
         if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
         const data = (await res.json()) as any;
@@ -1895,6 +2008,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "read_messages": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const channelId = args.channel_id as string;
         /**
          * ⚠️ MIRRORS THE SERVER'S CLAMP EXACTLY (`messages.ts:531` —
@@ -2116,12 +2230,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "claim_task": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const res = await apiFetch(`/api/tasks/${args.message_id as string}/claim`, { method: "POST" });
         if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
         return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
       }
 
       case "update_task_status": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const body: Record<string, unknown> = { status: args.state as string };
         if (args.message !== undefined) body.message = args.message;
         if (args.artifacts !== undefined) body.result = { artifacts: args.artifacts };
@@ -2134,6 +2250,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "cancel_task": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const res = await apiFetch(`/api/tasks/${args.message_id as string}/cancel`, {
           method: "POST",
           body: JSON.stringify(args.reason ? { reason: args.reason } : {}),
@@ -2143,6 +2260,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_my_tasks": {
+        { const gate = requireBridge(); if (gate) return gate; }
         // The plugin can't know its own agent id before WS auth; the server
         // resolves the `me` sentinel to the token's agent (RFC-004 §3).
         const params = new URLSearchParams({ assignee: "me" });
@@ -2177,18 +2295,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // minimalSessionInfo().sessionLabel on that next auth frame, and the
         // server re-suffixes whatever it receives. Storing `stored` here
         // would compound the suffix on every subsequent reconnect. `label`
-        // is already "" on the clear path.
-        sessionLabel = label;
-        // Store the RAW label the user typed, not the suffixed `Name · #id`
-        // form the server just returned. On the next plugin launch this same
-        // raw value feeds back into minimalSessionInfo().sessionLabel, and the
-        // SERVER re-applies its own suffix on connect — storing the already-
-        // suffixed form would double-suffix on every subsequent launch.
-        if (label) writeLabelFile(STATE_DIR, SESSION_KEY, label);
-        else clearLabelFile(STATE_DIR, SESSION_KEY);
-        // Drop the auth-payload memo so a reconnect re-collects and re-sends
-        // sessionInfo with the new label rather than replaying the cached one.
-        sessionInfoPromise = null;
+        // is already "" on the clear path. Same store+memo write `connect`'s
+        // optional label uses (persistLabel), just without the API PUT above.
+        persistLabel(label);
         return {
           content: [
             {
@@ -2196,6 +2305,106 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               text: label
                 ? `Session renamed to "${stored}".`
                 : `Session name cleared (now "${stored}").`,
+            },
+          ],
+        };
+      }
+
+      case "connect": {
+        // Optional label first: independent of connection state (it just
+        // touches the label file + the in-memory value), so it is in place
+        // before the auth frame below is even built.
+        const label = String(args.label ?? "").trim();
+        if (label) persistLabel(label);
+
+        wantConnected = true;
+        // Mark BEFORE awaiting resolution below: this must win over the
+        // startup assignment regardless of how the two race (see
+        // intentExplicitlySet's declaration).
+        intentExplicitlySet = true;
+        // Wait for the real SESSION_KEY before persisting — a connect issued
+        // before it settles would otherwise write under FALLBACK_SESSION_KEY.
+        if (sessionKeyReady) await sessionKeyReady;
+        writeConnectState(STATE_DIR, SESSION_KEY, true);
+
+        if (!API_URL || !TOKEN) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Bridge not configured — run /bridge:configure to set your API URL and token.",
+              },
+            ],
+          };
+        }
+        // Already open: re-persisting the intent above is enough. Tearing
+        // down a healthy socket to "reconnect" would restart a connection
+        // that does not need it — the no-op half of idempotent.
+        if (!(wsConnected && authenticated)) connectUnlessDuplicate();
+        return {
+          content: [
+            { type: "text", text: wsConnected && authenticated ? "connected" : "connecting" },
+          ],
+        };
+      }
+
+      case "disconnect": {
+        wantConnected = false;
+        // Mark BEFORE awaiting resolution below — same reasoning as connect.
+        intentExplicitlySet = true;
+        // Wait for the real SESSION_KEY before persisting — a disconnect
+        // issued before it settles would otherwise write under
+        // FALLBACK_SESSION_KEY.
+        if (sessionKeyReady) await sessionKeyReady;
+        writeConnectState(STATE_DIR, SESSION_KEY, false);
+        // Cancel anything already scheduled — a socket mid-backoff must not
+        // fire a reconnect after this tool returns. scheduleReconnect()'s own
+        // `!wantConnected` guard (now false) covers every future attempt.
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        if (livenessTimer) {
+          clearInterval(livenessTimer);
+          livenessTimer = null;
+        }
+        // Also cancel a lock-retry loop armed by connectUnlessDuplicate()
+        // while a sibling held the session lock — that self-recursion reaches
+        // connectWs() WITHOUT going through scheduleReconnect(), so its
+        // `!wantConnected` guard above never sees it. Belt-and-suspenders
+        // with the `!wantConnected` guard now at the top of
+        // connectUnlessDuplicate() itself.
+        if (lockRetryTimer) {
+          clearTimeout(lockRetryTimer);
+          lockRetryTimer = null;
+        }
+        try {
+          ws?.close();
+        } catch {}
+        return { content: [{ type: "text", text: "disconnected" }] };
+      }
+
+      case "status": {
+        // Deliberately NOT gated by requireBridge() — this tool's entire job
+        // is to answer "why can't I use the other ones", so it must work in
+        // exactly the states requireBridge() refuses (unconfigured, idle).
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ...connectionStatus(),
+                  wantConnected,
+                  configured: !!(API_URL && TOKEN),
+                  // The RAW in-memory label (what the user typed), not the
+                  // server's suffixed "Name · #id" form — same distinction
+                  // persistLabel's own comment draws.
+                  label: sessionLabel || null,
+                },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -2362,6 +2571,15 @@ function releaseSessionLock(): void {
  * turn a duplicate into a broken session the moment the holder shut down first.
  */
 function connectUnlessDuplicate(): void {
+  // This is its own self-recursion (via lockRetryTimer below), NOT a call
+  // routed through scheduleReconnect() — so scheduleReconnect()'s own
+  // `!wantConnected` guard never sees these retries. Without this guard, a
+  // `disconnect` while a sibling held the lock left lockRetryTimer armed;
+  // once the sibling freed the lock, the timer would still fire, win it, and
+  // reconnect — after an explicit disconnect. `disconnect` also clears
+  // lockRetryTimer directly (belt-and-suspenders), but this guard is what
+  // makes a stray fire inert regardless.
+  if (!wantConnected) return;
   if (shuttingDown) return;
   if (acquireSessionLock()) {
     if (lockRetryTimer) { clearTimeout(lockRetryTimer); lockRetryTimer = null; }
@@ -2409,9 +2627,18 @@ process.on("SIGINT", shutdown);
 // carries it (the Bridge server reuses it as the context ID) and the cursor
 // file is named after it. Deliberately after mcp.connect, so tools stay
 // answerable while this waits on the hook.
-const resolvedSessionKey = await resolveSessionKey();
-SESSION_KEY = resolvedSessionKey.key;
-CURSOR_FILE = cursorFileFor(SESSION_KEY);
+//
+// Assigned into the SHARED sessionKeyReady declared near wantConnected above:
+// the connect/disconnect handlers await this exact promise too, instead of
+// racing this resolution on their own — SESSION_KEY is set inside its `.then`
+// so anything awaiting it (here or from a handler) sees SESSION_KEY already
+// resolved by the time it resumes, regardless of who started waiting first.
+sessionKeyReady = resolveSessionKey().then((resolved) => {
+  SESSION_KEY = resolved.key;
+  CURSOR_FILE = cursorFileFor(SESSION_KEY);
+  return resolved;
+});
+const resolvedSessionKey = await sessionKeyReady;
 lastMessageTime = loadCursor();
 sweepCursors();
 
@@ -2422,10 +2649,23 @@ sweepCursors();
 // cursors — nothing else prunes these files either.
 sessionLabel = SESSION_LABEL_OVERRIDE || readLabelFile(STATE_DIR, SESSION_KEY) || "";
 sweepLabelFiles(STATE_DIR, labelFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
+
+// Same precedence idea as sessionLabel above: whatever the connect/disconnect
+// tools persisted on a previous launch of THIS session key wins; else
+// BRIDGE_AUTOCONNECT decides. Swept on the same age-based, never-current-file
+// terms as cursors and labels. Guarded on intentExplicitlySet: a
+// connect/disconnect already answered in the pre-settle window set
+// wantConnected (and persisted it under the now-resolved SESSION_KEY via the
+// same sessionKeyReady await) — this must not clobber that with a stale read.
+if (!intentExplicitlySet) {
+  wantConnected = readConnectState(STATE_DIR, SESSION_KEY)
+    ?? (process.env.BRIDGE_AUTOCONNECT === "1");
+}
+sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
 // The one line someone debugging a lost context will need.
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
 );
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-if (!shuttingDown) connectUnlessDuplicate();
+if (!shuttingDown && wantConnected && API_URL && TOKEN) connectUnlessDuplicate();
