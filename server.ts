@@ -89,7 +89,11 @@ if (!API_URL || !TOKEN) {
       `    BRIDGE_API_URL=https://bridge-api.example.com\n` +
       `    BRIDGE_TOKEN=your-agent-token\n`
   );
-  process.exit(1);
+  // Stay alive rather than exit: the MCP host treats a server that exits as
+  // a failure and does not respawn it, so an unconfigured install must still
+  // answer tools/list with working tools + guidance instead of a dead
+  // session. The startup connect below is guarded on API_URL/TOKEN so it
+  // does not spin with empty creds.
 }
 
 // ── Session info ────────────────────────────────────────────────────────────
@@ -2428,4 +2432,4 @@ process.stderr.write(
 );
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-if (!shuttingDown) connectUnlessDuplicate();
+if (!shuttingDown && API_URL && TOKEN) connectUnlessDuplicate();
