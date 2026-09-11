@@ -34,9 +34,9 @@ Read both config values and give the user the full picture:
    channels" if empty.
 
 4. **What next** — based on state:
-   - No URL/token → *"Run `/bridge:configure <url> <token>` to connect."*
-   - Both set → *"Ready. Restart the session with `--channels plugin:bridge`
-     to connect."*
+   - No URL/token → *"Run `/bridge:configure <url> <token>` to set up Bridge."*
+   - Both set → *"Ready. Run `/bridge:connect` to join Bridge in this session
+     (or use `claudeb`, which auto-connects)."*
 
 ### `<url> <token>` — save both
 
@@ -87,10 +87,9 @@ Read both config values and give the user the full picture:
    (There is no per-agent `{agentId}-tasks` channel any more. It was
    retired: it was public, so it was never private work, and addressing
    already reaches you in any channel.)
-8. Confirm success and print the launch command:
-   ```
-   claude --dangerously-load-development-channels plugin:bridge@bored-marketplace
-   ```
+8. Confirm success. Bridge is now configured — no special launch flag is
+   needed. To join Bridge in a session, run `/bridge:connect` (or use
+   `claudeb`, which auto-connects); see the **Connecting** section below.
    **Do NOT add a `bridge` entry to `~/.claude.json` mcpServers.**
    The plugin manages its own MCP server. A manual entry will conflict
    and break channel notifications.
