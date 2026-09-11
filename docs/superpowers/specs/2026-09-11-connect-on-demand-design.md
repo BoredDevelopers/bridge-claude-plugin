@@ -68,10 +68,20 @@ startup, `scheduleReconnect`, and the liveness-timer / pong self-heal.
 ### Config gate change (server.ts:84-93)
 
 Today: missing `BRIDGE_API_URL`/`BRIDGE_TOKEN` → `process.exit(1)` (server dies).
-New: **do not exit** — stay alive, tools answerable. A connect attempt with no
-token returns a helpful error (*"no Bridge token — run /bridge:configure"*).
-Rationale: an installed-but-unconfigured user must still get working
-`configure`/`status`/`connect` tools and guidance, not a dead server.
+New: **do not exit** — stay alive, tools answerable. Rationale: an
+installed-but-unconfigured user must still get working `configure`/`status`/
+`connect` tools and guidance, not a dead server.
+
+Two distinct states, distinct hints (do not conflate):
+- **not configured** (`!API_URL || !TOKEN`) → *"run /bridge:configure"*
+- **not connected** (`wantConnected === false`, creds fine) → *"run /bridge:connect"*
+
+**Safety of dropping `exit(1)`:** every creds-consuming path must stay behind the
+creds guard so nothing runs with an empty token — verified sites: `apiFetch`
+(only reached through the guarded Bridge tools) and `connectWs` (only reached when
+`wantConnected && API_URL && TOKEN`). The implementer must confirm there is no
+*unconditional startup* `apiFetch` call (e.g. server.ts:724) that would now fire
+with empty creds; if there is, it moves behind the guard.
 
 ## Components
 
@@ -85,7 +95,12 @@ Same shape/tests as `label-store.ts`, so it is unit-testable without spawning.
 ### `server.ts`
 - Introduce `let wantConnected = false;` resolved at startup (above).
 - Startup (line 2431): `if (!shuttingDown && wantConnected) connectUnlessDuplicate();`
-- `scheduleReconnect()` and the liveness reconnect: **no-op when `!wantConnected`**.
+- **Reconnect suppression:** put the guard as an early return at the TOP of
+  `scheduleReconnect()` — `if (!wantConnected) return;` — so the single check
+  covers BOTH callers (the ws `close` handler ~912 and the liveness timer ~935)
+  and the pong self-heal. Do not guard each caller separately. On explicit
+  `disconnect`, also clear any pending `reconnectTimer`/`livenessTimer` and
+  `ws.close()`.
 - Config: replace `process.exit(1)` with a stored "no creds" state; `connectWs`
   and `connect` tool guard on `API_URL && TOKEN`, else return guidance.
 - New tools:
@@ -96,11 +111,23 @@ Same shape/tests as `label-store.ts`, so it is unit-testable without spawning.
   - **`disconnect`**: `wantConnected = false`; `writeConnectState(..., false)`;
     clear reconnect/liveness timers; `ws?.close()`; release nothing else.
     Idempotent.
-- **Socket-requiring tools** (`reply`, `list_channels`, `list_agents`,
+- **Bridge tools** (`reply`, `list_channels`, `list_agents`, `list_contexts`,
   `read_messages`, `claim_task`, `update_task_status`, `cancel_task`,
-  `list_my_tasks`): when `ws` is not OPEN, return
-  `"Bridge not connected — run /bridge:connect first."` `connect`,
-  `disconnect`, `set_session_label`, and status-type reads always work.
+  `list_my_tasks`) — these call **`apiFetch` (REST)**, NOT the WebSocket, so the
+  guard is on intent/creds, not on `ws` state. Two-tier, in a shared helper:
+  1. `!API_URL || !TOKEN` → *"Bridge not configured — run /bridge:configure."*
+  2. else `!wantConnected` → *"Bridge not connected — run /bridge:connect first."*
+  3. else proceed. Gate on the **intent** `wantConnected` (the master "on Bridge"
+     switch), NOT on live ws-open: if intent is true but the ws is mid-reconnect,
+     REST still works (`reply` already appends a "may not reach this session"
+     warning via `connectionState()`).
+- **New `status` tool** (always-on, never gated): returns
+  `connectionStatus()` (already defined, server.ts:963) plus `wantConnected`,
+  `configured` (`!!(API_URL && TOKEN)`), and the current label. `/bridge:status`
+  calls this so it renders correctly even when disconnected/unconfigured.
+- **Always-on tools:** `connect`, `disconnect`, `status`, `set_session_label`.
+  `set_session_label` when disconnected just writes the label store (applied on
+  next connect); it does not require a socket.
 - `sweepConnectStateFiles(...)` alongside the existing label/cursor sweeps.
 
 ### Skills (new + edited)
@@ -132,7 +159,7 @@ Reviewer; `claudeb` = launch connected, derived name.
 launch → resolve SESSION_KEY → read connect-store + label-store
   wantConnected = persisted ?? (BRIDGE_AUTOCONNECT==="1")
   if wantConnected && creds → connectUnlessDuplicate() → connectWs (auth frame carries label)
-  else → idle; tools answerable; socket tools return the hint
+  else → idle; tools answerable; Bridge (REST) tools return the not-connected hint
 
 /bridge:connect [name] → connect tool
   (set label if given) → wantConnected=true → persist true → connectWs
@@ -163,13 +190,23 @@ drop / claude -c → same SESSION_KEY → persisted governs → restore prior st
 - Spawn tests:
   - No token → server **stays alive**, tools answerable, `connect` returns the
     configure hint (was: process exits).
-  - Idle (no env, no state) → not connected; a socket tool returns the hint.
+  - Idle (no env, no state) → not connected; a Bridge REST tool returns the
+    **not-connected** hint.
+  - **Two-tier hint**: no creds → a Bridge tool returns the **not-configured**
+    hint; creds present + `wantConnected=false` → the **not-connected** hint.
+    (Distinct messages — mutation: collapse both branches to one and prove a test
+    reds.)
   - `BRIDGE_AUTOCONNECT=1` → connects on launch.
   - `connect` tool → connects; `connect Reviewer` → label applied + connected.
   - `disconnect` → closes, and **stays closed** (liveness/pong do not reconnect)
-    — mutation: remove the `wantConnected` guard and prove the test reconnects.
+    — mutation: remove the `wantConnected` early-return in `scheduleReconnect()`
+    and prove the test reconnects.
+  - `status` tool (always-on): reports `configured`/`wantConnected`/ws-state
+    correctly in each of {unconfigured, idle, connected, disconnected}; works
+    when disconnected (mutation: gate it and prove `/bridge:status` breaks idle).
   - Persistence: connect, restart same SESSION_KEY → still connected; disconnect,
-    restart → still disconnected; both override the env per the precedence rule.
+    restart → still disconnected; both override the env per the precedence rule
+    (`persisted ?? env`).
 - `version-sync.test.ts` stays green at 0.17.0.
 
 Every guard proven red by mutation before it is trusted.
