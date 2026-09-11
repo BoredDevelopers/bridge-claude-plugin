@@ -400,3 +400,169 @@ describe("connect-on-demand: connect/disconnect tools", () => {
     }
   }, 40_000);
 });
+
+/**
+ * connect-on-demand, Task 6: REST-tool two-tier guard.
+ *
+ * The 9 Bridge REST tools (reply, list_channels, list_agents, list_contexts,
+ * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks)
+ * must refuse with a DISTINCT hint depending on WHY they can't proceed:
+ * unconfigured (no BRIDGE_API_URL/BRIDGE_TOKEN) vs. configured-but-idle
+ * (wantConnected === false). `connect`/`disconnect`/`set_session_label` stay
+ * ungated — `list_channels` stands in for all 9 here since they share one
+ * helper called identically at the top of each case (see server.ts).
+ *
+ * Gated on wantConnected (INTENT), not on whether the socket has actually
+ * finished its handshake — so "proceeds after connect" below calls
+ * `list_channels` immediately after `connect` returns, before any auth frame
+ * could plausibly have round-tripped.
+ */
+function startGuardStub() {
+  let authFrame: any = null;
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      const url = new URL(req.url);
+      if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
+        if (srv.upgrade(req)) return;
+      }
+      if (url.pathname === "/api/channels/read-state") return Response.json({ readState: [] });
+      if (url.pathname === "/api/channels") return Response.json({ channels: [] });
+      return new Response("no", { status: 404 });
+    },
+    websocket: {
+      message(ws, raw) {
+        let frame: any = {};
+        try {
+          frame = JSON.parse(String(raw));
+        } catch {
+          return;
+        }
+        if (frame.type === "auth") {
+          authFrame = frame;
+          ws.send(
+            JSON.stringify({
+              type: "authenticated",
+              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+            })
+          );
+        }
+      },
+    },
+  });
+  return { port: server.port!, authFrame: () => authFrame, stop: () => server.stop(true) };
+}
+
+function unconfiguredEnv(dir: string): Record<string, string> {
+  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  delete env.BRIDGE_API_URL;
+  delete env.BRIDGE_TOKEN;
+  delete env.BRIDGE_AUTOCONNECT;
+  env.CLAUDE_PLUGIN_DATA = dir;
+  env.BRIDGE_STATE_DIR = dir;
+  return env;
+}
+
+describe("connect-on-demand: REST tool guard", () => {
+  test("list_channels returns not-configured hint when no creds", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cod-guard-unconf-"));
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: unconfiguredEnv(dir),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({ name: "list_channels", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+      const text = (result?.content as any)?.[0]?.text ?? "";
+      expect(text).toContain("not configured");
+      expect(text).toContain("/bridge:configure");
+    } finally {
+      await client.close().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("list_channels returns not-connected hint when idle with creds", async () => {
+    const key = "20000000-0000-0000-0000-000000000001";
+    const dir = mkdtempSync(join(tmpdir(), "cod-guard-idle-"));
+    const stub = startGuardStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({ name: "list_channels", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+      const text = (result?.content as any)?.[0]?.text ?? "";
+      expect(text).toContain("not connected");
+      expect(text).toContain("/bridge:connect");
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("list_channels proceeds after connect", async () => {
+    const key = "20000000-0000-0000-0000-000000000002";
+    const dir = mkdtempSync(join(tmpdir(), "cod-guard-connected-"));
+    const stub = startGuardStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      // Same race the Task 4/5 tests guard against: a `connect` call before
+      // SESSION_KEY settles persists its "1" under the fallback key, and the
+      // startup path then overwrites wantConnected back to false once the
+      // real key resolves. Wait it out first.
+      await Bun.sleep(SESSION_KEY_SETTLE_MS);
+
+      const connectResult = await client.callTool({ name: "connect", arguments: {} });
+      expect(connectResult?.isError).not.toBe(true);
+
+      const result = await client.callTool({ name: "list_channels", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+      const text = (result?.content as any)?.[0]?.text ?? "";
+      // Not the gate hint — real data, even though the socket has not
+      // necessarily finished authenticating yet.
+      expect(text.startsWith("Bridge not configured")).toBe(false);
+      expect(text.startsWith("Bridge not connected")).toBe(false);
+      const body = JSON.parse(text);
+      expect(Array.isArray(body.channels)).toBe(true);
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("connect/disconnect are not gated", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cod-guard-notgated-"));
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: unconfiguredEnv(dir),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({ name: "disconnect", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+      const text = (result?.content as any)?.[0]?.text ?? "";
+      expect(text).toBe("disconnected");
+    } finally {
+      await client.close().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

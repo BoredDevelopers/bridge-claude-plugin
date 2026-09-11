@@ -1428,6 +1428,39 @@ async function apiFetch(
   }
 }
 
+/**
+ * Two-tier guard for the 9 Bridge REST tools (reply, list_channels,
+ * list_agents, list_contexts, read_messages, claim_task, update_task_status,
+ * cancel_task, list_my_tasks). Distinct hints because they are distinct
+ * fixes: unconfigured needs /bridge:configure, idle needs /bridge:connect.
+ *
+ * Gated on `wantConnected` (INTENT), not on whether the socket has actually
+ * finished its handshake — a session mid-reconnect still intends to be
+ * connected and must not be told to run /bridge:connect again; `reply`
+ * already warns separately when the socket happens to be down at send time.
+ *
+ * `connect`/`disconnect`/`set_session_label` are NOT gated — they are how a
+ * session gets OUT of the states this refuses.
+ */
+function requireBridge(): { content: { type: "text"; text: string }[] } | null {
+  if (!API_URL || !TOKEN)
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Bridge not configured — run /bridge:configure to set your API URL and token.",
+        },
+      ],
+    };
+  if (!wantConnected)
+    return {
+      content: [
+        { type: "text", text: "Bridge not connected — run /bridge:connect first." },
+      ],
+    };
+  return null;
+}
+
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 // Read from package.json rather than restated here. The comment that used to
@@ -1704,6 +1737,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     switch (req.params.name) {
       case "reply": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const channelId = args.channel_id as string;
         const text = args.text as string;
         const type = (args.type as string) ?? "text";
@@ -1782,6 +1816,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_channels": {
+        { const gate = requireBridge(); if (gate) return gate; }
         /**
          * ⚠️ READ STATE IS A SECOND REQUEST NOW, AND THIS TOOL WAS SILENTLY
          * WRONG WITHOUT IT.
@@ -1873,6 +1908,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_contexts": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const filterAgentId = args.agent_id as string | undefined;
 
         let agentIds: string[];
@@ -1929,6 +1965,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_agents": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const res = await apiFetch("/api/agents");
         if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
         const data = (await res.json()) as any;
@@ -1946,6 +1983,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "read_messages": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const channelId = args.channel_id as string;
         /**
          * ⚠️ MIRRORS THE SERVER'S CLAMP EXACTLY (`messages.ts:531` —
@@ -2167,12 +2205,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "claim_task": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const res = await apiFetch(`/api/tasks/${args.message_id as string}/claim`, { method: "POST" });
         if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
         return { content: [{ type: "text", text: JSON.stringify(await res.json(), null, 2) }] };
       }
 
       case "update_task_status": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const body: Record<string, unknown> = { status: args.state as string };
         if (args.message !== undefined) body.message = args.message;
         if (args.artifacts !== undefined) body.result = { artifacts: args.artifacts };
@@ -2185,6 +2225,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "cancel_task": {
+        { const gate = requireBridge(); if (gate) return gate; }
         const res = await apiFetch(`/api/tasks/${args.message_id as string}/cancel`, {
           method: "POST",
           body: JSON.stringify(args.reason ? { reason: args.reason } : {}),
@@ -2194,6 +2235,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_my_tasks": {
+        { const gate = requireBridge(); if (gate) return gate; }
         // The plugin can't know its own agent id before WS auth; the server
         // resolves the `me` sentinel to the token's agent (RFC-004 §3).
         const params = new URLSearchParams({ assignee: "me" });
