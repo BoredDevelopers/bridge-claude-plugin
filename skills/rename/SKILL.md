@@ -19,12 +19,33 @@ Arguments passed: `$ARGUMENTS`
 
 ---
 
-## Dispatch on arguments
+## Step 1 — check connection FIRST (always, before any rename)
+
+A rename can only change a **live** session's name: `set_session_label` requires
+an authenticated Bridge connection and throws otherwise. Since 0.17.0 a session
+is **not** connected by default (connect-on-demand). So **always call the
+`status` tool first** and branch on it — do NOT call `set_session_label` blind
+and lean on its error:
+
+- `configured` is **false** → stop. The plugin has no API URL/token yet. Tell the
+  user to run `/bridge:configure`, and stop here.
+- not connected (`websocket` is not `connected`, or `wantConnected` is false) →
+  stop. Do **not** call `set_session_label`. Tell the user this session isn't on
+  Bridge yet, and offer the one-step fix: `/bridge:connect <name>` connects **and**
+  sets the name at once (use their argument as `<name>` if they gave one); or
+  `/bridge:connect` first, then `/bridge:rename`. Stop here.
+- connected → continue to Dispatch below.
+
+`status` also returns the current `label`, so use it directly for the no-arg case
+below — no separate `list_contexts` call needed.
+
+---
+
+## Dispatch on arguments (only once Step 1 confirms connected)
 
 ### No args — show the current name
-Do NOT change anything. Use the `list_contexts` Bridge tool, find THIS session's
-context (its context id is shown in the Bridge connection status), and report its
-current `label`. Then show usage:
+Do NOT change anything. Report the `label` from `status` (or note it is the
+auto-derived default if `label` is null). Then show usage:
 - `/bridge:rename <name>` — set the display name.
 - `/bridge:rename --default` — clear back to the auto-derived name (`repo · branch · #id`).
 
@@ -41,12 +62,8 @@ distinguishable — show the full returned value).
 ---
 
 ## Notes
-- If `set_session_label` returns an error that the session isn't authenticated
-  on Bridge yet, tell the user the Bridge connection isn't up — the rename needs
-  a live session. Don't retry in a loop.
-- If the session isn't connected at all (`/bridge:connect` hasn't been run),
-  `/bridge:rename` fails with that same "not authenticated" error rather than
-  storing anything — tell the user to run `/bridge:connect` first, or set the
-  name in the same step with `/bridge:connect <name>`.
+- Step 1 is the guard. If you somehow still call `set_session_label` while
+  disconnected and it errors that the session isn't authenticated, do NOT retry
+  in a loop — fall back to the Step 1 guidance (connect first).
 - The label is a display nickname with no authority — it doesn't change routing,
   membership, or the agent identity.
