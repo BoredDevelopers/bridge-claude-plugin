@@ -169,7 +169,7 @@ describe("read_messages resumes exactly, or says why it cannot", () => {
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_TOKEN: "test-token",
+        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,

@@ -70,7 +70,7 @@ async function boot(waitMs = 9000): Promise<{ err: string; declined: boolean; co
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
       BRIDGE_API_URL: "http://127.0.0.1:1",
-      BRIDGE_TOKEN: "test-token",
+      BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
       BRIDGE_SESSION_KEY: SESSION_ID,
       CLAUDE_CODE_SSE_PORT: "",
     } as Record<string, string>,
@@ -183,7 +183,7 @@ describe("single instance per session key", () => {
         ...process.env,
         PATH: `${shimBin}:${process.env.PATH}`, // `ps` resolves to the failing shim
         CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t",
+        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t", BRIDGE_AUTOCONNECT: "1",
         BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -227,7 +227,7 @@ describe("single instance per session key", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t",
+        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t", BRIDGE_AUTOCONNECT: "1",
         BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -254,7 +254,7 @@ describe("single instance per session key", () => {
         env: {
           ...process.env,
           CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t",
+          BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t", BRIDGE_AUTOCONNECT: "1",
           BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
