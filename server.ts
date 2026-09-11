@@ -1713,6 +1713,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: "status",
+      description:
+        "Show this session's Bridge connection/intent snapshot — configured, wantConnected (persisted intent), websocket state, and display label. Always answers, even when unconfigured or disconnected; unlike the other tools it is not gated.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
   ],
 }));
 
@@ -2334,6 +2343,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ws?.close();
         } catch {}
         return { content: [{ type: "text", text: "disconnected" }] };
+      }
+
+      case "status": {
+        // Deliberately NOT gated by requireBridge() — this tool's entire job
+        // is to answer "why can't I use the other ones", so it must work in
+        // exactly the states requireBridge() refuses (unconfigured, idle).
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ...connectionStatus(),
+                  wantConnected,
+                  configured: !!(API_URL && TOKEN),
+                  // The RAW in-memory label (what the user typed), not the
+                  // server's suffixed "Name · #id" form — same distinction
+                  // persistLabel's own comment draws.
+                  label: sessionLabel || null,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
       }
 
       default:

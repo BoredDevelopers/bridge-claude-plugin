@@ -106,6 +106,19 @@ Delete `BRIDGE_API_URL=` and `BRIDGE_TOKEN=` lines from `.env`.
 
 ---
 
+## Connecting
+
+Once configured, Bridge is available in **every** session — configuration is
+machine-wide, but joining Bridge is per-session. Run `/bridge:connect` in a
+session to join it (presence, inbound messages, registration); it persists
+across restarts until `/bridge:disconnect`. `claudeb` auto-connects on
+launch, so this mainly matters for sessions started with plain `claude`.
+
+Recommend enabling the plugin at **user scope** (not just per-repo), so
+Bridge is available in every repo without reinstalling it each time.
+
+---
+
 ## Implementation notes
 
 - The channels dir might not exist. Missing file = not configured, not an error.

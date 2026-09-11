@@ -566,3 +566,106 @@ describe("connect-on-demand: REST tool guard", () => {
     }
   }, 30_000);
 });
+
+/**
+ * connect-on-demand: `status` MCP tool.
+ *
+ * ALWAYS-ON — unlike the 9 REST tools above, `status` is NOT gated by
+ * requireBridge(): it must answer with the connection/intent snapshot even
+ * when unconfigured or idle, since that snapshot is precisely how a session
+ * (or the /bridge:status skill) tells those two states apart. Returns text
+ * containing a JSON object: `{ ...connectionStatus(), wantConnected,
+ * configured, label }`.
+ */
+describe("connect-on-demand: status tool", () => {
+  test("status works unconfigured", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cod-status-unconf-"));
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: unconfiguredEnv(dir),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({ name: "status", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+      const text = (result?.content as any)?.[0]?.text ?? "";
+      const body = JSON.parse(text);
+      expect(body.configured).toBe(false);
+      expect(body.wantConnected).toBe(false);
+    } finally {
+      await client.close().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("status reports idle with creds", async () => {
+    const key = "30000000-0000-0000-0000-000000000001";
+    const dir = mkdtempSync(join(tmpdir(), "cod-status-idle-"));
+    const stub = startToolStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({ name: "status", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+      const text = (result?.content as any)?.[0]?.text ?? "";
+      const body = JSON.parse(text);
+      expect(body.configured).toBe(true);
+      expect(body.wantConnected).toBe(false);
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("status reports connected after connect", async () => {
+    const key = "30000000-0000-0000-0000-000000000002";
+    const dir = mkdtempSync(join(tmpdir(), "cod-status-connected-"));
+    const stub = startToolStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      await Bun.sleep(SESSION_KEY_SETTLE_MS);
+
+      const connectResult = await client.callTool({ name: "connect", arguments: {} });
+      expect(connectResult?.isError).not.toBe(true);
+
+      const authDeadline = Date.now() + 15_000;
+      while (Date.now() < authDeadline && !stub.authFrame()) await Bun.sleep(50);
+      expect(stub.authFrame()?.type).toBe("auth");
+
+      // wantConnected flips synchronously inside the `connect` handler, but
+      // receiving_messages/websocket only go true once the "authenticated"
+      // frame round-trips back — poll status until it settles.
+      let body: any = null;
+      const statusDeadline = Date.now() + 5_000;
+      while (Date.now() < statusDeadline) {
+        const result = await client.callTool({ name: "status", arguments: {} });
+        expect(result?.isError).not.toBe(true);
+        const text = (result?.content as any)?.[0]?.text ?? "";
+        body = JSON.parse(text);
+        if (body.receiving_messages) break;
+        await Bun.sleep(100);
+      }
+      expect(body.wantConnected).toBe(true);
+      expect(body.receiving_messages).toBe(true);
+      expect(body.websocket).toBe("connected");
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

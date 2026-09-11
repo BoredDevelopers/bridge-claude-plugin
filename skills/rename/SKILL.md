@@ -44,5 +44,9 @@ distinguishable — show the full returned value).
 - If `set_session_label` returns an error that the session isn't authenticated
   on Bridge yet, tell the user the Bridge connection isn't up — the rename needs
   a live session. Don't retry in a loop.
+- If the session isn't connected at all (`/bridge:connect` hasn't been run),
+  `/bridge:rename` fails with that same "not authenticated" error rather than
+  storing anything — tell the user to run `/bridge:connect` first, or set the
+  name in the same step with `/bridge:connect <name>`.
 - The label is a display nickname with no authority — it doesn't change routing,
   membership, or the agent identity.
