@@ -11,7 +11,7 @@
  * pipe) rather than resolving.
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -182,4 +182,221 @@ describe("connect-on-demand: wantConnected startup gate", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+/**
+ * connect-on-demand, Tasks 4 + 5: the `connect`/`disconnect` tools and
+ * reconnect suppression (`wantConnected`).
+ *
+ * Same SESSION_KEY resolution cost as above applies to every test here that
+ * calls `connect`/`disconnect` and then checks the on-disk state file: the
+ * tools read/write `connectStateFileFor(STATE_DIR, SESSION_KEY)` using
+ * whatever SESSION_KEY *currently* holds, and that starts at a random
+ * FALLBACK_SESSION_KEY until resolveSessionKey() settles it to
+ * CLAUDE_CODE_SESSION_ID — which, per server.ts's resolveSessionKey(), takes
+ * up to SESSION_MAP_WAIT_MS (3s) even when there is nothing to find (no
+ * session-map hook, no SSE port). Every test below sleeps past that window
+ * before making its first tool call, so the state file it inspects is
+ * guaranteed to be the one keyed by the CLAUDE_CODE_SESSION_ID it set.
+ */
+const SESSION_KEY_SETTLE_MS = 4_000;
+
+function startToolStub() {
+  const authFrames: any[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return;
+      return new Response("no", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        let frame: any = {};
+        try {
+          frame = JSON.parse(String(raw));
+        } catch {
+          return;
+        }
+        if (frame.type === "auth") {
+          authFrames.push(frame);
+          ws.send(
+            JSON.stringify({
+              type: "authenticated",
+              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+            })
+          );
+        }
+      },
+    },
+  });
+  return {
+    port: server.port!,
+    authFrames: () => authFrames,
+    authFrame: () => authFrames[authFrames.length - 1] ?? null,
+    stop: () => server.stop(true),
+  };
+}
+
+function connectToolEnv(dir: string, stubPort: number, sessionKey: string): Record<string, string> {
+  const env: Record<string, string> = {
+    ...process.env,
+    CLAUDE_PLUGIN_DATA: dir,
+    BRIDGE_STATE_DIR: dir,
+    BRIDGE_API_URL: `http://127.0.0.1:${stubPort}`,
+    BRIDGE_TOKEN: "test-token",
+    CLAUDE_CODE_SESSION_ID: sessionKey,
+    CLAUDE_CODE_SSE_PORT: "",
+  };
+  delete env.BRIDGE_AUTOCONNECT;
+  return env;
+}
+
+function readState(dir: string, key: string): string | null {
+  try {
+    return readFileSync(connectStateFileFor(dir, key), "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+describe("connect-on-demand: connect/disconnect tools", () => {
+  test("connect tool connects and persists", async () => {
+    const key = "10000000-0000-0000-0000-000000000001";
+    const dir = mkdtempSync(join(tmpdir(), "cod-tool-connect-"));
+    const stub = startToolStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      await Bun.sleep(SESSION_KEY_SETTLE_MS);
+
+      const result = await client.callTool({ name: "connect", arguments: {} });
+      expect(result?.isError).not.toBe(true);
+
+      expect(readState(dir, key)).toBe("1");
+
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline && !stub.authFrame()) await Bun.sleep(50);
+      expect(stub.authFrame()?.type).toBe("auth");
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("connect tool applies label", async () => {
+    const key = "10000000-0000-0000-0000-000000000002";
+    const dir = mkdtempSync(join(tmpdir(), "cod-tool-label-"));
+    const stub = startToolStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      await Bun.sleep(SESSION_KEY_SETTLE_MS);
+
+      const result = await client.callTool({ name: "connect", arguments: { label: "Reviewer" } });
+      expect(result?.isError).not.toBe(true);
+
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline && !stub.authFrame()) await Bun.sleep(50);
+      const frame = stub.authFrame();
+      expect(frame?.type).toBe("auth");
+      expect(frame?.sessionInfo?.sessionLabel).toBe("Reviewer");
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("disconnect closes and stays closed", async () => {
+    const key = "10000000-0000-0000-0000-000000000003";
+    const dir = mkdtempSync(join(tmpdir(), "cod-tool-disconnect-"));
+    const stub = startToolStub();
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      await Bun.sleep(SESSION_KEY_SETTLE_MS);
+
+      const connectResult = await client.callTool({ name: "connect", arguments: {} });
+      expect(connectResult?.isError).not.toBe(true);
+
+      let deadline = Date.now() + 15_000;
+      while (Date.now() < deadline && !stub.authFrame()) await Bun.sleep(50);
+      expect(stub.authFrame()?.type).toBe("auth");
+      const framesBefore = stub.authFrames().length;
+
+      const disconnectResult = await client.callTool({ name: "disconnect", arguments: {} });
+      expect(disconnectResult?.isError).not.toBe(true);
+      expect(readState(dir, key)).toBe("0");
+
+      await Bun.sleep(NO_CONNECT_WINDOW_MS);
+      expect(stub.authFrames().length).toBe(framesBefore);
+    } finally {
+      await client.close().catch(() => {});
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("disconnect persists across restart", async () => {
+    const key = "10000000-0000-0000-0000-000000000004";
+    const dir = mkdtempSync(join(tmpdir(), "cod-tool-restart-"));
+    const stub = startToolStub();
+
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: connectToolEnv(dir, stub.port, key),
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      await Bun.sleep(SESSION_KEY_SETTLE_MS);
+
+      const connectResult = await client.callTool({ name: "connect", arguments: {} });
+      expect(connectResult?.isError).not.toBe(true);
+      expect(readState(dir, key)).toBe("1");
+
+      const disconnectResult = await client.callTool({ name: "disconnect", arguments: {} });
+      expect(disconnectResult?.isError).not.toBe(true);
+      expect(readState(dir, key)).toBe("0");
+    } finally {
+      await client.close().catch(() => {});
+    }
+
+    const framesBefore = stub.authFrames().length;
+    // Fresh process, same session key + state dir, no BRIDGE_AUTOCONNECT: the
+    // persisted "0" from the disconnect above is the only thing that can
+    // decide this — resolution is `readConnectState(...) ?? (BRIDGE_AUTOCONNECT
+    // === "1")`, and both env inputs are absent here.
+    const plugin = Bun.spawn(["bun", SERVER], {
+      env: connectToolEnv(dir, stub.port, key),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      await Bun.sleep(SESSION_KEY_SETTLE_MS + NO_CONNECT_WINDOW_MS);
+      expect(stub.authFrames().length).toBe(framesBefore);
+    } finally {
+      plugin.kill();
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
 });

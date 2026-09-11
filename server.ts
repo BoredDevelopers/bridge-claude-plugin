@@ -36,7 +36,7 @@ import {
 import { homedir, hostname } from "os";
 import { join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
-import { readConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
+import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -950,6 +950,11 @@ function connectWs(): void {
 }
 
 function scheduleReconnect(): void {
+  // The `disconnect` tool (and a persisted "0" at startup) sets this false —
+  // a single guard here covers every caller (WebSocket creation failure, the
+  // close handler, the liveness watchdog) rather than needing one at each
+  // call site.
+  if (!wantConnected) return;
   if (reconnectTimer) return;
   reconnectAttempt++;
   const delay = Math.min(1000 * reconnectAttempt, 30000);
@@ -1652,8 +1657,43 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["label"],
       },
     },
+    {
+      name: "connect",
+      description:
+        "Connect this session to Bridge. Idempotent — calling it while already connected is a no-op on the socket. Persists across restarts until disconnect is called. Optionally set a display label at the same time (applied before the connect handshake, so the very first auth frame already carries it).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description: "Optional display name to set at connect time.",
+          },
+        },
+      },
+    },
+    {
+      name: "disconnect",
+      description:
+        "Disconnect this session from Bridge and stop automatic reconnects. Idempotent. Persists across restarts until connect is called again.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
   ],
 }));
+
+// Shared by `set_session_label` and `connect`'s optional label: persist the
+// label file (keyed by SESSION_KEY) and patch the live `sessionLabel` so the
+// NEXT auth frame carries it without requiring a reconnect to take effect.
+// Dropping the sessionInfo memo makes that "next auth frame" the very next
+// one sent, rather than a cached payload from before the change.
+function persistLabel(label: string): void {
+  sessionLabel = label;
+  if (label) writeLabelFile(STATE_DIR, SESSION_KEY, label);
+  else clearLabelFile(STATE_DIR, SESSION_KEY);
+  sessionInfoPromise = null;
+}
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   // First tool call proves Claude Code session is fully initialized
@@ -2188,18 +2228,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // minimalSessionInfo().sessionLabel on that next auth frame, and the
         // server re-suffixes whatever it receives. Storing `stored` here
         // would compound the suffix on every subsequent reconnect. `label`
-        // is already "" on the clear path.
-        sessionLabel = label;
-        // Store the RAW label the user typed, not the suffixed `Name · #id`
-        // form the server just returned. On the next plugin launch this same
-        // raw value feeds back into minimalSessionInfo().sessionLabel, and the
-        // SERVER re-applies its own suffix on connect — storing the already-
-        // suffixed form would double-suffix on every subsequent launch.
-        if (label) writeLabelFile(STATE_DIR, SESSION_KEY, label);
-        else clearLabelFile(STATE_DIR, SESSION_KEY);
-        // Drop the auth-payload memo so a reconnect re-collects and re-sends
-        // sessionInfo with the new label rather than replaying the cached one.
-        sessionInfoPromise = null;
+        // is already "" on the clear path. Same store+memo write `connect`'s
+        // optional label uses (persistLabel), just without the API PUT above.
+        persistLabel(label);
         return {
           content: [
             {
@@ -2210,6 +2241,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             },
           ],
         };
+      }
+
+      case "connect": {
+        // Optional label first: independent of connection state (it just
+        // touches the label file + the in-memory value), so it is in place
+        // before the auth frame below is even built.
+        const label = String(args.label ?? "").trim();
+        if (label) persistLabel(label);
+
+        wantConnected = true;
+        writeConnectState(STATE_DIR, SESSION_KEY, true);
+
+        if (!API_URL || !TOKEN) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Bridge not configured — run /bridge:configure to set your API URL and token.",
+              },
+            ],
+          };
+        }
+        // Already open: re-persisting the intent above is enough. Tearing
+        // down a healthy socket to "reconnect" would restart a connection
+        // that does not need it — the no-op half of idempotent.
+        if (!(wsConnected && authenticated)) connectUnlessDuplicate();
+        return {
+          content: [
+            { type: "text", text: wsConnected && authenticated ? "connected" : "connecting" },
+          ],
+        };
+      }
+
+      case "disconnect": {
+        wantConnected = false;
+        writeConnectState(STATE_DIR, SESSION_KEY, false);
+        // Cancel anything already scheduled — a socket mid-backoff must not
+        // fire a reconnect after this tool returns. scheduleReconnect()'s own
+        // `!wantConnected` guard (now false) covers every future attempt.
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        if (livenessTimer) {
+          clearInterval(livenessTimer);
+          livenessTimer = null;
+        }
+        try {
+          ws?.close();
+        } catch {}
+        return { content: [{ type: "text", text: "disconnected" }] };
       }
 
       default:
