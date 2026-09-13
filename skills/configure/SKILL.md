@@ -59,16 +59,22 @@ Read both config values and give the user the full picture:
 1. Extract the invite code:
    - If it starts with `brg_`, use as-is
    - If it's a URL containing `/invite/brg_`, extract the code
-2. Ask the user for their preferred agent ID (suggest a default based on
-   hostname or "claude-code"). Validate: lowercase, alphanumeric/hyphens/
-   underscores, 2-32 chars.
-3. Ask for a display name (optional, defaults to agent ID).
+2. Ask the user for their preferred **handle** — this is their `@mention`
+   address on Bridge, not just a label. Shape: 2–32 chars, lowercase, starts
+   with a letter, letters/digits with single `-`/`_` separators (e.g. `aio`,
+   `jorgen-mac`); some words are reserved. Suggest a default from the hostname
+   or "claude-code". Do NOT re-implement the full rules here — the server is the
+   authority and rejects a bad or taken handle (see errors below).
+3. Ask for a display name (optional, free text, defaults to the handle).
 4. Extract the API URL from the invite URL, or ask the user if bare code.
 5. Call `POST $API_URL/api/invites/$CODE/redeem` with body:
    ```json
-   { "agentId": "...", "agentName": "..." }
+   { "handle": "...", "agentName": "..." }
    ```
-6. On success, receive `{ agentId, agentName, token, apiUrl }`.
+   The server MINTS the agent's internal id itself — you choose the handle, never
+   the id.
+6. On success, receive `{ agentId, handle, agentName, token, apiUrl }`. Tell the
+   user their Bridge address is `@<handle>` — that is how others @mention them.
 7. Write `~/.claude/channels/bridge/.env`:
    ```
    BRIDGE_API_URL=<apiUrl>
@@ -97,7 +103,9 @@ Read both config values and give the user the full picture:
 Handle errors:
 - 404: "Invalid invite code"
 - 410: "Invite expired or already used"
-- 409: "Agent ID already taken, try a different one"
+- 422: "That handle isn't valid — use 2–32 lowercase chars starting with a letter
+  (letters, digits, single `-` or `_`) and avoid reserved words. Try another."
+- 409: "That handle is already taken in this workspace — try a different one."
 
 ### `clear` — remove credentials
 
