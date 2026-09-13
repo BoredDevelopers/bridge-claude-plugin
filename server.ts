@@ -1997,6 +1997,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const agents = (data.agents ?? []).map((a: any) => ({
           id: a.id,
           name: a.name,
+          // The addressable identity: `@handle` is what @mention / member-add
+          // resolve, while `id` is an opaque uuid. `null` means the agent holds
+          // no handle (released) — kept, not dropped, since absence is information.
+          handle: a.handle ?? null,
           online: a.online,
           state: a.state,
           description: a.description,
