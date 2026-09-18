@@ -139,7 +139,9 @@ const row = (seq: number, extra: Record<string, unknown> = {}): Row => ({
   agentName: "aio",
   content: `message ${seq}`,
   type: "text",
-  parentId: null,
+  // Channel view is roots-only, and every root carries its own surrogate thread
+  // id (RFC-012). read_messages projects `threadId` from it — the reply key.
+  threadId: `00000000-0000-7000-9000-${String(seq).padStart(12, "0")}`,
   replyCount: 0,
   seq,
   // ⚠️ WHOLE SECONDS, not `new Date().toISOString()`. `created_at` is an epoch
@@ -264,6 +266,16 @@ describe("read_messages resumes exactly, or says why it cannot", () => {
     expect(body.next_since_seq).toBe(9);
     // The literal next call, so the model does not have to assemble one.
     expect(body.hint).toContain("since_seq: 9");
+
+    // RFC-012 slice 5.2: the projection carries each root's SURROGATE thread id
+    // (the reply key the model feeds back to reply(thread_id: …)), sourced from
+    // the server's `threadId` — never the legacy `parentId`, which is null on a
+    // root and would strand every root with no way to thread.
+    expect(body.messages.map((m: any) => m.threadId)).toEqual([
+      "00000000-0000-7000-9000-000000000007",
+      "00000000-0000-7000-9000-000000000008",
+      "00000000-0000-7000-9000-000000000009",
+    ]);
   });
 
   test("since_seq: 0 is a real cursor, and reads from the beginning", async () => {

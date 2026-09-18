@@ -634,10 +634,6 @@ function markSeen(id: string): void {
   }
 }
 
-// Inbound message id → sender's context id, so threaded replies can default
-// to targeting the session that sent the message (server does the same for
-// thread replies; this covers replies through this tool explicitly)
-const senderContextByMessageId = new Map<string, string>();
 // Asks this session sent (id → type + send time) — used to notify the model
 // when one gets its first "seen" receipt. Only receipt-notified types are
 // tracked: keeping chatter here would evict pending asks.
@@ -1249,22 +1245,11 @@ function handleInboundMessage(msg: any, deliveryReasons?: unknown): void {
     typeof rawSender === "string" && rawSender && !rawSender.startsWith("unattributed_")
       ? rawSender
       : "";
-
-  // Remember who sent this (by session) for default reply targeting.
-  // Never record our OWN session. This map answers "whose session asked me, so
-  // I can reply back to them" — the answer is never ourselves. Cursor replay
-  // has no sender filter, so the server replays a session its own messages on
-  // reconnect, and this write happens BEFORE the own-message skip below.
-  // Without this guard every reconnect recorded our own context against our
-  // own message ids, and every later reply in those threads then targeted
-  // ourselves — a message for which no receipt can ever be recorded.
-  if (msg.id && senderContextId && senderContextId !== myContextId) {
-    senderContextByMessageId.set(msg.id, senderContextId);
-    if (senderContextByMessageId.size > 500) {
-      const first = senderContextByMessageId.keys().next().value;
-      if (first) senderContextByMessageId.delete(first);
-    }
-  }
+  // `senderContextId` still rides the inbound meta below as `sender_context_id`,
+  // so the model can target a reply at this exact session explicitly. DEFAULT
+  // thread-reply targeting is no longer computed here (RFC-012 slice 5.2): the
+  // server routes an untargeted thread reply to the thread's asker, one place
+  // for every client.
 
   // Deduplicate: skip if we already processed this exact message
   if (msg.id && seenMessageIds.has(msg.id)) {
@@ -1375,7 +1360,11 @@ function routeInbound(
           sender: senderName,
           sender_id: msg.agentId ?? "",
           type: msgType,
-          ...(msg.parentId ? { thread_id: msg.parentId } : {}),
+          // RFC-012 slice 5.2: surface the SURROGATE thread id (the reply key for
+          // POST /api/threads/:id/messages), not the legacy parent message id.
+          // Present on ROOTS too now — the model needs a root's thread id to reply
+          // into it — so `thread_id` no longer means "this is a reply".
+          ...(msg.threadId ? { thread_id: msg.threadId } : {}),
           ts: msg.createdAt ?? new Date().toISOString(),
           ...(metadata.routedTo ? { routed_to: metadata.routedTo } : {}),
           ...(metadata.contextId
@@ -1491,7 +1480,7 @@ const mcp = new Server(
     instructions: [
       "Bridge is an agent-to-agent messaging platform. Messages from other agents arrive as <channel source=\"bridge\" channel_id=\"...\" message_id=\"...\" sender=\"...\" type=\"...\">.",
       "",
-      "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. Use thread_id to reply in a thread (set to the parent message_id).",
+      "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
       "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start.",
       "",
@@ -1509,13 +1498,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "reply",
       description:
-        "Send a message to a Bridge channel. Pass channel_id from the inbound message. Optionally set type (text, task, question, code, status, response) and thread_id for threading.",
+        "Send a message to a Bridge channel. Pass channel_id from the inbound message. Optionally set type (text, task, question, code, status, response), title (names a task thread), and thread_id to reply into an existing thread.",
       inputSchema: {
         type: "object",
         properties: {
           channel_id: {
             type: "string",
-            description: "Channel ID or name to send to.",
+            description:
+              "Channel ID or name, from the inbound message. Always pass it; on a thread reply it is ignored (the thread fixes the channel), but it is still required.",
           },
           text: { type: "string", description: "Message content." },
           type: {
@@ -1533,7 +1523,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           thread_id: {
             type: "string",
             description:
-              "Parent message ID for threading. Use message_id from the inbound notification.",
+              "Thread ID to reply into. Use the thread_id from the inbound message (or from read_messages) — every message carries the id of the thread it belongs to. Omit to start a new root message.",
+          },
+          title: {
+            type: "string",
+            description:
+              "Title for a task thread (root only; ignored on thread replies). Use with type \"task\" to name the work; omitted, the server derives one from the content.",
           },
           context_id: {
             type: "string",
@@ -1767,16 +1762,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const text = args.text as string;
         const type = (args.type as string) ?? "text";
         const threadId = args.thread_id as string | undefined;
+        const title = args.title as string | undefined;
         let contextId = args.context_id as string | undefined;
 
-        // Targeted-by-default replies: "" forces broadcast; otherwise a
-        // threaded reply inherits the target session of the message being
-        // replied to (mirrors the server's thread-reply default)
+        // Targeting: an explicit context_id addresses one session; "" forces a
+        // broadcast reply. DEFAULT thread-reply targeting is the SERVER's job now
+        // (RFC-012 slice 5.2, #33) — a reply with no context_id and no broadcast
+        // is routed server-side to the thread's asker. The plugin dropped its own
+        // message→session map (an artifact of the old parentId wire): the thread
+        // route hands only the surrogate thread id, from which the server derives
+        // the same default in one place.
         const forceBroadcast = contextId === "";
         if (forceBroadcast) contextId = undefined;
-        if (!contextId && !forceBroadcast && threadId) {
-          contextId = senderContextByMessageId.get(threadId);
-        }
         // Self-targeting is a loop: a message targeted at this session bypasses
         // own-message echo suppression, so it would come back as inbound.
         let selfTargetNote = "";
@@ -1786,12 +1783,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             ", self-targeting dropped (context_id was this session's own)";
         }
 
-        const body: Record<string, unknown> = {
-          channelId,
-          content: text,
-          type,
-        };
-        if (threadId) body.parentId = threadId;
+        // RFC-012 slice 5.2 split wire: a REPLY posts to its THREAD (the thread
+        // fixes the channel and its root is the parent, so the client names
+        // NEITHER channelId NOR parentId); a ROOT stays on /api/messages.
+        const body: Record<string, unknown> = { content: text, type };
         if (contextId) body.contextId = contextId;
         if (forceBroadcast) body.broadcast = true;
         // Our own session, so receivers can target a reply back at this exact
@@ -1804,11 +1799,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // clobbered any caller metadata, and the server now stores the sender
         // in its own column rather than in the blob.
         if (myContextId) body.senderContextId = myContextId;
+        if (!threadId) {
+          body.channelId = channelId;
+          // D8: an explicit thread title, ROOT-ONLY (the thread reply route has
+          // no title field). Absent → the server derives one from content; a
+          // titleless task root is refused once slice 5.4 turns that 422 on.
+          if (title) body.title = title;
+        }
 
-        const res = await apiFetch("/api/messages", {
-          method: "POST",
-          body: JSON.stringify(body),
-        });
+        const res = await apiFetch(
+          threadId ? `/api/threads/${encodeURIComponent(threadId)}/messages` : "/api/messages",
+          { method: "POST", body: JSON.stringify(body) }
+        );
 
         if (!res.ok) {
           const err = await res.text();
@@ -2093,7 +2095,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           sender: m.agentName ?? m.agentId,
           content: m.content,
           type: m.type ?? "text",
-          threadId: m.parentId,
+          // RFC-012 slice 5.2: the surrogate thread id (the reply key), not the
+          // legacy parent id. Channel view is roots-only, so this is each root's
+          // own thread — reply into it with reply(thread_id: <this>).
+          threadId: m.threadId,
           replies: m.replyCount ?? 0,
           ts: m.createdAt,
         }));

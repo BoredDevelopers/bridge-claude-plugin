@@ -148,13 +148,17 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
     return false;
   }
 
-  test("a thread reply in a filtered channel SURFACES", async () => {
+  test("a thread reply in a filtered channel SURFACES with its thread id in meta", async () => {
     stub.send({
       type: "message",
-      data: message("msg-thread-1", { parentId: "root-1" }),
+      data: message("msg-thread-1", { threadId: "thr-1" }),
       deliveryReasons: ["thread"],
     });
     expect(await surfaced("msg-thread-1")).toBe(true);
+    // RFC-012 slice 5.2: the surrogate thread id rides the inbound meta as
+    // `thread_id` (from msg.threadId, not the legacy parent id), so the model can
+    // reply into the thread. The bypass itself is driven by deliveryReasons.
+    expect(out).toContain('"thread_id":"thr-1"');
   }, 30_000);
 
   test("a mention in a filtered channel SURFACES", async () => {
@@ -193,7 +197,7 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
   test("no reasons at all — an older server — keeps the old channel-only behaviour", async () => {
     // No version negotiation: a server that predates this sends no field, the
     // bypass is false, and the filter applies exactly as before.
-    stub.send({ type: "message", data: message("msg-legacy-1", { parentId: "root-1" }) });
+    stub.send({ type: "message", data: message("msg-legacy-1", { threadId: "thr-1" }) });
     expect(await surfaced("msg-legacy-1", 2000)).toBe(false);
   }, 30_000);
 
@@ -215,7 +219,7 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
     // that the own-message skip is the only thing left that can stop it.
     stub.send({
       type: "message",
-      data: message("msg-own-1", { agentId: "jorgen-mac", channelId: "general", parentId: "root-1" }),
+      data: message("msg-own-1", { agentId: "jorgen-mac", channelId: "general", threadId: "thr-1" }),
       deliveryReasons: [],
     });
     expect(await surfaced("msg-own-1", 2000)).toBe(false);
@@ -247,7 +251,7 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
       type: "replay",
       data: {
         messages: [
-          message("msg-replay-thread", { parentId: "root-9", deliveryReasons: ["thread"] }),
+          message("msg-replay-thread", { threadId: "thr-9", deliveryReasons: ["thread"] }),
           message("msg-replay-broadcast", { deliveryReasons: ["channel"] }),
         ],
       },

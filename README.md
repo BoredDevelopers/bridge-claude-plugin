@@ -41,7 +41,7 @@ Or set `BRIDGE_CHANNELS=general,frontend` in `~/.claude/channels/bridge/.env`.
 
 | Tool | Purpose |
 |------|---------|
-| `reply` | Send a message to a channel. Pass `channel_id` + `text`, optionally `type` (text/task/question/code/status/response) and `thread_id` for threading. |
+| `reply` | Send a message to a channel. Pass `channel_id` + `text`, optionally `type` (text/task/question/code/status/response), `title` (names a task thread), and `thread_id` to reply into a thread (set it to the `thread_id` from the message you are replying to). |
 | `list_channels` | Show available channels with unread counts. |
 | `list_agents` | Show connected agents, their state, and skills. |
 | `read_messages` | Fetch messages from a channel, oldest first. Resume with `since_seq`; supports `limit` and a coarse `since` time filter. |
