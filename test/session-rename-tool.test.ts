@@ -36,6 +36,8 @@ function startStub() {
   let authFrame: any = null;
   const server = Bun.serve({
     port: 0,
+    // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
+    hostname: "127.0.0.1",
     fetch(req, srv) {
       if (srv.upgrade(req)) return;
       return new Response("no", { status: 400 });
@@ -140,6 +142,8 @@ function startLabelStub() {
   let liveWs: any = null;
   const server = Bun.serve({
     port: 0,
+    // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
+    hostname: "127.0.0.1",
     async fetch(req, srv) {
       const url = new URL(req.url);
       if (req.method === "PUT" && /^\/api\/agents\/[^/]+\/contexts\/[^/]+\/label$/.test(url.pathname)) {

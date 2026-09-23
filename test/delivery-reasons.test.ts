@@ -61,6 +61,8 @@ function startStub(): Stub {
   let socket: any = null;
   const server = Bun.serve({
     port: 0,
+    // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
+    hostname: "127.0.0.1",
     fetch(req, srv) {
       if (srv.upgrade(req)) return;
       return new Response("no", { status: 400 });

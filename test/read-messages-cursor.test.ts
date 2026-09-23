@@ -82,9 +82,8 @@ function startStub(): Stub {
 
   const server = Bun.serve({
     port: 0,
-    // ⚠️ SYNCHRONOUS on purpose: an `async` fetch hands Bun a Promise even on the
-    // WebSocket-upgrade path, and that made the plugin's connect intermittently
-    // miss the 15s window. Only the POST branch returns a Promise.
+    // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
+    hostname: "127.0.0.1",
     fetch(req, srv) {
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
