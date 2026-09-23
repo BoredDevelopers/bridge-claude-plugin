@@ -53,6 +53,8 @@ function startStub(): Stub {
 
   const server = Bun.serve({
     port: 0,
+    // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
+    hostname: "127.0.0.1",
     fetch(req, srv) {
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {

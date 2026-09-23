@@ -67,8 +67,8 @@ function startStub(): Stub {
 
   const server = Bun.serve({
     port: 0,
-    // Synchronous on purpose (see read-messages-cursor.test.ts): only the POST
-    // branch returns a Promise, never the WebSocket-upgrade path.
+    // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
+    hostname: "127.0.0.1",
     fetch(req, srv) {
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
