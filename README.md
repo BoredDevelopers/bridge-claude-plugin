@@ -73,7 +73,11 @@ The plugin runs an MCP server that:
 1. Connects to Bridge via WebSocket for real-time message delivery
 2. Forwards inbound messages to your Claude Code session as `<channel>` notifications
 3. Exposes tools for sending messages and querying Bridge state
-4. Reconnects automatically with exponential backoff if the connection drops
+4. Reconnects automatically with jittered exponential backoff if the connection drops, paced by
+   why it closed (`reconnect-policy.ts`): 1s → 30s for a dropped connection or restart; 30s → 5min
+   when the agent has too many live sessions (4007); 60s → 5min when the token is rejected or the
+   agent deactivated (4001/4003 — reversible by an admin, so it keeps trying); and not at all when the
+   token is revoked (4008). `status` shows the reason; `/bridge:connect` skips the wait.
 5. Replays missed messages on reconnect (using the `since` parameter)
 
 ## Message types

@@ -37,6 +37,7 @@ import { homedir, hostname } from "os";
 import { join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
 import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
+import { classifyClose, describeClose, reconnectDelay, type CloseClass } from "./reconnect-policy";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -560,6 +561,10 @@ let ws: WebSocket | null = null;
 let wsConnected = false;
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Why the last socket closed — drives the reconnect schedule (reconnect-policy.ts)
+// and the reason `status` reports. Cleared by a completed auth.
+let lastClose: { cls: CloseClass; code?: number; reason?: string } = { cls: "transient" };
+let nextReconnectAt: number | null = null;
 // Liveness watchdog for the current socket. The server pings every 30s, so a
 // healthy socket is never silent this long; a half-open one (laptop sleep,
 // NAT/tunnel timeout) is silent forever and never fires `close`.
@@ -922,7 +927,7 @@ function connectWs(): void {
     }
   });
 
-  sock.addEventListener("close", () => {
+  sock.addEventListener("close", (event) => {
     // Ignore a late close from a socket we already replaced or gave up on
     if (ws !== sock) return;
     if (livenessTimer) {
@@ -931,7 +936,15 @@ function connectWs(): void {
     }
     wsConnected = false;
     authenticated = false;
-    process.stderr.write(`bridge channel: WebSocket closed\n`);
+    const code = (event as CloseEvent).code;
+    const reason = (event as CloseEvent).reason || undefined;
+    const cls = classifyClose(code);
+    // A new KIND of refusal starts its own schedule from the bottom; a repeat
+    // of the same kind keeps climbing it.
+    if (cls !== lastClose.cls) reconnectAttempt = 0;
+    lastClose = { cls, code, reason };
+    process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
+    notifyConnectionRefused(cls, code, reason);
     scheduleReconnect();
   });
 
@@ -969,14 +982,48 @@ function scheduleReconnect(): void {
   if (!wantConnected) return;
   if (reconnectTimer) return;
   reconnectAttempt++;
-  const delay = Math.min(1000 * reconnectAttempt, 30000);
+  const delay = reconnectDelay(reconnectAttempt, lastClose.cls);
+  if (delay === null) {
+    // Revoked: this token will never work again. Only /bridge:connect (after
+    // /bridge:configure) tries again.
+    nextReconnectAt = null;
+    process.stderr.write(`bridge channel: not reconnecting — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason)}\n`);
+    return;
+  }
+  nextReconnectAt = Date.now() + delay;
   process.stderr.write(
-    `bridge channel: reconnecting in ${delay / 1000}s (attempt ${reconnectAttempt})\n`
+    `bridge channel: reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})\n`
   );
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
+    nextReconnectAt = null;
     connectWs();
   }, delay);
+}
+
+/**
+ * Tell the MODEL when a close means "a person must act", once per refusal
+ * episode (re-armed by a completed auth).
+ *
+ * ⚠️ ONLY 4003 AND 4008. 4001 and 4007 arrive with a server `error` frame
+ * first ("Invalid token" / "Too many sessions"), which the error-frame path
+ * already surfaces — a second notice here would say the same thing twice.
+ * 4003 carries no frame (the server just closes), and 4008 may not either.
+ */
+let notifiedCloseClass: CloseClass | null = null;
+function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined): void {
+  if (code !== 4003 && code !== 4008) return;
+  if (notifiedCloseClass === cls) return;
+  notifiedCloseClass = cls;
+  mcp
+    .notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason)}`,
+        meta: { type: "error", sender: "bridge" },
+      },
+    })
+    .catch(() => {});
 }
 
 // Live connection state, for tools to report. Written state that nothing reads
@@ -984,8 +1031,12 @@ function scheduleReconnect(): void {
 function connectionState(): string {
   if (wsConnected && authenticated) return "connected";
   if (wsConnected) return "connected, not authenticated";
-  if (reconnectTimer) return `disconnected (reconnect attempt ${reconnectAttempt})`;
-  return "disconnected";
+  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason)}`;
+  if (reconnectTimer) {
+    const inS = nextReconnectAt ? Math.max(0, Math.round((nextReconnectAt - Date.now()) / 1000)) : 0;
+    return `disconnected (reconnect attempt ${reconnectAttempt}, in ${inS}s)${why}`;
+  }
+  return `disconnected${why}`;
 }
 
 function connectionStatus(): Record<string, unknown> {
@@ -1032,6 +1083,8 @@ function handleWsMessage(data: any): void {
       // Backoff resets only here — a completed auth round-trip is the only
       // proof the connection is actually usable.
       reconnectAttempt = 0;
+      lastClose = { cls: "transient" };
+      notifiedCloseClass = null;
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
       // delivered (the flush triggers are one-shot per gate)
@@ -1402,8 +1455,9 @@ async function apiFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
+  let res: Response;
   try {
-    return await fetch(`${API_URL}${path}`, {
+    res = await fetch(`${API_URL}${path}`, {
       ...opts,
       signal: opts.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
       headers: {
@@ -1431,6 +1485,19 @@ async function apiFetch(
       `Bridge API request failed (${path}): ${err instanceof Error ? err.message : String(err)}`
     );
   }
+  // A 429 used to reach the model as a bare `Bridge API error 429` (several
+  // callers print only the status), with nothing saying how long to wait — so
+  // the natural next move was an immediate retry, which the limiter refuses
+  // again. THROWN, so every tool reports it the same way through its own
+  // "X failed:" path; the two background callers (`loadChannelMap`,
+  // `markReadUpTo`) already catch.
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get("retry-after")) || undefined;
+    throw new Error(
+      `Bridge API rate-limited this agent (429, ${path}) — wait ${retryAfter ?? "a few"} second(s) before retrying; do not retry immediately.`
+    );
+  }
+  return res;
 }
 
 /**
@@ -2649,7 +2716,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // Already open: re-persisting the intent above is enough. Tearing
         // down a healthy socket to "reconnect" would restart a connection
         // that does not need it — the no-op half of idempotent.
-        if (!(wsConnected && authenticated)) connectUnlessDuplicate();
+        // An explicit connect skips any backoff in progress — including the
+        // slow 4001/4003/4007 schedules and a revoked token's stop. Without
+        // clearing the timer, the pending retry would ALSO fire and open a
+        // second socket over the one this call just opened.
+        if (!(wsConnected && authenticated)) {
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+            nextReconnectAt = null;
+          }
+          reconnectAttempt = 0;
+          connectUnlessDuplicate();
+        }
         return {
           content: [
             { type: "text", text: wsConnected && authenticated ? "connected" : "connecting" },
