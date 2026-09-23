@@ -1468,6 +1468,54 @@ function requireBridge(): { content: { type: "text"; text: string }[] } | null {
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
+/**
+ * Advance a read cursor after a read tool returned messages — best-effort.
+ *
+ * For an agent, the read call IS the act of reading: there is no scrolling past
+ * a message. A separate "mark read" tool would be one more bookkeeping call a
+ * model skips, and unread counts would freeze (the plugin never marked anything
+ * read before 0.20.0, so channel unread was frozen for every agent).
+ *
+ * ⚠️ ONLY AS FAR AS WHAT WAS RETURNED. Both routes clamp to the head and never
+ * move a cursor backwards, but "up to the head" is not what the caller saw — a
+ * paged read must leave the pages it did not fetch unread.
+ *
+ * ⚠️ AND ONLY FROM WHERE THE CALLER ACTUALLY IS. `since_seq` is whatever the
+ * model passed — a hint's number, an inbound message's seq — not the stored
+ * read cursor. Marking from there would, via the server's GREATEST, sweep
+ * everything below the page into "read" unseen (found in review: a newest-page
+ * read correctly marked nothing, then its own "poll from since_seq: 100" hint
+ * marked roots 1..80 read). `fromSeq` makes the server advance only when its
+ * stored position already reaches the start of this read; otherwise it answers
+ * `advanced: false` and nothing moves.
+ *
+ * A failure is REPORTED, never thrown: the read itself succeeded, and failing it
+ * over bookkeeping would make the model retry a read that already worked.
+ */
+async function markReadUpTo(
+  path: string,
+  fromSeq: number,
+  lastReadSeq: number
+): Promise<{ marked_read_up_to?: number; mark_read_skipped?: string; mark_read_error?: string }> {
+  try {
+    const res = await apiFetch(path, { method: "POST", body: JSON.stringify({ fromSeq, lastReadSeq }) });
+    if (!res.ok) return { mark_read_error: `Bridge API error ${res.status}: ${await res.text()}` };
+    const data = (await res.json()) as any;
+    if (data.advanced === false) {
+      return {
+        mark_read_skipped:
+          `not marked: this read started at seq ${fromSeq}, but your read position is ${data.lastReadSeq} — ` +
+          `messages in between were not read. Read from since_seq: ${data.lastReadSeq} to catch up.`,
+      };
+    }
+    // The server's answer, not what was asked: it is the value that stuck after
+    // clamping, and the only honest thing to report.
+    return { marked_read_up_to: Number(data.lastReadSeq) };
+  } catch (err) {
+    return { mark_read_error: String(err) };
+  }
+}
+
 // Read from package.json rather than restated here. The comment that used to
 // sit in this spot asked whoever bumped the version to remember three places,
 // and it had already drifted — package.json said 0.10.1 while the handshake
@@ -1482,7 +1530,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -1576,10 +1624,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Read messages from a Bridge channel, oldest first. Every message carries a `seq` — " +
         "unique and increasing within its channel. Gaps in the returned seqs are normal: they " +
-        "are thread replies, which this tool does not return. With no since_seq you get the " +
+        "are thread replies, which this tool does not return — a message's `replies` count says " +
+        "how many, and read_thread(thread_id) reads them. With no since_seq you get the " +
         "NEWEST page and older messages are not returned; pass since_seq: 0 to read a channel " +
         "from the start, or the `next_since_seq` from a previous result to continue exactly " +
-        "where you left off.",
+        "where you left off. Marks the channel read up to the last message returned — only " +
+        "when the read continues from your read position, so nothing unread is skipped; " +
+        "mark_read: false to peek.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1622,6 +1673,68 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
               "Coarse time filter, e.g. 'show me today'. ⚠️ NOT a cursor — it is accurate " +
               "only to the whole second, so resuming with it silently drops messages that " +
               "share a second with the last one you saw. Use since_seq to resume.",
+          },
+          mark_read: {
+            type: "boolean",
+            description:
+              "Default true: mark the channel read up to the last message returned (only when the read was contiguous). false = peek.",
+          },
+        },
+        required: ["channel_id"],
+      },
+    },
+    {
+      name: "read_thread",
+      description:
+        "Read a thread: its root message and its replies, oldest first — including replies " +
+        "sent while this session was not connected. Pass the thread_id shown on any message " +
+        "(inbound or from read_messages) — NOT its message_id. Pages like read_messages: pass " +
+        "the returned next_since_seq as since_seq to continue. By default it marks the thread " +
+        "read up to the last message returned (never further); pass mark_read: false to peek.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread_id: {
+            type: "string",
+            description: "The thread_id from a message (not the message_id).",
+          },
+          since_seq: {
+            type: "number",
+            description:
+              "Resume after this seq — use next_since_seq from the previous result. Omit to " +
+              "read from the start (the root message is included on that first page).",
+          },
+          limit: {
+            type: "number",
+            minimum: 1,
+            maximum: 200,
+            description: "Max replies to return (default 50, max 200).",
+          },
+          mark_read: {
+            type: "boolean",
+            description:
+              "Default true: mark the thread read up to the last message returned. false = peek without consuming.",
+          },
+        },
+        required: ["thread_id"],
+      },
+    },
+    {
+      name: "list_threads",
+      description:
+        "List a channel's threads, most recently active first, with each thread's reply count " +
+        "and how many of its messages you have not read. Use it to find which threads need " +
+        "attention, then read_thread(thread_id) to read (and mark read) one.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: {
+            type: "string",
+            description: "Channel ID or name.",
+          },
+          unread_only: {
+            type: "boolean",
+            description: "Only threads with unread messages (default false).",
           },
         },
         required: ["channel_id"],
@@ -2211,6 +2324,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           hint = `Caught up. To resume later: read_messages(channel_id: "${channelId}", since_seq: ${nextSinceSeq})`;
         }
 
+        /**
+         * Mark read — ONLY a contiguous read. The cursor means "read everything
+         * up to here", so it may only move over messages this call returned:
+         *   - since_seq: contiguous from since_seq, and the SERVER checks that
+         *     since_seq is not above the stored position (`fromSeq`). ✓
+         *   - newest page that holds the WHOLE channel: contiguous from 0. ✓
+         *   - newest page with older messages withheld: marking would clear the
+         *     ones never returned. ✗
+         *   - `since` (a time filter): not anchored to any seq. ✗
+         * Up to the HIGHEST returned seq, not the last row: the newest page is
+         * ordered by created_at, which can disagree with seq.
+         * The channel ID comes off the rows: the caller may have passed a name,
+         * and `/api/channels/:id/read` takes an id.
+         */
+        const contiguous = sinceSeq !== undefined || (!hasSince && !olderNotReturned);
+        const rawChannelId = (data.messages ?? [])[0]?.channelId;
+        const returnedSeqs = messages.map((m: any) => m.seq).filter((n: unknown) => typeof n === "number");
+        const mark =
+          args.mark_read !== false && contiguous && returnedSeqs.length > 0 && rawChannelId
+            ? await markReadUpTo(
+                `/api/channels/${encodeURIComponent(rawChannelId)}/read`,
+                sinceSeq ?? 0,
+                Math.max(...returnedSeqs)
+              )
+            : {};
+
         return {
           content: [
             {
@@ -2225,6 +2364,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                   next_since_seq: nextSinceSeq,
                   has_more: hasMore,
                   older_not_returned: olderNotReturned,
+                  ...mark,
                   // A literal next call, because a cursor the model has to
                   // assemble is a cursor it can assemble wrong.
                   hint,
@@ -2233,6 +2373,166 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 null,
                 2
               ),
+            },
+          ],
+        };
+      }
+
+      case "read_thread": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const threadId = args.thread_id;
+        if (typeof threadId !== "string" || threadId === "") {
+          throw new Error("thread_id is required — the thread_id shown on a message, not its message_id.");
+        }
+        const limit = Math.min(Math.max(Math.trunc(Number(args.limit) || 50), 1), 200);
+        // Same guards as read_messages' since_seq, for the same measured reasons.
+        if (
+          args.since_seq != null &&
+          typeof args.since_seq !== "number" &&
+          typeof args.since_seq !== "string"
+        ) {
+          throw new Error(`since_seq must be a number, got ${JSON.stringify(args.since_seq)}`);
+        }
+        const sinceSeq = args.since_seq != null ? Number(args.since_seq) : undefined;
+        if (sinceSeq !== undefined && (!Number.isInteger(sinceSeq) || sinceSeq < 0)) {
+          throw new Error(`since_seq must be a whole number >= 0, got ${JSON.stringify(args.since_seq)}`);
+        }
+
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (sinceSeq !== undefined) params.set("sinceSeq", String(sinceSeq));
+        const res = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/messages?${params}`);
+        if (res.status === 404) {
+          throw new Error(`Thread ${threadId} not found, or not visible to this agent.`);
+        }
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        const data = (await res.json()) as any;
+
+        // An unknown id answers 200 with nothing in it (the server masks, it does
+        // not 404, for a non-uuid). The likeliest cause is a message_id passed as
+        // a thread_id — exactly the mistake that made thread replies "not work"
+        // before 0.19.0 — so say that rather than "0 replies".
+        // Keyed on `thread` (null only for an unknown/non-uuid id), not on "no
+        // messages": a real thread can be rootless and empty.
+        if (data.thread === null || (data.thread === undefined && !data.parent && (data.replies ?? []).length === 0)) {
+          throw new Error(
+            `No thread with id ${threadId}. Pass the thread_id shown on a message ` +
+              `(inbound, or from read_messages) — a message_id is not a thread_id.`
+          );
+        }
+        // A server that predates paging strips `sinceSeq` and answers the FIRST
+        // page as if it were the requested one. Its tell: no `hasMore` field.
+        if (typeof data.hasMore !== "boolean") {
+          throw new Error(
+            "This Bridge server does not support paged thread reads — upgrade the server."
+          );
+        }
+
+        const shape = (m: any) => ({
+          id: m.id,
+          seq: m.seq,
+          sender: m.senderName ?? m.agentName ?? m.agentId,
+          content: m.content,
+          type: m.type ?? "text",
+          ts: m.createdAt,
+        });
+        // The root is context, not news: shipped on the first page only, so a
+        // polling reader is not handed it again on every call.
+        const includeParent = !sinceSeq && data.parent;
+        const replies = (data.replies ?? []).map(shape);
+        const nextSinceSeq: number = data.nextSinceSeq;
+        const hasMore: boolean = data.hasMore;
+
+        const returnedSeqs = [
+          ...(includeParent ? [Number(data.parent.seq)] : []),
+          ...replies.map((r: any) => Number(r.seq)),
+        ].filter((n) => Number.isFinite(n));
+        const mark =
+          args.mark_read !== false && returnedSeqs.length > 0
+            ? await markReadUpTo(
+                `/api/threads/${encodeURIComponent(threadId)}/read`,
+                sinceSeq ?? 0,
+                Math.max(...returnedSeqs)
+              )
+            : {};
+
+        const channelId = data.thread?.channelId ?? data.parent?.channelId;
+        // Resume from the highest seq SEEN — on a first page with no replies the
+        // server echoes cursor 0, and polling from 0 would resend the root.
+        const resumeSeq = Math.max(nextSinceSeq, ...returnedSeqs);
+        const hint = hasMore
+          ? `More replies. Next: read_thread(thread_id: "${threadId}", since_seq: ${nextSinceSeq})`
+          : `Caught up. Reply with reply(channel_id: "${channelId}", thread_id: "${threadId}", text: ...). ` +
+            `To check for newer replies later: read_thread(thread_id: "${threadId}", since_seq: ${resumeSeq})`;
+
+        return {
+          content: [
+            {
+              type: "text",
+              // Cursor fields first, for the reason read_messages gives.
+              text: JSON.stringify(
+                {
+                  thread: data.thread
+                    ? {
+                        id: data.thread.id,
+                        title: data.thread.title,
+                        status: data.thread.status,
+                        reply_count: data.thread.replyCount,
+                      }
+                    : { id: threadId },
+                  channel_id: channelId,
+                  count: replies.length,
+                  next_since_seq: resumeSeq,
+                  has_more: hasMore,
+                  ...mark,
+                  hint,
+                  ...(includeParent ? { root: shape(data.parent) } : {}),
+                  replies,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "list_threads": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const channelArg = args.channel_id as string;
+        // The server resolves a name or an id (as the channel view does).
+        const res = await apiFetch(`/api/threads?channel=${encodeURIComponent(channelArg)}`);
+        if (res.status === 404) throw new Error(`Channel ${channelArg} not found, or not visible to this agent.`);
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        const data = (await res.json()) as any;
+        // ⚠️ An unknown channel is a 200 with no threads — indistinguishable from
+        // a quiet channel except by `channelId: null`. Reporting it as "No unread
+        // threads." would be a false all-read.
+        if (data.channelId === null) throw new Error(`Unknown channel: ${channelArg}. list_channels shows the valid ones.`);
+        if (typeof data.channelId !== "string") {
+          throw new Error("This Bridge server does not support list_threads by name — upgrade the server.");
+        }
+        const channelId: string = data.channelId;
+        const all = (data.threads ?? []).map((t: any) => ({
+          thread_id: t.id,
+          title: t.title,
+          status: t.status,
+          replies: t.replyCount ?? 0,
+          // ⚠️ `unread` absent, never defaulted to 0, when the server did not say:
+          // a made-up 0 is a claim that everything is read (see list_channels).
+          ...(typeof t.unreadCount === "number" ? { unread: t.unreadCount } : {}),
+          last_activity: t.lastActivityAt,
+        }));
+        const threads = args.unread_only === true ? all.filter((t: any) => (t.unread ?? 0) > 0) : all;
+        const unreadThreads = all.filter((t: any) => (t.unread ?? 0) > 0).length;
+        const hint =
+          unreadThreads > 0
+            ? `${unreadThreads} thread(s) with unread messages — read_thread(thread_id) reads one and marks it read.`
+            : "No unread threads.";
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ channel_id: channelId, count: threads.length, hint, threads }, null, 2),
             },
           ],
         };
