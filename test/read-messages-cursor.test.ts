@@ -47,6 +47,8 @@ type Stub = {
   setRawResponse: (rows: Row[] | null) => void;
   /** Make the next `/api/messages` call fail with this status and body. */
   setError: (status: number, body: string) => void;
+  /** Every `POST /api/channels/:id/read` as { channelId, body }, in order. */
+  marks: { channelId: string; body: any }[];
   stop: () => void;
 };
 
@@ -72,16 +74,35 @@ function startStub(): Stub {
   let raw: Row[] | null = null;
   let failWith: { status: number; body: string } | null = null;
   const queries: string[] = [];
+  const marks: { channelId: string; body: any }[] = [];
+  let cursor = 0; // the stored channel read position
 
   const clamp = (v: string | null) =>
     Math.min(Math.max(Math.trunc(Number(v) || 50), 1), 200);
 
   const server = Bun.serve({
     port: 0,
+    // ⚠️ SYNCHRONOUS on purpose: an `async` fetch hands Bun a Promise even on the
+    // WebSocket-upgrade path, and that made the plugin's connect intermittently
+    // miss the 15s window. Only the POST branch returns a Promise.
     fetch(req, srv) {
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
         if (srv.upgrade(req)) return;
+      }
+      const mark = url.pathname.match(/^\/api\/channels\/([^/]+)\/read$/);
+      if (mark && req.method === "POST") {
+        return req.json().catch(() => null).then((body: any) => {
+          marks.push({ channelId: decodeURIComponent(mark[1]!), body });
+          // Models channels.ts: advance only if the stored position reaches
+          // fromSeq; clamp to the head; never backwards.
+          const head = channel.length ? Number(channel[channel.length - 1]!.seq) : 0;
+          if (body?.fromSeq !== undefined && cursor < body.fromSeq) {
+            return Response.json({ ok: true, advanced: false, channelId: mark[1], lastReadSeq: cursor });
+          }
+          cursor = Math.max(cursor, Math.min(body?.lastReadSeq ?? head, head));
+          return Response.json({ ok: true, advanced: true, channelId: mark[1], lastReadSeq: cursor });
+        });
       }
       if (url.pathname === "/api/messages") {
         queries.push(url.search);
@@ -121,7 +142,8 @@ function startStub(): Stub {
     port: server.port!,
     connected: () => socket !== null,
     queries,
-    setChannel: (r) => { channel = r; raw = null; failWith = null; },
+    marks,
+    setChannel: (r) => { channel = r; raw = null; failWith = null; cursor = 0; },
     setRawResponse: (r) => { raw = r; },
     setError: (status, body) => { failWith = { status, body }; },
     stop: () => server.stop(true),
@@ -459,5 +481,85 @@ describe("read_messages resumes exactly, or says why it cannot", () => {
     const res = await callTool("read_messages", { channel_id: CHANNEL, since: "yesterday" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("Invalid 'since' timestamp");
+  });
+
+  /**
+   * 0.20.0: reading marks read — but ONLY a contiguous read. The channel cursor
+   * means "everything up to here is read", so it may only move over messages
+   * this call actually returned. Before 0.20.0 the plugin marked nothing read,
+   * so every agent's channel unread was frozen.
+   */
+  describe("marks the channel read only over what it returned", () => {
+    test("cursor mode: marks up to the last returned seq, sending fromSeq = since_seq", async () => {
+      stub.setChannel(channelOf(9));
+      await read({ since_seq: 0, limit: 3 });
+      const body = await read({ since_seq: 3, limit: 4 });
+      expect(body.messages.map((m: any) => m.seq)).toEqual([4, 5, 6, 7]);
+      // 7, not the head (9): 8 and 9 were not returned and stay unread.
+      expect(stub.marks.map((m) => m.body)).toEqual([
+        { fromSeq: 0, lastReadSeq: 3 },
+        { fromSeq: 3, lastReadSeq: 7 },
+      ]);
+      expect(stub.marks[1]!.channelId).toBe(CHANNEL);
+      expect(body.marked_read_up_to).toBe(7);
+    });
+
+    /**
+     * The review finding: a newest-page read (older withheld) correctly marks
+     * nothing — then its own hint says "poll from since_seq: 30". That poll
+     * starts ABOVE the stored position (0), so marking would sweep 1..20 into
+     * "read" unseen. The server refuses (advanced: false) and the tool says so.
+     */
+    test("a poll from the hint's since_seq after a withheld newest page does NOT mark", async () => {
+      stub.setChannel(channelOf(30));
+      const first = await read({ limit: 10 });
+      expect(first.older_not_returned).toBe(true);
+      stub.setChannel([...channelOf(32)]);
+      const poll = await read({ since_seq: 30 });
+      expect(poll.messages.map((m: any) => m.seq)).toEqual([31, 32]);
+      expect(poll.marked_read_up_to).toBeUndefined();
+      expect(poll.mark_read_skipped).toContain("since_seq: 0");
+    });
+
+    test("marks the HIGHEST returned seq, not the last row (created_at can disagree with seq)", async () => {
+      stub.setChannel(channelOf(11));
+      // Newest page as the server orders it: by created_at, so seq 11 (earlier
+      // second) comes before seq 10. The whole channel fits, so it is contiguous.
+      stub.setRawResponse([row(11), row(10)]);
+      await read({ limit: 50 });
+      expect(stub.marks.map((m) => m.body)).toEqual([{ fromSeq: 0, lastReadSeq: 11 }]);
+    });
+
+    test("newest page WITH older messages withheld: marks nothing", async () => {
+      stub.setChannel(channelOf(30));
+      const body = await read({ limit: 10 });
+      expect(body.older_not_returned).toBe(true);
+      expect(stub.marks).toEqual([]);
+    });
+
+    test("newest page holding the WHOLE channel: marks to its end", async () => {
+      stub.setChannel(channelOf(5));
+      const body = await read({ limit: 10 });
+      expect(body.older_not_returned).toBe(false);
+      expect(stub.marks.map((m) => m.body)).toEqual([{ fromSeq: 0, lastReadSeq: 5 }]);
+    });
+
+    test("the coarse `since` time filter never marks", async () => {
+      stub.setChannel(channelOf(5));
+      await read({ since: new Date(0).toISOString() });
+      expect(stub.marks).toEqual([]);
+    });
+
+    test("mark_read: false peeks", async () => {
+      stub.setChannel(channelOf(9));
+      await read({ since_seq: 0, mark_read: false });
+      expect(stub.marks).toEqual([]);
+    });
+
+    test("an empty poll marks nothing", async () => {
+      stub.setChannel(channelOf(9));
+      await read({ since_seq: 9 });
+      expect(stub.marks).toEqual([]);
+    });
   });
 });
