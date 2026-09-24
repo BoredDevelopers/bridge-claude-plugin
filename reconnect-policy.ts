@@ -23,17 +23,18 @@
  *               today both are undone by someone else with the SAME token
  *               (reactivate; workspace restore), so keep retrying — slowly — and
  *               the session recovers without anyone touching the terminal.
- * - revoked     (4008, reserved): the token itself was revoked or rotated away
- *               and will never work again. Retrying is pointless; stop and tell
- *               the user. Shipped ahead of the server feature on purpose:
- *               plugins update slowly, so the installed base should understand
- *               the code before the server first sends it.
+ * - expired     (4009, RFC-014 D9): the access token ran out before a reauth. The
+ *               credential manager refreshes on the way back in, so retry soon.
+ * - revoked     (4008): the session or the machine's installation was revoked
+ *               ("session revoked" / "installation revoked") and will never work
+ *               again. Retrying is pointless; stop and tell the user.
  */
 
-export type CloseClass = "transient" | "session-cap" | "credential" | "revoked";
+export type CloseClass = "transient" | "expired" | "session-cap" | "credential" | "revoked";
 
 const SCHEDULE: Record<Exclude<CloseClass, "revoked">, { baseMs: number; capMs: number }> = {
   transient: { baseMs: 1_000, capMs: 30_000 },
+  expired: { baseMs: 1_000, capMs: 30_000 },
   "session-cap": { baseMs: 30_000, capMs: 300_000 },
   credential: { baseMs: 60_000, capMs: 300_000 },
 };
@@ -47,6 +48,8 @@ export function classifyClose(code: number | undefined): CloseClass {
       return "credential";
     case 4008:
       return "revoked";
+    case 4009:
+      return "expired";
     default:
       return "transient";
   }
@@ -72,8 +75,13 @@ export function describeClose(cls: CloseClass, code: number | undefined, reason:
       return `too many live sessions for this agent (${tail}) — close another session, or wait for a slot`;
     case "credential":
       return `token rejected or agent deactivated (${tail}) — an admin can reactivate it; otherwise fix the token with /bridge:configure`;
+    case "expired":
+      return `access token expired (${tail}) — refreshing`;
     case "revoked":
-      return `token revoked (${tail}) — set the new token with /bridge:configure, then /bridge:connect`;
+      if (reason === "session revoked") return `this session was revoked in Bridge (${tail}) — /bridge:connect starts a new session`;
+      if (reason === "installation revoked")
+        return `this machine was signed out of Bridge (${tail}) — run /bridge:login to connect it again`;
+      return `token revoked (${tail}) — run /bridge:login, then /bridge:connect`;
     default:
       return `connection closed (${tail})`;
   }

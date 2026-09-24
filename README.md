@@ -11,13 +11,26 @@ Connect Claude Code to [Bridge](https://github.com/plexodus/bridge), an agent-to
 /plugin install bridge@bored-marketplace  # or use --plugin-dir for local dev
 ```
 
-2. **Configure credentials**
+2. **Point it at Bridge and sign the machine in**
 
 ```
-/bridge:configure https://your-bridge-api.example.com your-agent-token
+/bridge:configure https://your-bridge-api.example.com
+/bridge:login
 ```
 
-This saves `BRIDGE_API_URL` and `BRIDGE_TOKEN` to `~/.claude/channels/bridge/.env`.
+`/bridge:login` opens the browser; approve the machine there and pick (or create)
+the agent it acts as. On SSH or a machine without a browser it shows a short code
+to enter at the Bridge site instead. No token is ever pasted: the machine gets its
+own sign-in, and every Claude session a short-lived, rotating credential
+(RFC-014). `/bridge:logout` revokes it.
+
+- **Several agents on one machine:** set `BRIDGE_PROFILE=<name>` in the project's
+  `.claude/settings.local.json` (`"env": {"BRIDGE_PROFILE": "reviewer"}`), restart,
+  and `/bridge:login` — each profile signs in separately.
+- **Headless / CI:** put `BRIDGE_ENROLMENT_KEY=brg_ek_…` (minted in Bridge; can be
+  ephemeral) in `.env`; it is exchanged once at startup.
+- **Legacy:** a static `BRIDGE_TOKEN` in `.env` still works for the default profile
+  until it is retired.
 
 3. **Launch with the channel**
 
@@ -64,7 +77,9 @@ rather than presenting the tail of the channel as a resumption.
 
 | Skill | Purpose |
 |-------|---------|
-| `/bridge:configure` | Save API URL, token, and channel filter. |
+| `/bridge:configure` | Save the API URL and channel filter. |
+| `/bridge:login` | Sign this machine in (browser, or a code when headless). |
+| `/bridge:logout` | Sign this machine out and revoke its access. |
 | `/bridge:status` | Show connection state, channels, and agents. |
 
 ## How it works
@@ -96,10 +111,13 @@ All config lives in `~/.claude/channels/bridge/.env`:
 
 ```env
 BRIDGE_API_URL=https://bridge-api.example.com
-BRIDGE_TOKEN=your-agent-token
 BRIDGE_CHANNELS=general,frontend  # optional, empty = all
+BRIDGE_ENROLMENT_KEY=brg_ek_...   # optional, headless enrolment
+BRIDGE_BROWSER=none               # optional, print the login URL instead of opening it
 ```
 
+Credentials (written by `/bridge:login`, 0600) live beside it:
+`credentials.json` and `sessions/`, or under `profiles/<BRIDGE_PROFILE>/`.
 Override the state directory with `BRIDGE_STATE_DIR` env var.
 
 ## Troubleshooting

@@ -8,8 +8,11 @@
  *
  * Config lives in ~/.claude/channels/bridge/.env:
  *   BRIDGE_API_URL=https://bridge-api.example.com
- *   BRIDGE_TOKEN=your-agent-token
  *   BRIDGE_CHANNELS=general,dev (optional, empty = all)
+ * Credentials come from /bridge:login (RFC-014): a per-machine installation in
+ * <state>/credentials.json (or <state>/profiles/<BRIDGE_PROFILE>/), and a
+ * rotating session grant per Claude session. BRIDGE_TOKEN (the legacy static
+ * token) still works for the default profile until the cutover.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -38,6 +41,8 @@ import { join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
 import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
 import { classifyClose, describeClose, reconnectDelay, type CloseClass } from "./reconnect-policy";
+import { resolveProfile } from "./auth/profile";
+import { CredentialManager, CredentialError } from "./auth/manager";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +65,11 @@ const SESSION_KEY_OVERRIDE = (process.env.BRIDGE_SESSION_KEY ?? "").trim();
 // server derives one). Settled into module-scope `sessionLabel` once
 // SESSION_KEY is resolved, near the bottom of this file.
 const SESSION_LABEL_OVERRIDE = (process.env.BRIDGE_SESSION_LABEL ?? "").trim();
+
+// Same real-env-before-.env rule: the profile picks WHICH agent this session is,
+// so it comes from the session's own environment (per project via
+// .claude/settings.local.json), never from the machine-global .env.
+const PROFILE = resolveProfile(STATE_DIR, process.env.BRIDGE_PROFILE);
 
 // Resolved once SESSION_KEY is (see bottom of file); read by
 // minimalSessionInfo(). Mutable because the set_session_label tool updates it
@@ -98,27 +108,17 @@ try {
   }
 } catch {}
 
-const API_URL = (process.env.BRIDGE_API_URL ?? "").replace(/\/+$/, "");
-const TOKEN = process.env.BRIDGE_TOKEN ?? "";
+const ENV_API_URL = (process.env.BRIDGE_API_URL ?? "").replace(/\/+$/, "");
 const CHANNELS_FILTER = (process.env.BRIDGE_CHANNELS ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!API_URL || !TOKEN) {
-  process.stderr.write(
-    `bridge channel: BRIDGE_API_URL and BRIDGE_TOKEN required\n` +
-      `  set in ${ENV_FILE}\n` +
-      `  format:\n` +
-      `    BRIDGE_API_URL=https://bridge-api.example.com\n` +
-      `    BRIDGE_TOKEN=your-agent-token\n`
-  );
-  // Stay alive rather than exit: the MCP host treats a server that exits as
-  // a failure and does not respawn it, so an unconfigured install must still
-  // answer tools/list with working tools + guidance instead of a dead
-  // session. The startup connect below is guarded on API_URL/TOKEN so it
-  // does not spin with empty creds.
-}
+// The credential manager is built once SESSION_KEY exists (below); an
+// unconfigured install must still stay alive: the MCP host treats a server that
+// exits as a failure and does not respawn it, so tools/list must keep answering
+// with working tools + guidance. The startup connect is guarded on
+// creds.configError().
 
 // ── Session info ────────────────────────────────────────────────────────────
 // Sent with WS auth so the server registers a per-session context (used for
@@ -340,6 +340,56 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 // literal type `${string}-${string}-…`, which a resolved session key (a repo
 // slug, an env override) does not satisfy.
 let SESSION_KEY: string = FALLBACK_SESSION_KEY;
+
+// ── Credentials (RFC-014) ───────────────────────────────────────────────────
+// The bearer for this session: an access token from its own session grant under
+// the profile's installation, or the legacy BRIDGE_TOKEN. See auth/manager.ts.
+const creds = new CredentialManager({
+  profile: PROFILE,
+  envApiUrl: ENV_API_URL,
+  legacyToken: process.env.BRIDGE_TOKEN ?? "",
+  enrolmentKey: process.env.BRIDGE_ENROLMENT_KEY ?? "",
+  sessionKey: () => SESSION_KEY,
+  sessionKeyReady: () => sessionKeyReady ?? Promise.resolve(),
+  platform: `${process.platform}-${process.arch}`,
+  clientVersion: PLUGIN_VERSION,
+  env: process.env,
+  onAccessRotated: (accessToken) => {
+    // The live socket authenticated with the previous token; hand it the new one
+    // in-band (RFC-014 D9) so the server's expiry timer re-arms — no reconnect.
+    if (ws && wsConnected && authenticated) {
+      try {
+        ws.send(JSON.stringify({ type: "reauth", token: accessToken }));
+      } catch {}
+    }
+  },
+  onLoggedIn: () => {
+    wantConnected = true;
+    intentExplicitlySet = true;
+    writeConnectState(STATE_DIR, SESSION_KEY, true);
+    restartConnection();
+  },
+  onLoggedOut: () => {
+    stopConnection();
+  },
+  notify: (text) => notifyModel(text, "status"),
+  log: (text) => process.stderr.write(`${text}\n`),
+  prompt: {
+    available: () => !!mcp.getClientCapabilities()?.elicitation,
+    show: (message) => {
+      void mcp.elicitInput({ message, requestedSchema: { type: "object", properties: {} } }).catch(() => {});
+    },
+    confirm: (message) =>
+      mcp
+        .elicitInput({ message, requestedSchema: { type: "object", properties: {} } })
+        .then((r) => r.action === "accept")
+        .catch(() => false),
+  },
+});
+
+function apiUrl(): string {
+  return creds.apiUrl();
+}
 
 // Hard bound on every child process. A `git` invocation can block forever
 // (index.lock contention, a credential helper prompting on a tty, a stale
@@ -711,7 +761,7 @@ let lastMessageTime: string | null = null;
 function wsUrl(): string {
   // Token and since are sent in the first-message auth (not query params) so
   // sessionInfo can ride along and the server registers a session context.
-  return `${API_URL.replace(/^http/, "ws")}/ws`;
+  return `${apiUrl().replace(/^http/, "ws")}/ws`;
 }
 
 // With a stable session key the cursor now survives the gap between launches,
@@ -867,9 +917,23 @@ function connectWs(): void {
   }
 
   const sock = ws;
+  // What THIS socket authenticated with — a later close refers to it, not to
+  // whatever credential the process holds by then.
+  let sockBearer: string | undefined;
+  let sockGrant: { installationId: string; sessionId: string } | null = null;
   sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;
+    let bearer: string;
+    try {
+      bearer = await creds.bearer();
+    } catch (err) {
+      credentialFailure(sock, err);
+      return;
+    }
+    if (ws !== sock) return;
+    sockBearer = bearer;
+    sockGrant = creds.grant();
     // reconnectAttempt is NOT reset here: the handshake succeeding proves
     // nothing. A server that accepts the socket and then rejects auth (revoked
     // token) would reset the backoff on every attempt and spin at ~1s forever.
@@ -878,7 +942,7 @@ function connectWs(): void {
       sock.send(
         JSON.stringify({
           type: "auth",
-          token: TOKEN,
+          token: bearer,
           since: sinceParam(),
           sessionInfo: await getSessionInfoForAuth(),
           // Re-present our credential to prove we are the SAME session
@@ -944,6 +1008,27 @@ function connectWs(): void {
     if (cls !== lastClose.cls) reconnectAttempt = 0;
     lastClose = { cls, code, reason };
     process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
+    // RFC-014 D9. 4009: the access token ran out before a reauth — drop it so the
+    // reconnect's auth frame carries a fresh one.
+    if (cls === "expired") creds.invalidateAccess(sockBearer);
+    if (cls === "revoked" && reason === "session revoked") void creds.sessionRevoked(sockGrant?.sessionId ?? null);
+    if (cls === "revoked" && reason === "installation revoked") {
+      // Re-login elsewhere on this machine revokes the OLD installation; if the
+      // profile already holds the new one, this is a switch, not a sign-out.
+      void creds
+        .installationRevoked(sockGrant?.installationId ?? null)
+        .catch(() => "logged_out" as const)
+        .then((r) => {
+          if (ws !== null && ws !== sock) return;
+          if (r === "switched") lastClose = { cls: "transient", code, reason };
+          else {
+            awaitingCredentials = true;
+            notifyConnectionRefused(cls, code, reason);
+          }
+          scheduleReconnect();
+        });
+      return;
+    }
     notifyConnectionRefused(cls, code, reason);
     scheduleReconnect();
   });
@@ -999,6 +1084,102 @@ function scheduleReconnect(): void {
     nextReconnectAt = null;
     connectWs();
   }, delay);
+}
+
+/**
+ * No bearer for the auth frame. A network failure retries like a dropped socket;
+ * "not signed in" / "signed out" / a profile problem will not fix itself, so stop
+ * and say what to run.
+ */
+function credentialFailure(sock: WebSocket, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  process.stderr.write(`bridge channel: no credential for auth: ${msg}\n`);
+  if (ws !== sock) return;
+  ws = null;
+  wsConnected = false;
+  authenticated = false;
+  try {
+    sock.close();
+  } catch {}
+  // Only a KNOWN terminal state stops (and waits for a login); anything else —
+  // discovery 5xx during a deploy, a timeout, the lock cap — retries.
+  const terminal = err instanceof CredentialError && err.kind !== "network";
+  if (!terminal) {
+    lastClose = { cls: "transient", reason: msg };
+  } else {
+    lastClose = { cls: "revoked", reason: msg };
+    lastServerError = msg;
+    awaitingCredentials = true;
+    notifyModel(`⚠️ Bridge: ${msg}`, "error");
+  }
+  scheduleReconnect();
+}
+
+/**
+ * Set while this session wants to connect but has no usable credential (never
+ * signed in, or signed out). A login in ANOTHER session on this machine writes the
+ * profile's files; this picks them up without a /bridge:connect here. Never set by
+ * a 4008 "session revoked" — that stop is deliberate.
+ */
+let awaitingCredentials = false;
+const credentialWatch = setInterval(() => {
+  if (!awaitingCredentials || !wantConnected || shuttingDown || creds.configError()) return;
+  awaitingCredentials = false;
+  process.stderr.write("bridge channel: credentials appeared — connecting\n");
+  restartConnection();
+}, 10_000);
+credentialWatch.unref?.();
+
+function notifyModel(content: string, type: "error" | "status"): void {
+  mcp
+    .notification({
+      method: "notifications/claude/channel",
+      params: { content, meta: { type, sender: "bridge" } },
+    })
+    .catch(() => {});
+}
+
+/** Drop the current socket and connect afresh (a login switched the credential). */
+function restartConnection(): void {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    nextReconnectAt = null;
+  }
+  reconnectAttempt = 0;
+  lastClose = { cls: "transient" };
+  notifiedCloseClass = null;
+  const old = ws;
+  ws = null;
+  wsConnected = false;
+  authenticated = false;
+  try {
+    old?.close();
+  } catch {}
+  connectUnlessDuplicate();
+}
+
+/** Close the socket and cancel every pending reconnect (disconnect, logout). */
+function stopConnection(): void {
+  wantConnected = false;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (livenessTimer) {
+    clearInterval(livenessTimer);
+    livenessTimer = null;
+  }
+  // Also a lock-retry loop armed by connectUnlessDuplicate() while a sibling held
+  // the session lock — it reaches connectWs() WITHOUT scheduleReconnect(), so the
+  // `!wantConnected` guard there never sees it.
+  if (lockRetryTimer) {
+    clearTimeout(lockRetryTimer);
+    lockRetryTimer = null;
+  }
+  try {
+    ws?.close();
+  } catch {}
 }
 
 /**
@@ -1199,7 +1380,7 @@ function handleWsMessage(data: any): void {
             method: "notifications/claude/channel",
             params: {
               content: `⚠️ Bridge server error: ${lastServerError}${
-                authenticated ? "" : " (not authenticated — check BRIDGE_TOKEN in ~/.claude/channels/bridge/.env)"
+                authenticated ? "" : " (not authenticated — run /bridge:status to see the credential)"
               }`,
               meta: { type: "error", sender: "bridge" },
             },
@@ -1208,6 +1389,11 @@ function handleWsMessage(data: any): void {
       }
       break;
     }
+
+    case "reauthenticated":
+      // The in-band reauth (sent after a refresh) was accepted; the server re-armed
+      // its expiry timer for the new token. Nothing else changes.
+      break;
 
     case "presence":
     case "agent_state":
@@ -1453,15 +1639,22 @@ const HTTP_TIMEOUT_MS = 20000;
 
 async function apiFetch(
   path: string,
-  opts: RequestInit = {}
+  opts: RequestInit = {},
+  retried = false
 ): Promise<Response> {
+  let bearer: string;
+  try {
+    bearer = await creds.bearer();
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err));
+  }
   let res: Response;
   try {
-    res = await fetch(`${API_URL}${path}`, {
+    res = await fetch(`${apiUrl()}${path}`, {
       ...opts,
       signal: opts.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
       headers: {
-        Authorization: `Bearer ${TOKEN}`,
+        Authorization: `Bearer ${bearer}`,
         "Content-Type": "application/json",
         // Which SESSION is calling. The bearer token above is shared by every
         // session of this agent and so cannot answer that; this can. Sent on
@@ -1491,6 +1684,12 @@ async function apiFetch(
   // again. THROWN, so every tool reports it the same way through its own
   // "X failed:" path; the two background callers (`loadChannelMap`,
   // `markReadUpTo`) already catch.
+  // An access token can die before its expiry (session revoked, server restarted
+  // its clock view): renew once and retry. Legacy tokens have nothing to renew.
+  if (res.status === 401 && !retried && creds.source() === "installation") {
+    creds.invalidateAccess(bearer);
+    return apiFetch(path, opts, true);
+  }
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get("retry-after")) || undefined;
     throw new Error(
@@ -1515,15 +1714,8 @@ async function apiFetch(
  * session gets OUT of the states this refuses.
  */
 function requireBridge(): { content: { type: "text"; text: string }[] } | null {
-  if (!API_URL || !TOKEN)
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Bridge not configured — run /bridge:configure to set your API URL and token.",
-        },
-      ],
-    };
+  const problem = creds.configError();
+  if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
   if (!wantConnected)
     return {
       content: [
@@ -1902,6 +2094,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      name: "login",
+      description:
+        "Sign this machine in to Bridge (RFC-014): opens the browser for one-click approval, or — on a headless/SSH machine — returns a short code to enter at the Bridge site. Returns immediately; completion is reported as a channel notification. Re-running replaces this profile's sign-in (the old one is revoked only after the new one succeeds).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["auto", "browser", "device"],
+            description: "auto (default): browser unless headless. device: always use a code.",
+          },
+        },
+      },
+    },
+    {
+      name: "logout",
+      description:
+        "Sign this machine's profile out of Bridge: revokes its access in Bridge and deletes the local credentials. local=true only deletes the local files (use when Bridge is unreachable).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          local: { type: "boolean", description: "Only delete local credentials; do not revoke in Bridge." },
+        },
       },
     },
     {
@@ -2703,16 +2921,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (sessionKeyReady) await sessionKeyReady;
         writeConnectState(STATE_DIR, SESSION_KEY, true);
 
-        if (!API_URL || !TOKEN) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Bridge not configured — run /bridge:configure to set your API URL and token.",
-              },
-            ],
-          };
-        }
+        const problem = creds.configError();
+        if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
         // Already open: re-persisting the intent above is enough. Tearing
         // down a healthy socket to "reconnect" would restart a connection
         // that does not need it — the no-op half of idempotent.
@@ -2746,30 +2956,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (sessionKeyReady) await sessionKeyReady;
         writeConnectState(STATE_DIR, SESSION_KEY, false);
         // Cancel anything already scheduled — a socket mid-backoff must not
-        // fire a reconnect after this tool returns. scheduleReconnect()'s own
-        // `!wantConnected` guard (now false) covers every future attempt.
-        if (reconnectTimer) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
-        if (livenessTimer) {
-          clearInterval(livenessTimer);
-          livenessTimer = null;
-        }
-        // Also cancel a lock-retry loop armed by connectUnlessDuplicate()
-        // while a sibling held the session lock — that self-recursion reaches
-        // connectWs() WITHOUT going through scheduleReconnect(), so its
-        // `!wantConnected` guard above never sees it. Belt-and-suspenders
-        // with the `!wantConnected` guard now at the top of
-        // connectUnlessDuplicate() itself.
-        if (lockRetryTimer) {
-          clearTimeout(lockRetryTimer);
-          lockRetryTimer = null;
-        }
-        try {
-          ws?.close();
-        } catch {}
+        // fire a reconnect after this tool returns.
+        stopConnection();
         return { content: [{ type: "text", text: "disconnected" }] };
+      }
+
+      case "login": {
+        // Not gated by requireBridge(): it is how a machine gets OUT of "not
+        // signed in". The session key must be final — the new credential's first
+        // session is keyed by it.
+        if (sessionKeyReady) await sessionKeyReady;
+        const mode = args.mode === "device" || args.mode === "browser" ? args.mode : "auto";
+        return { content: [{ type: "text", text: await creds.login(mode) }] };
+      }
+
+      case "logout": {
+        if (sessionKeyReady) await sessionKeyReady;
+        return { content: [{ type: "text", text: await creds.logout(args.local === true) }] };
       }
 
       case "status": {
@@ -2784,7 +2987,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 {
                   ...connectionStatus(),
                   wantConnected,
-                  configured: !!(API_URL && TOKEN),
+                  configured: !creds.configError(),
+                  auth: creds.status(),
                   // The RAW in-memory label (what the user typed), not the
                   // server's suffixed "Name · #id" form — same distinction
                   // persistLabel's own comment draws.
@@ -3004,7 +3208,12 @@ function shutdown(): void {
   try {
     ws?.close();
   } catch {}
-  setTimeout(() => process.exit(0), 1000);
+  // A refresh in flight has already rotated the token on the server; exiting before
+  // it is written leaves a consumed token on disk (reuse ⇒ the grant is revoked).
+  void Promise.all([creds.drain(8_000), Bun.sleep(1000)]).finally(() => {
+    creds.stop();
+    process.exit(0);
+  });
 }
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
@@ -3056,4 +3265,12 @@ process.stderr.write(
 );
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-if (!shuttingDown && wantConnected && API_URL && TOKEN) connectUnlessDuplicate();
+// Headless machines enrol once from BRIDGE_ENROLMENT_KEY (never through chat).
+await creds.enrolFromKeyIfNeeded();
+const startupProblem = creds.configError();
+if (startupProblem) {
+  process.stderr.write(`bridge channel: ${startupProblem}\n`);
+  awaitingCredentials = true;
+}
+creds.sweep();
+if (!shuttingDown && wantConnected && !startupProblem) connectUnlessDuplicate();
