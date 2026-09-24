@@ -2,7 +2,7 @@
  * reconnect-policy.ts — the per-close-code reconnect schedule. Pure.
  */
 import { describe, test, expect } from "bun:test";
-import { classifyClose, reconnectDelay } from "../reconnect-policy";
+import { classifyClose, describeClose, reconnectDelay } from "../reconnect-policy";
 
 const lo = () => 0;
 const hi = () => 0.999999;
@@ -13,6 +13,7 @@ describe("classifyClose", () => {
     expect(classifyClose(4001)).toBe("credential");
     expect(classifyClose(4003)).toBe("credential");
     expect(classifyClose(4008)).toBe("revoked");
+    expect(classifyClose(4009)).toBe("expired");
     for (const c of [1000, 1001, 1006, 4006, 4004, 4005, undefined]) expect(classifyClose(c)).toBe("transient");
   });
 });
@@ -37,6 +38,16 @@ describe("reconnectDelay", () => {
     expect(reconnectDelay(1, "credential", lo)).toBe(30_000);
     expect(reconnectDelay(1, "credential", hi)).toBeLessThanOrEqual(60_000);
     expect(reconnectDelay(20, "credential", hi)).toBeLessThanOrEqual(300_000);
+  });
+
+  test("expired (4009): retries on the transient curve (the manager refreshes on the way in)", () => {
+    expect(reconnectDelay(1, "expired", hi)).toBeLessThanOrEqual(1000);
+    expect(reconnectDelay(1, "expired", lo)).toBe(500);
+  });
+
+  test("4008 says what to do, by reason", () => {
+    expect(describeClose("revoked", 4008, "session revoked")).toContain("/bridge:connect starts a new session");
+    expect(describeClose("revoked", 4008, "installation revoked")).toContain("run /bridge:login");
   });
 
   test("revoked (4008): never reconnects on its own", () => {

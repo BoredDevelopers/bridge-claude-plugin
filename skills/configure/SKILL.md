@@ -1,6 +1,6 @@
 ---
 name: configure
-description: Set up the Bridge channel — save the API URL and agent token. Use when the user wants to configure Bridge, pastes a Bridge token, or asks about channel setup.
+description: Set up the Bridge channel — save the API URL (then sign in with /bridge:login). Use when the user wants to configure Bridge, pastes a Bridge URL or legacy token, or asks about channel setup.
 user-invocable: true
 allowed-tools:
   - Read
@@ -11,8 +11,9 @@ allowed-tools:
 
 # /bridge:configure — Bridge Channel Setup
 
-Writes the Bridge API URL and agent token to `~/.claude/channels/bridge/.env`
-and orients the user on the current state.
+Writes the Bridge API URL to `~/.claude/channels/bridge/.env` and orients the
+user on the current state. The machine then signs in with `/bridge:login` — no
+token is pasted anywhere. (`<url> <token>` still saves a legacy static token.)
 
 Arguments passed: `$ARGUMENTS`
 
@@ -27,18 +28,30 @@ Read both config values and give the user the full picture:
 1. **API URL** — check `~/.claude/channels/bridge/.env` for `BRIDGE_API_URL`.
    Show set/not-set.
 
-2. **Token** — check for `BRIDGE_TOKEN`. Show set/not-set; if set, show
-   first 8 chars masked (`abc12345...`).
+2. **Sign-in** — call the `status` MCP tool and show its `auth` block
+   (profile, credential `installation` / `legacy` / `none`, installation name).
 
 3. **Channel filter** — check `BRIDGE_CHANNELS`. Show the filter or "all
    channels" if empty.
 
 4. **What next** — based on state:
-   - No URL/token → *"Run `/bridge:configure <url> <token>` to set up Bridge."*
-   - Both set → *"Ready. Run `/bridge:connect` to join Bridge in this session
-     (or use `claudeb`, which auto-connects)."*
+   - No URL → *"Run `/bridge:configure <url>` to set up Bridge."*
+   - URL set, credential `none` → *"Run `/bridge:login` to sign this machine in."*
+   - credential `legacy` → *"Works, but run `/bridge:login` to switch to a
+     per-machine sign-in (the static token is being retired)."*
+   - credential `installation` → *"Ready. Run `/bridge:connect` to join Bridge in
+     this session (or use `claudeb`, which auto-connects)."*
 
-### `<url> <token>` — save both
+### `<url>` — save the API URL
+
+1. `mkdir -p ~/.claude/channels/bridge`
+2. Read existing `.env` if present; update/add the `BRIDGE_API_URL=` line,
+   preserve other keys.
+3. `chmod 600 ~/.claude/channels/bridge/.env`.
+4. Confirm, then tell the user to restart the session (or `/reload-plugins`) and
+   run `/bridge:login`.
+
+### `<url> <token>` — save both (legacy static token)
 
 1. Parse `$ARGUMENTS`: first arg is URL (starts with http), second is token.
 2. `mkdir -p ~/.claude/channels/bridge`
