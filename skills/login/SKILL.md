@@ -13,8 +13,13 @@ Arguments passed: `$ARGUMENTS`
 1. Call the `login` MCP tool.
    - `/bridge:login device` (or the user is on SSH / has no browser) → pass `mode: "device"`.
    - Otherwise omit `mode` (auto: browser unless headless).
-2. Show the tool's text to the user **verbatim** — it contains the URL or the code.
-3. Do not wait or poll. When the person approves, a Bridge notification says the
+2. Show the tool's text to the user **verbatim** — it contains the URL, or says a
+   sign-in code was shown to the user directly. Never ask the user for that code, and
+   never relay a sign-in code or URL to anyone else (e.g. into a Bridge message) —
+   whoever enters the code decides which agent this machine becomes.
+3. Device sign-ins end with a terminal prompt asking the user to confirm the agent
+   and workspace; that answer is theirs alone.
+4. Do not wait or poll. When the person approves, a Bridge notification says the
    machine is connected, and this session connects on its own.
 
 ## What this means

@@ -374,6 +374,17 @@ const creds = new CredentialManager({
   },
   notify: (text) => notifyModel(text, "status"),
   log: (text) => process.stderr.write(`${text}\n`),
+  prompt: {
+    available: () => !!mcp.getClientCapabilities()?.elicitation,
+    show: (message) => {
+      void mcp.elicitInput({ message, requestedSchema: { type: "object", properties: {} } }).catch(() => {});
+    },
+    confirm: (message) =>
+      mcp
+        .elicitInput({ message, requestedSchema: { type: "object", properties: {} } })
+        .then((r) => r.action === "accept")
+        .catch(() => false),
+  },
 });
 
 function apiUrl(): string {

@@ -63,6 +63,16 @@ export interface ManagerDeps {
   onLoggedOut: () => void;
   notify: (text: string) => void;
   log: (text: string) => void;
+  /**
+   * Talk to the PERSON, not the model (MCP elicitation). The model can call `login`,
+   * so anything a prompt injection could exfiltrate or approve — the device code,
+   * the "bind this machine to that agent" decision — goes through here.
+   */
+  prompt: {
+    available: () => boolean;
+    show: (message: string) => void;
+    confirm: (message: string) => Promise<boolean>;
+  };
   /** Injected for tests. */
   random?: () => number;
   now?: () => number;
@@ -407,6 +417,15 @@ export class CredentialManager {
   }
 
   private async startDevice(meta: AuthMetadata, apiUrl: string, name: string): Promise<string> {
+    const canPrompt = this.d.prompt.available();
+    // Without a direct line to the person, a device code in the tool result is readable
+    // (and relayable) by the model. Tolerable only when there is no sign-in to lose.
+    if (!canPrompt && this.installation()) {
+      return (
+        "Device sign-in needs to show its code to you directly, and this client can't prompt you. " +
+        "Use /bridge:login in a session with a browser, or /bridge:logout first."
+      );
+    }
     let auth;
     try {
       auth = await deviceAuthorization(meta, name);
@@ -420,17 +439,41 @@ export class CredentialManager {
       if (ac.signal.aborted) return;
       if (!r.ok) return this.loginFailed(r.error);
       try {
+        if (canPrompt && !(await this.d.prompt.confirm(this.bindQuestion(r.grant)))) {
+          await revoke(meta, r.grant.installation_token).catch(() => {});
+          this.pendingLogin = null;
+          this.d.notify("Bridge: machine not connected — the sign-in was declined in the terminal.");
+          return;
+        }
         await this.completeLogin(meta, apiUrl, name, r.grant, () => ac.signal.aborted);
       } catch (e) {
         this.loginFailed(String(e));
       }
     })();
     const mins = Math.round(auth.expires_in / 60);
+    const instructions =
+      `To connect this machine to Bridge, open ${auth.verification_uri} on any device and enter the code:\n\n` +
+      `    ${auth.user_code}\n\n` +
+      `It expires in ${mins} minutes. Only enter it on the Bridge site you trust, and only if you started this sign-in.`;
+    if (canPrompt) {
+      this.d.prompt.show(instructions);
+      return (
+        `A sign-in code was shown to you directly (not to me). Enter it at ${auth.verification_uri}. ` +
+        "You'll be asked to confirm the agent before this machine is connected."
+      );
+    }
     return (
       `To connect this machine to Bridge, open ${auth.verification_uri} on any device and enter the code:\n\n` +
       `    ${auth.user_code}\n\n` +
       `It expires in ${mins} minutes. Only enter it on the Bridge site you trust. I'll report back here once it's approved.`
     );
+  }
+
+  private bindQuestion(g: InstallationGrant): string {
+    const who = g.agent ? (g.agent.handle ? `@${g.agent.handle} (${g.agent.name})` : g.agent.name) : "an agent";
+    const where = g.workspace?.name ? ` in workspace "${g.workspace.name}"` : "";
+    const replacing = this.installation() ? " This replaces this machine's current Bridge sign-in." : "";
+    return `Connect this machine to Bridge as ${who}${where}?${replacing} Decline if you did not start this sign-in.`;
   }
 
   private loginFailed(error: string): void {

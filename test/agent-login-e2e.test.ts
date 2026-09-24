@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { startAuthStub } from "./agent-auth-stub";
 import { writeInstallation, readInstallation, sessionFileFor } from "../auth/store";
 
@@ -19,8 +20,10 @@ const SESSION = "11111111-2222-3333-4444-555555555555";
 async function withPlugin<T>(
   stub: ReturnType<typeof startAuthStub>,
   env: Record<string, string>,
-  fn: (client: Client, dir: string, notices: () => string[]) => Promise<T>,
-  preset?: (dir: string) => void
+  fn: (client: Client, dir: string, notices: () => string[], prompts: string[]) => Promise<T>,
+  preset?: (dir: string) => void,
+  /** When set, the client supports elicitation and answers every prompt this way. */
+  answer?: "accept" | "decline"
 ): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "login-e2e-"));
   preset?.(dir);
@@ -40,14 +43,21 @@ async function withPlugin<T>(
       ...env,
     } as Record<string, string>,
   });
-  const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+  const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: answer ? { elicitation: {} } : {} });
+  const prompts: string[] = [];
+  if (answer) {
+    client.setRequestHandler(ElicitRequestSchema, async (req: any) => {
+      prompts.push(req.params.message);
+      return { action: answer, content: {} };
+    });
+  }
   const seen: string[] = [];
   client.fallbackNotificationHandler = async (n: any) => {
     if (typeof n?.params?.content === "string") seen.push(n.params.content);
   };
   try {
     await client.connect(transport);
-    return await fn(client, dir, () => seen);
+    return await fn(client, dir, () => seen, prompts);
   } finally {
     await client.close().catch(() => {});
     stub.stop();
@@ -279,6 +289,41 @@ describe("plugin on a session grant (RFC-014)", () => {
       writeInstallation(dir, { apiUrl: stub.url, installationId: g.installation_id, installationToken: g.installation_token });
       expect(await until(() => stub.stats.authTokens.length >= 1, 15_000)).toBe(true);
     });
+  }, 30_000);
+
+  test("device login through a prompting client: code shown to the person only, confirmed, connected", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, _notices, prompts) => {
+        const r: any = await client.callTool({ name: "login", arguments: { mode: "device" } });
+        expect(r.content[0].text).not.toContain("BCDF-GHJK");
+        expect(await until(() => stub.stats.authTokens.length >= 1, 15_000)).toBe(true);
+        expect(prompts[0]).toContain("BCDF-GHJK");
+        expect(prompts.some((p) => p.includes('@agent-one (Agent One) in workspace "Acme"'))).toBe(true);
+        expect(readInstallation(dir)).not.toBeNull();
+      },
+      undefined,
+      "accept"
+    );
+  }, 30_000);
+
+  test("device login declined at the terminal prompt: not connected, nothing stored", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices, prompts) => {
+        await client.callTool({ name: "login", arguments: { mode: "device" } });
+        expect(await until(() => notices().some((n) => n.includes("declined")), 15_000)).toBe(true);
+        expect(prompts.some((p) => p.includes("@agent-one"))).toBe(true);
+        expect(readInstallation(dir)).toBeNull();
+        expect(stub.stats.authTokens).toHaveLength(0);
+      },
+      undefined,
+      "decline"
+    );
   }, 30_000);
 
   test("a named profile with no credentials refuses to connect and says so", async () => {

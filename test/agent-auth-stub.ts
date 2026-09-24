@@ -54,7 +54,12 @@ export function startAuthStub(opts: StubOptions = {}) {
     insts.set(id, { id, revoked: false, agentId });
     const it = mint("it");
     chain.set(it, { kind: "it", grant: id, consumed: false });
-    return { installation_token: it, installation_id: id };
+    return {
+      installation_token: it,
+      installation_id: id,
+      agent: { id: agentId, handle: "agent-one", name: "Agent One" },
+      workspace: { id: "t1", name: "Acme" },
+    };
   }
 
   function liveSession(sid: string) {

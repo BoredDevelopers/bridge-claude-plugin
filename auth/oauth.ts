@@ -85,6 +85,9 @@ export interface RefreshGrant {
 export interface InstallationGrant {
   installation_token: string;
   installation_id: string;
+  /** Who the machine now acts as (servers since RFC-014 §7). */
+  agent?: { id: string; handle: string | null; name: string };
+  workspace?: { id: string; name: string };
 }
 
 export const token = {

@@ -31,7 +31,14 @@ function manager(
   apiUrl: string,
   { key, profile, ...over }: Omit<Partial<ManagerDeps>, "profile"> & { key?: string; profile?: string } = {}
 ) {
-  const events = { rotated: [] as string[], notices: [] as string[], loggedIn: 0, loggedOut: 0 };
+  const events = {
+    rotated: [] as string[],
+    notices: [] as string[],
+    loggedIn: 0,
+    loggedOut: 0,
+    shown: [] as string[],
+    asked: [] as string[],
+  };
   const m = new CredentialManager({
     profile: resolveProfile(dir, profile),
     envApiUrl: apiUrl,
@@ -47,6 +54,7 @@ function manager(
     onLoggedOut: () => events.loggedOut++,
     notify: (t) => events.notices.push(t),
     log: () => {},
+    prompt: { available: () => false, show: () => {}, confirm: async () => false },
     ...over,
   });
   cleanups.push(() => m.stop());
@@ -388,6 +396,56 @@ describe("login", () => {
     await Bun.sleep(900);
     expect(readInstallation(dir)).toBeNull();
     expect(events.loggedIn).toBe(0);
+  });
+
+  function prompting(answer: boolean) {
+    const seen = { shown: [] as string[], asked: [] as string[] };
+    return {
+      seen,
+      prompt: {
+        available: () => true,
+        show: (m: string) => void seen.shown.push(m),
+        confirm: async (m: string) => (seen.asked.push(m), answer),
+      },
+    };
+  }
+
+  test("device flow with a prompt: the code goes to the PERSON, never into the tool result", async () => {
+    const { stub, dir } = setup();
+    const p = prompting(true);
+    const { m } = manager(dir, stub.url, { prompt: p.prompt });
+    const text = await m.login("device");
+    expect(text).not.toContain("BCDF-GHJK");
+    expect(p.seen.shown.join()).toContain("BCDF-GHJK");
+    for (let i = 0; i < 40 && !readInstallation(dir); i++) await Bun.sleep(100);
+    expect(readInstallation(dir)).not.toBeNull();
+    expect(p.seen.asked[0]).toContain('@agent-one (Agent One) in workspace "Acme"');
+  }, 10_000);
+
+  test("device flow declined in the terminal: nothing stored, the new installation revoked, the old one kept", async () => {
+    const { stub, dir } = setup();
+    const old = enrolled(stub, dir);
+    const p = prompting(false);
+    const { m, events } = manager(dir, stub.url, { prompt: p.prompt });
+    await m.login("device");
+    for (let i = 0; i < 40 && p.seen.asked.length === 0; i++) await Bun.sleep(100);
+    await Bun.sleep(200);
+    expect(p.seen.asked[0]).toContain("replaces this machine's current Bridge sign-in");
+    expect(readInstallation(dir)!.installationId).toBe(old);
+    expect(stub.isRevoked(old)).toBe(false);
+    expect(stub.stats.revoked).toHaveLength(1); // the declined one
+    expect(stub.stats.revoked[0]).not.toBe(old);
+    expect(events.loggedIn).toBe(0);
+    expect(events.notices.join()).toMatch(/declined/);
+  }, 10_000);
+
+  test("without a prompt, device mode is refused on a machine that is already signed in", async () => {
+    const { stub, dir } = setup();
+    enrolled(stub, dir);
+    const { m } = manager(dir, stub.url);
+    const text = await m.login("device");
+    expect(text).toMatch(/can't prompt you/);
+    expect(text).not.toContain("BCDF-GHJK");
   });
 
   test("headless machines get the device flow automatically", async () => {
