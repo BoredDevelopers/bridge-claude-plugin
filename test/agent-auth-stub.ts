@@ -11,6 +11,14 @@ export interface StubOptions {
   /** `/authorize` answers with `error=access_denied`. */
   deny?: boolean;
   agentId?: string;
+  /** The first N discovery requests answer 502 (a deploy in progress). */
+  discoveryFail?: number;
+  /** Delay the authorization_code exchange (ms). */
+  codeDelayMs?: number;
+  /** Delay the session grant (ms). */
+  sessionDelayMs?: number;
+  /** Every /api/* request answers 401. */
+  always401?: boolean;
 }
 
 type Inst = { id: string; revoked: boolean; agentId: string };
@@ -34,6 +42,8 @@ export function startAuthStub(opts: StubOptions = {}) {
     sessionMeta: [] as { platform?: string; client_version?: string }[],
     authTokens: [] as string[],
     reauths: 0,
+    discoveryHits: 0,
+    apiHits: 0,
   };
   let n = 0;
   const mint = (k: string) => `brg_${k}_${(++n).toString().padStart(6, "0")}${crypto.randomUUID().replace(/-/g, "")}`;
@@ -95,6 +105,7 @@ export function startAuthStub(opts: StubOptions = {}) {
       const issuer = `${url.origin}/api/agent-auth`;
       if (url.pathname === "/ws" && srv.upgrade(req, { data: { session: "" } })) return;
       if (url.pathname === "/.well-known/oauth-authorization-server/api/agent-auth") {
+        if (stats.discoveryHits++ < (opts.discoveryFail ?? 0)) return new Response("bad gateway", { status: 502 });
         return Response.json({
           issuer,
           authorization_endpoint: `${issuer}/authorize`,
@@ -129,6 +140,7 @@ export function startAuthStub(opts: StubOptions = {}) {
             return Response.json(newInstallation(opts.agentId ?? "agent-1"));
           }
           case "urn:bridge:params:oauth:grant-type:session": {
+            if (opts.sessionDelayMs) await Bun.sleep(opts.sessionDelayMs);
             const c = consume(body.installation_token, "it");
             if ("error" in c) return err(c.error);
             const inst = insts.get(c.grant)!;
@@ -161,6 +173,7 @@ export function startAuthStub(opts: StubOptions = {}) {
             return Response.json({ refresh_token: rt, access_token: issueAccess(c.grant), token_type: "Bearer", expires_in: accessTtlS });
           }
           case "authorization_code": {
+            if (opts.codeDelayMs) await Bun.sleep(opts.codeDelayMs);
             const c = codes.get(body.code);
             if (!c || c.used || c.redirect !== body.redirect_uri || body.client_id !== "bridge-claude-plugin") return err("invalid_grant");
             const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body.code_verifier)));
@@ -205,8 +218,9 @@ export function startAuthStub(opts: StubOptions = {}) {
         return Response.json({});
       }
       if (url.pathname.startsWith("/api/")) {
+        stats.apiHits++;
         const tok = req.headers.get("authorization")?.replace(/^Bearer /, "");
-        if (!accessOk(tok)) return err("unauthorized", 401);
+        if (opts.always401 || !accessOk(tok)) return err("unauthorized", 401);
         return Response.json([]);
       }
       return new Response("not found", { status: 404 });

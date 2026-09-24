@@ -9,8 +9,9 @@ import { mkdtempSync, rmSync, statSync, existsSync, readFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startAuthStub } from "./agent-auth-stub";
-import { CredentialManager, type ManagerDeps } from "../auth/manager";
+import { CredentialManager, CredentialError, type ManagerDeps } from "../auth/manager";
 import { resolveProfile } from "../auth/profile";
+import { withProfileLock } from "../auth/lock";
 import { writeInstallation, readInstallation, readSession, sessionFileFor } from "../auth/store";
 
 const cleanups: (() => void)[] = [];
@@ -78,6 +79,17 @@ describe("session start and refresh", () => {
     expect(stub.stats.sessionGrants).toBe(1);
   });
 
+  test("drain waits for a renew in flight to persist its rotated token (shutdown)", async () => {
+    const { stub, dir } = setup({ sessionDelayMs: 300 });
+    enrolled(stub, dir);
+    const { m } = manager(dir, stub.url);
+    void m.bearer();
+    await Bun.sleep(50);
+    expect(readSession(dir, "session-a")).toBeNull(); // really in flight
+    await m.drain(5_000);
+    expect(readSession(dir, "session-a")).not.toBeNull();
+  });
+
   test("after invalidation the SAME session is refreshed (not a new one)", async () => {
     const { stub, dir } = setup();
     enrolled(stub, dir);
@@ -142,16 +154,39 @@ describe("session start and refresh", () => {
     expect(readInstallation(dir)).toBeNull();
   });
 
-  test("a network failure keeps the files", async () => {
+  test("a network failure keeps the files and is reported as retryable", async () => {
     const { stub, dir } = setup();
     enrolled(stub, dir);
     const { m } = manager(dir, stub.url);
     await m.bearer();
     stub.stop();
     m.invalidateAccess();
-    await expect(m.bearer()).rejects.toThrow();
+    const e = await m.bearer().catch((x) => x);
+    expect(e).toBeInstanceOf(CredentialError);
+    expect(e.kind).toBe("network");
     expect(readInstallation(dir)).not.toBeNull();
     expect(readSession(dir, "session-a")).not.toBeNull();
+  });
+
+  test("a discovery 5xx (deploy in progress) is retryable, not a sign-out", async () => {
+    const { stub, dir } = setup({ discoveryFail: 1 });
+    enrolled(stub, dir);
+    const { m } = manager(dir, stub.url);
+    const e = await m.bearer().catch((x) => x);
+    expect(e.kind).toBe("network");
+    expect(await m.bearer()).toStartWith("brg_at_");
+  });
+
+  test("invalidating with a token that is no longer current keeps the current one", async () => {
+    const { stub, dir } = setup();
+    enrolled(stub, dir);
+    const { m } = manager(dir, stub.url);
+    const old = await m.bearer();
+    m.invalidateAccess(old);
+    const fresh = await m.bearer();
+    m.invalidateAccess(old); // a late 401 for a request sent with the old token
+    expect(await m.bearer()).toBe(fresh);
+    expect(stub.stats.refreshes).toBe(1);
   });
 
   test("the refresh ticker renews ahead of expiry and hands the live socket the new token", async () => {
@@ -205,9 +240,18 @@ describe("revocation", () => {
     enrolled(stub, dir);
     const { m } = manager(dir, stub.url);
     await m.bearer();
-    m.sessionRevoked();
+    await m.sessionRevoked(m.grant()!.sessionId);
     expect(readSession(dir, "session-a")).toBeNull();
     expect(readInstallation(dir)).not.toBeNull();
+  });
+
+  test("a revoke for an OLDER session never deletes the newer session file", async () => {
+    const { stub, dir } = setup();
+    enrolled(stub, dir);
+    const { m } = manager(dir, stub.url);
+    await m.bearer();
+    await m.sessionRevoked("some-older-session-id");
+    expect(readSession(dir, "session-a")).not.toBeNull();
   });
 
   test("4008 installation revoked: signed out if it is still ours, switched if the profile holds a new one", async () => {
@@ -217,13 +261,17 @@ describe("revocation", () => {
     const b = manager(dir, stub.url, { key: "b" }).m;
     await a.bearer();
     await b.bearer();
+    const first = a.grant()!.installationId;
     // Re-login elsewhere replaced the installation on disk.
     enrolled(stub, dir);
-    expect(await a.installationRevoked()).toBe("switched");
+    expect(await a.installationRevoked(first)).toBe("switched");
+    expect(readInstallation(dir)).not.toBeNull();
+    // Unknown which one the socket used: retry rather than sign out.
+    expect(await a.installationRevoked(null)).toBe("switched");
     expect(readInstallation(dir)).not.toBeNull();
     // Now a genuine revoke of the current one.
     await a.bearer();
-    expect(await a.installationRevoked()).toBe("logged_out");
+    expect(await a.installationRevoked(a.grant()!.installationId)).toBe("logged_out");
     expect(readInstallation(dir)).toBeNull();
   });
 });
@@ -304,6 +352,44 @@ describe("login", () => {
     expect(events.loggedIn).toBe(1);
   }, 10_000);
 
+  test("a second hit on the callback (reload / prefetch) gets the same outcome, not an error", async () => {
+    const { stub, dir } = setup();
+    const { m } = manager(dir, stub.url);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    const cb = (await fetch(url, { redirect: "manual" })).headers.get("location")!;
+    const [a, b] = await Promise.all([fetch(cb, { redirect: "manual" }), Bun.sleep(20).then(() => fetch(cb, { redirect: "manual" }))]);
+    expect(a.headers.get("location")).toBe(`${stub.url}/connect/done?result=connected`);
+    expect(b.headers.get("location")).toBe(`${stub.url}/connect/done?result=connected`);
+  });
+
+  test("a held callback survives a long wait for the profile lock (no idle-timeout cut)", async () => {
+    const { stub, dir } = setup();
+    const { m } = manager(dir, stub.url);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    const cb = (await fetch(url, { redirect: "manual" })).headers.get("location")!;
+    // Another session holds the lock for 12 s (past Bun's 10 s default idle timeout).
+    const busy = withProfileLock(dir, () => Bun.sleep(12_000));
+    await Bun.sleep(50);
+    const done = await fetch(cb, { redirect: "manual" });
+    await busy;
+    expect(done.headers.get("location")).toBe(`${stub.url}/connect/done?result=connected`);
+  }, 30_000);
+
+  test("logout while the code is being exchanged is not undone by the late exchange", async () => {
+    const { stub, dir } = setup({ codeDelayMs: 500 });
+    const { m, events } = manager(dir, stub.url);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    const cb = (await fetch(url, { redirect: "manual" })).headers.get("location")!;
+    const done = fetch(cb, { redirect: "manual" });
+    await Bun.sleep(100);
+    await m.logout(true);
+    expect((await done).headers.get("location")).toBe(`${stub.url}/connect/done?result=error`);
+    // Past the 500 ms exchange: the late answer must not write anything.
+    await Bun.sleep(900);
+    expect(readInstallation(dir)).toBeNull();
+    expect(events.loggedIn).toBe(0);
+  });
+
   test("headless machines get the device flow automatically", async () => {
     const { stub, dir } = setup();
     const { m } = manager(dir, stub.url, { env: { SSH_CONNECTION: "1 2 3 4" } });
@@ -338,6 +424,21 @@ describe("logout and enrolment keys", () => {
     expect(JSON.parse(readFileSync(join(dir, "credentials.json"), "utf8")).apiUrl).toBe(stub.url);
     await Promise.all(ms.map((m) => m.bearer()));
     expect(stub.stats.reuse).toBe(0);
+  });
+
+  test("after /bridge:logout an enrolment key still in .env does not sign the machine back in; login clears that", async () => {
+    const { stub, dir } = setup();
+    stub.addEnrolmentKey("brg_ek_again", 5);
+    const { m } = manager(dir, stub.url, { enrolmentKey: "brg_ek_again" });
+    await m.enrolFromKeyIfNeeded();
+    expect(readInstallation(dir)).not.toBeNull();
+    await m.logout(true);
+    await m.enrolFromKeyIfNeeded();
+    expect(readInstallation(dir)).toBeNull();
+    expect(stub.stats.enrols).toBe(1);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!, { redirect: "manual" });
+    expect(existsSync(join(dir, "logged-out"))).toBe(false);
   });
 
   test("a used-up enrolment key tells the person, and nothing is written", async () => {

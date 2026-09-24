@@ -18,6 +18,11 @@ import {
   writeSession,
   deleteSession,
   deleteProfileCredentials,
+  sweepSessions,
+  sessionFileFor,
+  writeLoggedOutMarker,
+  clearLoggedOutMarker,
+  hasLoggedOutMarker,
   type InstallationCredentials,
 } from "./store";
 import { discover, token, revoke, deviceAuthorization, OAuthError, type AuthMetadata, type InstallationGrant } from "./oauth";
@@ -138,9 +143,19 @@ export class CredentialManager {
     return this.renew("expiring");
   }
 
-  /** Forget the in-memory access token (a 401 or a 4009): the next bearer() renews. */
-  invalidateAccess(): void {
+  /**
+   * Forget the in-memory access token (a 401 or a 4009): the next bearer() renews.
+   * Given the token that failed, only that one is dropped — a 401 for a request sent
+   * just before a concurrent refresh must not throw the NEW token away.
+   */
+  invalidateAccess(tokenUsed?: string): void {
+    if (tokenUsed !== undefined && this.access?.token !== tokenUsed) return;
     this.access = null;
+  }
+
+  /** The grant the current access token belongs to (recorded per socket at auth). */
+  grant(): { installationId: string; sessionId: string } | null {
+    return this.access ? { installationId: this.access.installationId, sessionId: this.access.sessionId } : null;
   }
 
   /** Refresh (or start a session) now. Single-flight across callers in this process. */
@@ -162,6 +177,16 @@ export class CredentialManager {
   }
 
   private async renewUnderLock(reason: string): Promise<Access> {
+    try {
+      return await this.renewLocked(reason);
+    } catch (e) {
+      // Everything that is not a known terminal state (signed out, profile problem)
+      // is retryable: discovery 5xx during a deploy, the lock cap, a timeout, fs.
+      throw this.networkError(e);
+    }
+  }
+
+  private async renewLocked(reason: string): Promise<Access> {
     const profile = this.profile!;
     await this.d.sessionKeyReady();
     return withProfileLock(profile.dir, async () => {
@@ -252,29 +277,50 @@ export class CredentialManager {
     return discover(apiUrl);
   }
 
-  /** 4008 "session revoked": this session is over; the next connect starts a new one. */
-  sessionRevoked(): void {
-    this.access = null;
+  /**
+   * 4008 "session revoked": this session is over; the next connect starts a new one.
+   * Deletes the session file only if it still holds THAT session — a duplicate
+   * process of the same session may already have written a newer one.
+   */
+  async sessionRevoked(sessionId: string | null): Promise<void> {
+    if (sessionId === null || this.access?.sessionId === sessionId) this.access = null;
     const p = this.profile;
-    if (p) deleteSession(p.dir, this.d.sessionKey());
+    if (!p) return;
+    await withProfileLock(p.dir, async () => {
+      const key = this.d.sessionKey();
+      const cur = readSession(p.dir, key);
+      if (cur && (sessionId === null || cur.sessionId === sessionId)) deleteSession(p.dir, key);
+    }).catch((e) => this.d.log(`bridge auth: could not clear the revoked session: ${e}`));
   }
 
   /**
-   * 4008 "installation revoked". If the profile now holds a DIFFERENT installation
-   * (the machine was re-logged-in, which revokes the old one), switch to it quietly.
-   * Only if the revoked one is still on disk is this machine actually signed out.
+   * 4008 "installation revoked" for the installation the socket authenticated with.
+   * If the profile now holds a DIFFERENT installation (the machine was re-logged-in,
+   * which revokes the old one), switch to it quietly. If we cannot tell which one the
+   * socket used, try again: a dead installation signs out on the next session start.
    */
-  async installationRevoked(): Promise<"switched" | "logged_out"> {
-    const revokedId = this.access?.installationId ?? null;
-    this.access = null;
+  async installationRevoked(revokedId: string | null): Promise<"switched" | "logged_out"> {
+    if (revokedId === null || this.access?.installationId === revokedId) this.access = null;
     const p = this.profile;
     if (!p) return "logged_out";
     return withProfileLock(p.dir, async () => {
       const inst = readInstallation(p.dir);
-      if (inst && revokedId && inst.installationId !== revokedId) return "switched";
-      if (inst && inst.installationId === revokedId) deleteProfileCredentials(p.dir);
-      return "logged_out";
+      if (!inst) return "logged_out" as const;
+      if (inst.installationId !== revokedId) return "switched" as const; // includes "unknown" (null)
+      deleteProfileCredentials(p.dir);
+      return "logged_out" as const;
     });
+  }
+
+  /** Session files idle past the server's 7-day session idle are dead weight. */
+  sweep(): void {
+    const p = this.profile;
+    if (p) sweepSessions(p.dir, sessionFileFor(p.dir, this.d.sessionKey()), 8 * 86_400_000);
+  }
+
+  /** Let a renew in flight persist its rotated token before the process exits. */
+  async drain(maxMs: number): Promise<void> {
+    if (this.inflight) await Promise.race([this.inflight.catch(() => {}), Bun.sleep(maxMs)]);
   }
 
   status(): Record<string, unknown> {
@@ -296,7 +342,8 @@ export class CredentialManager {
 
   private installationName(): string {
     const p = this.profile;
-    const host = hostname().replace(/\.local$/, "");
+    // The first DNS label: "Mac.lan" / "box.corp.example" name the machine, not the network.
+    const host = hostname().split(".")[0] || "machine";
     return p?.name ? `${host} (${p.name})` : host;
   }
 
@@ -345,7 +392,7 @@ export class CredentialManager {
         }
         try {
           const g = await token.authorizationCode(meta, a.code, lb.verifier, lb.redirectUri);
-          await this.completeLogin(meta, apiUrl, name, g);
+          if (!(await this.completeLogin(meta, apiUrl, name, g, () => cancelled))) return lb.finish("error");
           lb.finish("connected");
         } catch (e) {
           lb.finish("error");
@@ -373,7 +420,7 @@ export class CredentialManager {
       if (ac.signal.aborted) return;
       if (!r.ok) return this.loginFailed(r.error);
       try {
-        await this.completeLogin(meta, apiUrl, name, r.grant);
+        await this.completeLogin(meta, apiUrl, name, r.grant, () => ac.signal.aborted);
       } catch (e) {
         this.loginFailed(String(e));
       }
@@ -399,10 +446,21 @@ export class CredentialManager {
     if (error !== "cancelled") this.d.notify(`Bridge: machine not connected — ${why}.`);
   }
 
-  /** Store the new installation, drop the old one's sessions, then revoke the old one. */
-  private async completeLogin(meta: AuthMetadata, apiUrl: string, name: string, g: InstallationGrant): Promise<void> {
+  /**
+   * Store the new installation, drop the old one's sessions, then revoke the old one.
+   * False (and the new installation revoked) when the login was cancelled while its
+   * code was being exchanged — a logout in that window must not be undone.
+   */
+  private async completeLogin(
+    meta: AuthMetadata,
+    apiUrl: string,
+    name: string,
+    g: InstallationGrant,
+    cancelled: () => boolean
+  ): Promise<boolean> {
     const p = this.profile!;
-    const old = await withProfileLock(p.dir, async () => {
+    const outcome = await withProfileLock(p.dir, async () => {
+      if (cancelled()) return { cancelled: true as const };
       const prev = readInstallation(p.dir);
       // Replacing: every session file belongs to the old installation.
       deleteProfileCredentials(p.dir);
@@ -413,8 +471,14 @@ export class CredentialManager {
         installationName: name,
         enrolledAt: Math.floor(this.now() / 1000),
       });
-      return prev;
+      clearLoggedOutMarker(p.dir);
+      return { cancelled: false as const, prev };
     });
+    if (outcome.cancelled) {
+      await revoke(meta, g.installation_token).catch(() => {});
+      return false;
+    }
+    const old = outcome.prev;
     this.pendingLogin = null;
     this.access = null;
     // Reconnect on the new installation BEFORE revoking the old one, so this
@@ -429,6 +493,7 @@ export class CredentialManager {
         this.d.log(`bridge auth: could not revoke the previous installation ${old.installationId}: ${e}`);
       }
     }
+    return true;
   }
 
   /** Sign this profile out: delete its files, then (unless local) revoke on the server. */
@@ -440,6 +505,9 @@ export class CredentialManager {
     const inst = await withProfileLock(p.dir, async () => {
       const i = readInstallation(p.dir);
       deleteProfileCredentials(p.dir);
+      // An enrolment key still in .env must not silently sign the machine back in at
+      // the next start; /bridge:login clears this.
+      writeLoggedOutMarker(p.dir);
       return i;
     });
     this.access = null;
@@ -464,6 +532,10 @@ export class CredentialManager {
     const key = this.d.enrolmentKey.trim();
     const apiUrl = this.d.envApiUrl;
     if (!p || !key || !apiUrl || this.installation()) return;
+    if (hasLoggedOutMarker(p.dir)) {
+      this.d.log("bridge auth: signed out with /bridge:logout — not re-enrolling from BRIDGE_ENROLMENT_KEY (run /bridge:login)");
+      return;
+    }
     try {
       await withProfileLock(p.dir, async () => {
         if (readInstallation(p.dir)) return;

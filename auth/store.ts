@@ -85,6 +85,25 @@ export function deleteProfileCredentials(dir: string): void {
   } catch {}
 }
 
+const loggedOutMarker = (dir: string) => join(dir, "logged-out");
+
+/** Set by /bridge:logout; suppresses BRIDGE_ENROLMENT_KEY until the next login. */
+export function writeLoggedOutMarker(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(loggedOutMarker(dir), `${new Date().toISOString()}\n`, { mode: 0o600 });
+}
+export function clearLoggedOutMarker(dir: string): void {
+  remove(loggedOutMarker(dir));
+}
+export function hasLoggedOutMarker(dir: string): boolean {
+  try {
+    statSync(loggedOutMarker(dir));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Session files idle past the server's 7-day session idle are dead weight. */
 export function sweepSessions(dir: string, keepFile: string, maxAgeMs: number): void {
   let names: string[];

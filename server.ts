@@ -906,6 +906,10 @@ function connectWs(): void {
   }
 
   const sock = ws;
+  // What THIS socket authenticated with — a later close refers to it, not to
+  // whatever credential the process holds by then.
+  let sockBearer: string | undefined;
+  let sockGrant: { installationId: string; sessionId: string } | null = null;
   sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;
@@ -917,6 +921,8 @@ function connectWs(): void {
       return;
     }
     if (ws !== sock) return;
+    sockBearer = bearer;
+    sockGrant = creds.grant();
     // reconnectAttempt is NOT reset here: the handshake succeeding proves
     // nothing. A server that accepts the socket and then rejects auth (revoked
     // token) would reset the backoff on every attempt and spin at ~1s forever.
@@ -993,18 +999,21 @@ function connectWs(): void {
     process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
     // RFC-014 D9. 4009: the access token ran out before a reauth — drop it so the
     // reconnect's auth frame carries a fresh one.
-    if (cls === "expired") creds.invalidateAccess();
-    if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked();
+    if (cls === "expired") creds.invalidateAccess(sockBearer);
+    if (cls === "revoked" && reason === "session revoked") void creds.sessionRevoked(sockGrant?.sessionId ?? null);
     if (cls === "revoked" && reason === "installation revoked") {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
       // profile already holds the new one, this is a switch, not a sign-out.
       void creds
-        .installationRevoked()
+        .installationRevoked(sockGrant?.installationId ?? null)
         .catch(() => "logged_out" as const)
         .then((r) => {
           if (ws !== null && ws !== sock) return;
           if (r === "switched") lastClose = { cls: "transient", code, reason };
-          else notifyConnectionRefused(cls, code, reason);
+          else {
+            awaitingCredentials = true;
+            notifyConnectionRefused(cls, code, reason);
+          }
           scheduleReconnect();
         });
       return;
@@ -1081,15 +1090,34 @@ function credentialFailure(sock: WebSocket, err: unknown): void {
   try {
     sock.close();
   } catch {}
-  if (err instanceof CredentialError && err.kind === "network") {
+  // Only a KNOWN terminal state stops (and waits for a login); anything else —
+  // discovery 5xx during a deploy, a timeout, the lock cap — retries.
+  const terminal = err instanceof CredentialError && err.kind !== "network";
+  if (!terminal) {
     lastClose = { cls: "transient", reason: msg };
   } else {
     lastClose = { cls: "revoked", reason: msg };
     lastServerError = msg;
+    awaitingCredentials = true;
     notifyModel(`⚠️ Bridge: ${msg}`, "error");
   }
   scheduleReconnect();
 }
+
+/**
+ * Set while this session wants to connect but has no usable credential (never
+ * signed in, or signed out). A login in ANOTHER session on this machine writes the
+ * profile's files; this picks them up without a /bridge:connect here. Never set by
+ * a 4008 "session revoked" — that stop is deliberate.
+ */
+let awaitingCredentials = false;
+const credentialWatch = setInterval(() => {
+  if (!awaitingCredentials || !wantConnected || shuttingDown || creds.configError()) return;
+  awaitingCredentials = false;
+  process.stderr.write("bridge channel: credentials appeared — connecting\n");
+  restartConnection();
+}, 10_000);
+credentialWatch.unref?.();
 
 function notifyModel(content: string, type: "error" | "status"): void {
   mcp
@@ -1648,7 +1676,7 @@ async function apiFetch(
   // An access token can die before its expiry (session revoked, server restarted
   // its clock view): renew once and retry. Legacy tokens have nothing to renew.
   if (res.status === 401 && !retried && creds.source() === "installation") {
-    creds.invalidateAccess();
+    creds.invalidateAccess(bearer);
     return apiFetch(path, opts, true);
   }
   if (res.status === 429) {
@@ -3165,12 +3193,16 @@ function shutdown(): void {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (livenessTimer) clearInterval(livenessTimer);
   if (lockRetryTimer) clearTimeout(lockRetryTimer);
-  creds.stop();
   releaseSessionLock();
   try {
     ws?.close();
   } catch {}
-  setTimeout(() => process.exit(0), 1000);
+  // A refresh in flight has already rotated the token on the server; exiting before
+  // it is written leaves a consumed token on disk (reuse ⇒ the grant is revoked).
+  void Promise.all([creds.drain(8_000), Bun.sleep(1000)]).finally(() => {
+    creds.stop();
+    process.exit(0);
+  });
 }
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
@@ -3225,5 +3257,9 @@ process.stderr.write(
 // Headless machines enrol once from BRIDGE_ENROLMENT_KEY (never through chat).
 await creds.enrolFromKeyIfNeeded();
 const startupProblem = creds.configError();
-if (startupProblem) process.stderr.write(`bridge channel: ${startupProblem}\n`);
+if (startupProblem) {
+  process.stderr.write(`bridge channel: ${startupProblem}\n`);
+  awaitingCredentials = true;
+}
+creds.sweep();
 if (!shuttingDown && wantConnected && !startupProblem) connectUnlessDuplicate();

@@ -15,6 +15,9 @@ import { CLIENT_ID } from "./oauth";
 
 export type LoopbackAnswer = { code: string } | { error: string };
 
+/** Longest the browser's callback request is held open waiting for the outcome. */
+const HOLD_MS = 120_000;
+
 function b64url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
@@ -49,8 +52,12 @@ export async function startLoopback(
   let settle!: (a: LoopbackAnswer) => void;
   const answer = new Promise<LoopbackAnswer>((r) => (settle = r));
   let answered = false;
-  let release: ((r: Response) => void) | null = null;
   let finished = false;
+  // The outcome every held browser response waits for (a reload or prefetch of the
+  // callback gets the same answer as the first hit, not a misleading "error").
+  let settleOutcome!: (r: "connected" | "denied" | "error") => void;
+  const outcome = new Promise<"connected" | "denied" | "error">((r) => (settleOutcome = r));
+  const held = () => outcome.then((r) => doneResponse(r));
 
   const doneResponse = (result: string) =>
     doneUri
@@ -62,12 +69,15 @@ export async function startLoopback(
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
+    // Bun's default 10 s idle timeout would cut the held response while the code is
+    // exchanged and the profile lock is waited for; the hold is bounded below instead.
+    idleTimeout: 0,
     fetch(req) {
       const url = new URL(req.url);
       if (req.method !== "GET" || url.pathname !== "/callback") return new Response("Not found", { status: 404 });
       if (req.headers.get("host") !== `127.0.0.1:${server.port}`) return new Response("Forbidden", { status: 403 });
       if (url.searchParams.get("state") !== state) return new Response("Bad request", { status: 400 });
-      if (answered) return doneResponse("error");
+      if (answered) return held();
       const iss = url.searchParams.get("iss");
       // RFC 9207: a server that advertises the parameter must send it; a different
       // issuer means the code came from somewhere else.
@@ -80,8 +90,10 @@ export async function startLoopback(
       const err = url.searchParams.get("error");
       const code = url.searchParams.get("code");
       settle(err ? { error: err } : code ? { code } : { error: "invalid_response" });
-      // Hold the browser until the caller has exchanged the code and knows the outcome.
-      return new Promise<Response>((r) => (release = r));
+      // Hold the browser until the caller has exchanged the code and knows the
+      // outcome — never forever.
+      setTimeout(() => settleOutcome("error"), HOLD_MS).unref?.();
+      return held();
     },
   });
 
@@ -119,7 +131,7 @@ export async function startLoopback(
     finish(result) {
       if (finished) return;
       finished = true;
-      release?.(doneResponse(result));
+      settleOutcome(result);
       close();
     },
     close() {
@@ -127,7 +139,7 @@ export async function startLoopback(
         answered = true;
         settle({ error: "cancelled" });
       }
-      release?.(doneResponse("error"));
+      settleOutcome("error");
       close();
     },
   };

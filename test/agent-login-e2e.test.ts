@@ -189,6 +189,98 @@ describe("plugin on a session grant (RFC-014)", () => {
     });
   }, 30_000);
 
+  test("installation revoked because the machine re-logged-in elsewhere: switches to the new one silently", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (_client, dir, notices) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        const old = readInstallation(dir)!.installationId;
+        // Another session on this machine logged in again (new installation on disk)…
+        const g = stub.enrol();
+        writeInstallation(dir, { apiUrl: stub.url, installationId: g.installation_id, installationToken: g.installation_token });
+        // …and revoked the old one.
+        stub.revokeInstallation(old);
+        expect(await until(() => stub.stats.authTokens.length >= 2, 10_000)).toBe(true);
+        expect(stub.sessionsFor(g.installation_id)).toHaveLength(1);
+        expect(notices().some((n) => n.includes("/bridge:login"))).toBe(false);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("…even when this process already moved its HTTP credential to the new installation before the old one's 4008", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        const old = readInstallation(dir)!.installationId;
+        const g = stub.enrol();
+        writeInstallation(dir, { apiUrl: stub.url, installationId: g.installation_id, installationToken: g.installation_token });
+        // A 401 makes this process renew — onto the NEW installation on disk.
+        stub.expireAccess();
+        await client.callTool({ name: "list_channels", arguments: {} });
+        expect(stub.sessionsFor(g.installation_id)).toHaveLength(1);
+        // Now the old installation's socket is revoked: that is the old one, not ours.
+        stub.revokeInstallation(old);
+        expect(await until(() => stub.stats.authTokens.length >= 2, 10_000)).toBe(true);
+        expect(readInstallation(dir)?.installationId).toBe(g.installation_id);
+        expect(notices().some((n) => n.includes("/bridge:login"))).toBe(false);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("a persistent 401 renews exactly once, then reports the error (no loop)", async () => {
+    const stub = startAuthStub({ always401: true });
+    await withPlugin(
+      stub,
+      {},
+      async (client) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        const before = stub.stats.apiHits;
+        const r: any = await client.callTool({ name: "list_channels", arguments: {} });
+        expect(JSON.stringify(r.content)).toMatch(/401/);
+        // list_channels makes two parallel requests: each is tried, renewed once, retried once…
+        expect(stub.stats.apiHits - before).toBe(4);
+        // …and the two 401s share ONE refresh (the second must not drop the fresh token).
+        expect(stub.stats.refreshes).toBe(1);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("discovery failing during a deploy is retried, not treated as signed out", async () => {
+    const stub = startAuthStub({ discoveryFail: 2 });
+    await withPlugin(
+      stub,
+      {},
+      async (_client, _dir, notices) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 15_000)).toBe(true);
+        expect(stub.stats.discoveryHits).toBeGreaterThanOrEqual(3);
+        expect(notices().some((n) => n.includes("⚠️"))).toBe(false);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("a login done in ANOTHER session is picked up without /bridge:connect here", async () => {
+    const stub = startAuthStub();
+    await withPlugin(stub, {}, async (client, dir) => {
+      expect((await status(client)).configured).toBe(false);
+      // Past startup (session-key resolution waits up to 3 s): from here only the
+      // credential watch can notice the new files.
+      await Bun.sleep(4_000);
+      expect(stub.stats.authTokens).toHaveLength(0);
+      const g = stub.enrol();
+      writeInstallation(dir, { apiUrl: stub.url, installationId: g.installation_id, installationToken: g.installation_token });
+      expect(await until(() => stub.stats.authTokens.length >= 1, 15_000)).toBe(true);
+    });
+  }, 30_000);
+
   test("a named profile with no credentials refuses to connect and says so", async () => {
     const stub = startAuthStub();
     await withPlugin(

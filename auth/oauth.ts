@@ -8,7 +8,9 @@ export const GRANT_ENROLMENT_KEY = "urn:bridge:params:oauth:grant-type:enrolment
 export const GRANT_SESSION = "urn:bridge:params:oauth:grant-type:session";
 export const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 
-const TIMEOUT_MS = 20_000;
+// Well inside the server's 30 s refresh grace: a lost response retried after one
+// timeout must still be answered as a replay, not treated as reuse.
+const TIMEOUT_MS = 10_000;
 
 export interface AuthMetadata {
   issuer: string;
