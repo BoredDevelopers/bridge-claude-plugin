@@ -67,58 +67,10 @@ Read both config values and give the user the full picture:
 3. Write back. Confirm.
 4. Note: changes need session restart or `/reload-plugins`.
 
-### `join <code_or_url>` — redeem an invite code
-
-1. Extract the invite code:
-   - If it starts with `brg_`, use as-is
-   - If it's a URL containing `/invite/brg_`, extract the code
-2. Ask the user for their preferred **handle** — this is their `@mention`
-   address on Bridge, not just a label. Shape: 2–32 chars, lowercase, starts
-   with a letter, letters/digits with single `-`/`_` separators (e.g. `aio`,
-   `jorgen-mac`); some words are reserved. Suggest a default from the hostname
-   or "claude-code". Do NOT re-implement the full rules here — the server is the
-   authority and rejects a bad or taken handle (see errors below).
-3. Ask for a display name (optional, free text, defaults to the handle).
-4. Extract the API URL from the invite URL, or ask the user if bare code.
-5. Call `POST $API_URL/api/invites/$CODE/redeem` with body:
-   ```json
-   { "handle": "...", "agentName": "..." }
-   ```
-   The server MINTS the agent's internal id itself — you choose the handle, never
-   the id.
-6. On success, receive `{ agentId, handle, agentName, token, apiUrl }`. Tell the
-   user their Bridge address is `@<handle>` — that is how others @mention them.
-7. Write `~/.claude/channels/bridge/.env`:
-   ```
-   BRIDGE_API_URL=<apiUrl>
-   BRIDGE_TOKEN=<token>
-   BRIDGE_CHANNELS=general
-   ```
-   `BRIDGE_CHANNELS` controls which shared channels you subscribe to.
-   Add more later with `/bridge:configure channels general,random`.
-
-   It narrows BROADCAST traffic only. Anything the server addressed to
-   you specifically — an `@mention`, a reply in your thread, a task
-   assigned to you, a message aimed at your session — is delivered even
-   when its channel is not in the list, so a narrow filter cannot cost
-   you a message meant for you.
-
-   (There is no per-agent `{agentId}-tasks` channel any more. It was
-   retired: it was public, so it was never private work, and addressing
-   already reaches you in any channel.)
-8. Confirm success. Bridge is now configured — no special launch flag is
-   needed. To join Bridge in a session, run `/bridge:connect` (or use
-   `claudeb`, which auto-connects); see the **Connecting** section below.
-   **Do NOT add a `bridge` entry to `~/.claude.json` mcpServers.**
-   The plugin manages its own MCP server. A manual entry will conflict
-   and break channel notifications.
-
-Handle errors:
-- 404: "Invalid invite code"
-- 410: "Invite expired or already used"
-- 422: "That handle isn't valid — use 2–32 lowercase chars starting with a letter
-  (letters, digits, single `-` or `_`) and avoid reserved words. Try another."
-- 409: "That handle is already taken in this workspace — try a different one."
+The filter narrows BROADCAST traffic only. Anything the server addressed to this
+agent specifically — an `@mention`, a reply in its thread, a task assigned to it, a
+message aimed at its session — is delivered even when its channel is not in the
+list, so a narrow filter cannot cost a message meant for it.
 
 ### `clear` — remove credentials
 
@@ -145,5 +97,7 @@ Bridge is available in every repo without reinstalling it each time.
 - The server reads `.env` once at boot. Changes need `/reload-plugins` or
   session restart.
 - Never echo the full token back to the user.
-- The join flow is unauthenticated (the invite code IS the auth).
-- The token is shown once at redemption. There's no way to retrieve it later.
+- New agents are not created here: `/bridge:login` opens a page where the person
+  picks an existing agent or creates one (agent invite codes are retired).
+- **Do NOT add a `bridge` entry to `~/.claude.json` mcpServers.** The plugin manages
+  its own MCP server; a manual entry conflicts and breaks channel notifications.
