@@ -1951,7 +1951,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         "Read a thread: its root message and its replies, oldest first — including replies " +
         "sent while this session was not connected. Pass the thread_id shown on any message " +
         "(inbound or from read_messages) — NOT its message_id. Pages like read_messages: pass " +
-        "the returned next_since_seq as since_seq to continue. By default it marks the thread " +
+        "the returned next_since_seq as since_seq to continue. The first page also carries the " +
+        "thread's history (events: renames, resolves, answers marked or withdrawn). By default it marks the thread " +
         "read up to the last message returned (never further); pass mark_read: false to peek.",
       inputSchema: {
         type: "object",
@@ -2773,6 +2774,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               )
             : {};
 
+        // RFC-015 timeline — the thread's lifecycle history (renames, resolves, answers
+        // marked or withdrawn), on the FIRST page only, like the root: it is context.
+        // Every page already carries the thread's CURRENT status and answer. A server
+        // without the route (404) simply has no history to show.
+        let events: unknown[] | undefined;
+        if (!sinceSeq && data.thread) {
+          const ev = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/events`);
+          if (ev.ok) {
+            events = (((await ev.json()) as any).events ?? []).map((e: any) => ({
+              ts: e.occurredAt,
+              by: e.actorName ?? e.actorId,
+              action: e.action,
+              ...(e.detail ? { detail: e.detail } : {}),
+            }));
+          } else if (ev.status !== 404) {
+            throw new Error(`Bridge API error ${ev.status}: ${await ev.text()}`);
+          }
+        }
+
         const channelId = data.thread?.channelId ?? data.parent?.channelId;
         // Resume from the highest seq SEEN — on a first page with no replies the
         // server echoes cursor 0, and polling from 0 would resend the root.
@@ -2807,6 +2827,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                   ...mark,
                   hint,
                   ...(includeParent ? { root: shape(data.parent) } : {}),
+                  ...(events && events.length > 0 ? { events } : {}),
                   replies,
                 },
                 null,

@@ -63,6 +63,9 @@ type State = {
   /** PUT/DELETE /api/threads/:id/answer — status + `{error}` on refusal. */
   answerStatus: number;
   answerError: string;
+  /** GET /api/threads/:id/events — the timeline; `eventsStatus` 404 models an older server. */
+  events: Row[];
+  eventsStatus: number;
 };
 
 function startStub(): Stub {
@@ -70,7 +73,7 @@ function startStub(): Stub {
   const calls: string[] = [];
   const readBodies: { path: string; body: any }[] = [];
   const answerBodies: any[] = [];
-  let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false, answerStatus: 200, answerError: "" };
+  let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false, answerStatus: 200, answerError: "", events: [], eventsStatus: 200 };
   let answer: string | null = null; // the thread's accepted answer
   let cursor = 0; // the stored thread read position
   const agentAuth = createAgentAuthRoutes();
@@ -99,6 +102,11 @@ function startStub(): Stub {
         const known = c === CHANNEL_ID || c === CHANNEL_NAME;
         if (st.legacyList) return Response.json({ threads: known ? st.threads : [] });
         return Response.json({ channelId: known ? CHANNEL_ID : null, threads: known ? st.threads : [] });
+      }
+      const ev = url.pathname.match(/^\/api\/threads\/([^/]+)\/events$/);
+      if (ev && req.method === "GET") {
+        if (st.eventsStatus !== 200) return new Response("no", { status: st.eventsStatus });
+        return Response.json({ events: st.events });
       }
       // Models threads.ts PUT/DELETE /:id/answer (RFC-015 D4): mark resolves, unmark reopens.
       const a = url.pathname.match(/^\/api\/threads\/([^/]+)\/answer$/);
@@ -349,6 +357,33 @@ describe("read_thread / list_threads", () => {
     const unmarked = await ok("mark_answer", { thread_id: THREAD, unmark: true });
     expect(unmarked).toEqual({ thread_id: THREAD, status: "open", answer_message_id: null });
     expect(stub.calls).toContain(`DELETE /api/threads/${THREAD}/answer`);
+  });
+
+  test("read_thread's FIRST page carries the thread's history; a later page does not re-send it", async () => {
+    stub.set({
+      events: [
+        { id: "e1", action: "answer", detail: { messageId: "m1", from: null }, actorId: "u1", actorType: "human", actorName: "Jörgen", occurredAt: "2026-09-25T10:00:00.000Z" },
+        { id: "e2", action: "reopen", detail: null, actorId: "u2", actorType: "agent", actorName: null, occurredAt: "2026-09-25T10:05:00.000Z" },
+      ],
+    });
+    const first = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(first.events).toEqual([
+      { ts: "2026-09-25T10:00:00.000Z", by: "Jörgen", action: "answer", detail: { messageId: "m1", from: null } },
+      { ts: "2026-09-25T10:05:00.000Z", by: "u2", action: "reopen" },
+    ]);
+    const later = await ok("read_thread", { thread_id: THREAD, since_seq: 13, mark_read: false });
+    expect(later.events).toBeUndefined();
+    expect(stub.calls.filter((c) => c.endsWith("/events"))).toHaveLength(1);
+  });
+
+  test("read_thread against a server without the timeline (404) still reads, with no events", async () => {
+    stub.set({ eventsStatus: 404, events: [] });
+    const body = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(body.events).toBeUndefined();
+    expect(body.replies).toHaveLength(3);
+    stub.set({ eventsStatus: 500 });
+    const r = await callTool("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(r.isError).toBe(true);
   });
 
   test("mark_answer refuses an ambiguous or empty call locally — nothing is sent", async () => {
