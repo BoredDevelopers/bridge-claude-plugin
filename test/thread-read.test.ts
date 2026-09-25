@@ -46,6 +46,8 @@ type Stub = {
   calls: string[];
   /** Bodies POSTed to a `/read` route, in order. */
   readBodies: { path: string; body: any }[];
+  /** Bodies sent to `/answer`, in order. */
+  answerBodies: any[];
   set: (s: Partial<State>) => void;
   stop: () => void;
 };
@@ -58,13 +60,18 @@ type State = {
   threads: Row[];
   /** Server shape that predates name resolution: no `channelId` echo. */
   legacyList: boolean;
+  /** PUT/DELETE /api/threads/:id/answer — status + `{error}` on refusal. */
+  answerStatus: number;
+  answerError: string;
 };
 
 function startStub(): Stub {
   let socket: any = null;
   const calls: string[] = [];
   const readBodies: { path: string; body: any }[] = [];
-  let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false };
+  const answerBodies: any[] = [];
+  let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false, answerStatus: 200, answerError: "" };
+  let answer: string | null = null; // the thread's accepted answer
   let cursor = 0; // the stored thread read position
   const agentAuth = createAgentAuthRoutes();
   agentAuth.addEnrolmentKey(ENROLMENT_KEY);
@@ -93,6 +100,18 @@ function startStub(): Stub {
         if (st.legacyList) return Response.json({ threads: known ? st.threads : [] });
         return Response.json({ channelId: known ? CHANNEL_ID : null, threads: known ? st.threads : [] });
       }
+      // Models threads.ts PUT/DELETE /:id/answer (RFC-015 D4): mark resolves, unmark reopens.
+      const a = url.pathname.match(/^\/api\/threads\/([^/]+)\/answer$/);
+      if (a && (req.method === "PUT" || req.method === "DELETE")) {
+        const body: any = req.method === "PUT" ? await req.json().catch(() => null) : null;
+        answerBodies.push(body);
+        if (st.answerStatus !== 200) return Response.json({ error: st.answerError }, { status: st.answerStatus });
+        answer = req.method === "PUT" ? body.messageId : null;
+        return Response.json({
+          threadId: a[1], channelId: CHANNEL_ID, kind: "question",
+          status: answer ? "resolved" : "open", resolvedReason: answer ? "done" : null, answerMessageId: answer,
+        });
+      }
       const m = url.pathname.match(/^\/api\/threads\/([^/]+)\/(messages|read)$/);
       if (m && m[2] === "read" && req.method === "POST") {
         return req.json().catch(() => null).then((body: any) => {
@@ -120,7 +139,10 @@ function startStub(): Stub {
         const last = page[page.length - 1];
         const body: any = { parent: st.root, replies: page };
         if (!st.legacy) {
-          body.thread = { id: THREAD, channelId: CHANNEL_ID, title: "Bug: threaded replies", status: "open", replyCount: st.replies.length };
+          body.thread = {
+            id: THREAD, channelId: CHANNEL_ID, title: "Bug: threaded replies", kind: "question",
+            status: answer ? "resolved" : "open", answerMessageId: answer, replyCount: st.replies.length,
+          };
           body.hasMore = after.length > limit;
           body.nextSinceSeq = last ? last.seq : Number(since ?? 0);
         }
@@ -149,6 +171,7 @@ function startStub(): Stub {
     connected: () => socket !== null,
     calls,
     readBodies,
+    answerBodies,
     set: (s) => { st = { ...st, ...s }; },
     stop: () => server.stop(true),
   };
@@ -311,6 +334,47 @@ describe("read_thread / list_threads", () => {
     const r = await callTool("read_thread", { thread_id: String(msg(12, "").id) });
     expect(r.isError).toBe(true);
     expect(r.text).toContain("a message_id is not a thread_id");
+  });
+
+  test("mark_answer PUTs the reply; read_thread then shows kind + the answer; unmark DELETEs (RFC-015 D4)", async () => {
+    const reply = String(msg(14, "r2").id);
+    const marked = await ok("mark_answer", { thread_id: THREAD, message_id: reply });
+    expect(marked).toEqual({ thread_id: THREAD, status: "resolved", answer_message_id: reply });
+    expect(stub.calls).toContain(`PUT /api/threads/${THREAD}/answer`);
+    expect(stub.answerBodies).toEqual([{ messageId: reply }]);
+
+    const read = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(read.thread).toMatchObject({ kind: "question", status: "resolved", answer_message_id: reply });
+
+    const unmarked = await ok("mark_answer", { thread_id: THREAD, unmark: true });
+    expect(unmarked).toEqual({ thread_id: THREAD, status: "open", answer_message_id: null });
+    expect(stub.calls).toContain(`DELETE /api/threads/${THREAD}/answer`);
+  });
+
+  test("mark_answer refuses an ambiguous or empty call locally — nothing is sent", async () => {
+    const both = await callTool("mark_answer", { thread_id: THREAD, message_id: "x", unmark: true });
+    expect(both.isError).toBe(true);
+    expect(both.text).toContain("not both");
+    const neither = await callTool("mark_answer", { thread_id: THREAD });
+    expect(neither.isError).toBe(true);
+    expect(neither.text).toContain("message_id is required");
+    expect(stub.answerBodies).toEqual([]);
+  });
+
+  test("mark_answer explains a refusal: 403 standing, 409 nothing to withdraw, 422 the server's reason", async () => {
+    stub.set({ answerStatus: 403, answerError: "Forbidden" });
+    const r403 = await callTool("mark_answer", { thread_id: THREAD, message_id: "m" });
+    expect(r403.isError).toBe(true);
+    expect(r403.text).toContain("only the thread's creator, the channel owner or a workspace admin");
+
+    stub.set({ answerStatus: 409, answerError: "Thread has no answer" });
+    const r409 = await callTool("mark_answer", { thread_id: THREAD, unmark: true });
+    expect(r409.text).toContain("no answer to withdraw");
+
+    stub.set({ answerStatus: 422, answerError: "Only a question thread has an answer" });
+    const r422 = await callTool("mark_answer", { thread_id: THREAD, message_id: "m" });
+    expect(r422.isError).toBe(true);
+    expect(r422.text).toContain("Only a question thread has an answer");
   });
 
   test("a masked or missing thread (404) is an error naming the id", async () => {
