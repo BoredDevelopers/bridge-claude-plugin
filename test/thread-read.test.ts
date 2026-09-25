@@ -346,6 +346,31 @@ describe("read_thread / list_threads", () => {
     expect(unreadOnly.threads.map((t: any) => t.thread_id)).toEqual([THREAD]);
   });
 
+  test("list_threads(query) SEARCHES: sends q, reports kind, and says continue-don't-duplicate (RFC-015 D5)", async () => {
+    stub.set({
+      threads: [
+        { id: THREAD, title: "Picker double-fetch on workspace switch", kind: "question", status: "open", replyCount: 2, unreadCount: 0, lastActivityAt: "x" },
+      ],
+    });
+    const body = await ok("list_threads", { channel_id: CHANNEL_NAME, query: "  picker double fetch & more " });
+    // Trimmed and URL-encoded (a title can hold &, #, ?).
+    expect(stub.calls).toContain(`GET /api/threads?channel=${CHANNEL_NAME}&q=picker%20double%20fetch%20%26%20more`);
+    expect(body.threads[0]).toMatchObject({ thread_id: THREAD, kind: "question" });
+    expect(body.hint).toContain("1 similar thread(s)");
+    expect(body.hint).toContain("reply(thread_id)");
+
+    stub.set({ threads: [] });
+    const none = await ok("list_threads", { channel_id: CHANNEL_NAME, query: "nightly deploy" });
+    expect(none.hint).toContain("No similar threads");
+  });
+
+  test("list_threads WITHOUT a query sends no q (the plain list is unchanged)", async () => {
+    stub.set({ threads: [] });
+    await ok("list_threads", { channel_id: CHANNEL_NAME });
+    expect(stub.calls).toContain(`GET /api/threads?channel=${CHANNEL_NAME}`);
+    expect(stub.calls.some((c) => c.includes("&q="))).toBe(false);
+  });
+
   test("an unknown channel is an error, never a false 'No unread threads.'", async () => {
     const r = await callTool("list_threads", { channel_id: "no-such-channel" });
     expect(r.isError).toBe(true);

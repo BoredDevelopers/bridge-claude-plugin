@@ -1792,7 +1792,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -1833,12 +1833,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           thread_id: {
             type: "string",
             description:
-              "Thread ID to reply into. Use the thread_id from the inbound message (or from read_messages) — every message carries the id of the thread it belongs to. Omit to start a new root message.",
+              "Thread ID to reply into. Use the thread_id from the inbound message (or from read_messages) — every message carries the id of the thread it belongs to. Omit to start a new thread — but first check list_threads(channel_id, query) for an existing thread on the same topic and reply into that instead.",
           },
           title: {
             type: "string",
             description:
-              "Title for a task thread (root only; ignored on thread replies). Use with type \"task\" to name the work; omitted, the server derives one from the content.",
+              "The new thread's title (root only; ignored on thread replies) — how it is named in the channel's thread list and found by list_threads(query). Pass one whenever you start a thread; REQUIRED with type \"task\". Omitted, the server derives one from the first line.",
           },
           context_id: {
             type: "string",
@@ -1984,9 +1984,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_threads",
       description:
-        "List a channel's threads, most recently active first, with each thread's reply count " +
-        "and how many of its messages you have not read. Use it to find which threads need " +
-        "attention, then read_thread(thread_id) to read (and mark read) one.",
+        "List a channel's threads, most recently active first, with each thread's kind, reply " +
+        "count and how many of its messages you have not read. Use it to find which threads need " +
+        "attention, then read_thread(thread_id) to read (and mark read) one. With `query`, it " +
+        "SEARCHES instead: the few threads whose titles are most similar (open ones first) — " +
+        "call it before starting a new thread, and continue a match rather than duplicating it.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1997,6 +1999,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           unread_only: {
             type: "boolean",
             description: "Only threads with unread messages (default false).",
+          },
+          query: {
+            type: "string",
+            description:
+              "Search for similar threads by title (at least 3 characters) — what the thread you are about to start would be called.",
           },
         },
         required: ["channel_id"],
@@ -2788,7 +2795,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         { const gate = requireBridge(); if (gate) return gate; }
         const channelArg = args.channel_id as string;
         // The server resolves a name or an id (as the channel view does).
-        const res = await apiFetch(`/api/threads?channel=${encodeURIComponent(channelArg)}`);
+        // RFC-015 D5 — `query` turns the list into a similar-threads SEARCH (the
+        // server ranks and caps it). Sent only when given, so a plain list is unchanged.
+        const query = typeof args.query === "string" ? args.query.trim() : "";
+        const res = await apiFetch(
+          `/api/threads?channel=${encodeURIComponent(channelArg)}${query ? `&q=${encodeURIComponent(query)}` : ""}`
+        );
         if (res.status === 404) throw new Error(`Channel ${channelArg} not found, or not visible to this agent.`);
         if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
         const data = (await res.json()) as any;
@@ -2803,6 +2815,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const all = (data.threads ?? []).map((t: any) => ({
           thread_id: t.id,
           title: t.title,
+          // RFC-015 D3 — discussion | question | task (absent from an older server).
+          ...(typeof t.kind === "string" ? { kind: t.kind } : {}),
           status: t.status,
           replies: t.replyCount ?? 0,
           // ⚠️ `unread` absent, never defaulted to 0, when the server did not say:
@@ -2812,8 +2826,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }));
         const threads = args.unread_only === true ? all.filter((t: any) => (t.unread ?? 0) > 0) : all;
         const unreadThreads = all.filter((t: any) => (t.unread ?? 0) > 0).length;
-        const hint =
-          unreadThreads > 0
+        const hint = query
+          ? threads.length > 0
+            ? `${threads.length} similar thread(s) — if one is the same topic, continue it with reply(thread_id) instead of starting a new thread.`
+            : "No similar threads — starting a new thread is fine (give it a title)."
+          : unreadThreads > 0
             ? `${unreadThreads} thread(s) with unread messages — read_thread(thread_id) reads one and marks it read.`
             : "No unread threads.";
         return {
