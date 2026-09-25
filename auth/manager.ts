@@ -31,7 +31,15 @@ import { pollDevice } from "./device";
 import { isHeadless, browserDisabled, openBrowser } from "./browser";
 import { profileLabel, type Profile } from "./profile";
 
-export type CredentialSource = "installation" | "legacy" | "none";
+export type CredentialSource = "installation" | "none";
+
+/**
+ * Shown when there is no credential but BRIDGE_TOKEN is still set — almost
+ * certainly why the person thinks this machine is signed in when it isn't.
+ * The variable itself is never read past a presence check (see
+ * `staleStaticTokenPresent` below) and never sent anywhere.
+ */
+const STALE_TOKEN_HINT = "BRIDGE_TOKEN is no longer supported — run /bridge:login";
 
 /** Why no bearer can be produced — the text is shown to the model as-is. */
 export class CredentialError extends Error {
@@ -47,8 +55,12 @@ export interface ManagerDeps {
   profile: Profile | { error: string };
   /** BRIDGE_API_URL from the environment / .env, trailing slashes stripped ("" = unset). */
   envApiUrl: string;
-  /** BRIDGE_TOKEN — the legacy static token, honoured only by the default profile. */
-  legacyToken: string;
+  /**
+   * Whether BRIDGE_TOKEN is set in the environment. Only a presence check —
+   * the value itself is never read here and never sent anywhere; it exists
+   * solely to power the STALE_TOKEN_HINT.
+   */
+  staleStaticTokenPresent: boolean;
   enrolmentKey: string;
   sessionKey: () => string;
   /** Resolves once sessionKey() is final — a grant keyed by a provisional key would be orphaned. */
@@ -115,9 +127,6 @@ export class CredentialManager {
   source(): CredentialSource {
     if (!this.profile) return "none";
     if (this.installation()) return "installation";
-    // A NAMED profile never falls back to the machine's legacy token: selecting a
-    // profile that has no credentials is an error, not "use whatever is there".
-    if (this.profile.name === null && this.d.legacyToken) return "legacy";
     return "none";
   }
 
@@ -136,6 +145,7 @@ export class CredentialManager {
     // Login needs the API URL, so that hint comes first.
     if (!this.apiUrl()) return "BRIDGE_API_URL is not set — run /bridge:configure, then /bridge:login";
     if (this.source() === "none") {
+      if (this.d.staleStaticTokenPresent) return STALE_TOKEN_HINT;
       return this.profile!.name
         ? `profile "${this.profile!.name}" is not signed in — run /bridge:login`
         : "this machine is not signed in to Bridge — run /bridge:login";
@@ -147,7 +157,6 @@ export class CredentialManager {
   async bearer(): Promise<string> {
     const err = this.configError();
     if (err) throw new CredentialError(this.source() === "none" ? "not_logged_in" : "profile", err);
-    if (this.source() === "legacy") return this.d.legacyToken;
     const a = this.access;
     if (a && this.now() < a.expiresAt - EXPIRY_SLACK_MS) return a.token;
     return this.renew("expiring");
@@ -344,7 +353,7 @@ export class CredentialManager {
       api_url: this.apiUrl() || null,
       ...(inst ? { installation_id: inst.installationId, installation_name: inst.installationName ?? null } : {}),
       ...(this.access ? { access_token_expires_at: new Date(this.access.expiresAt).toISOString() } : {}),
-      ...(src === "legacy" ? { hint: "using the legacy BRIDGE_TOKEN — run /bridge:login to switch to a per-machine sign-in" } : {}),
+      ...(src === "none" && this.d.staleStaticTokenPresent ? { hint: STALE_TOKEN_HINT } : {}),
       ...(this.configError() ? { problem: this.configError() } : {}),
       ...(this.pendingLogin ? { login: "waiting for approval in the browser" } : {}),
     };

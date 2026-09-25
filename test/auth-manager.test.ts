@@ -42,7 +42,7 @@ function manager(
   const m = new CredentialManager({
     profile: resolveProfile(dir, profile),
     envApiUrl: apiUrl,
-    legacyToken: "",
+    staleStaticTokenPresent: false,
     enrolmentKey: "",
     sessionKey: () => key ?? "session-a",
     sessionKeyReady: () => Promise.resolve(),
@@ -211,20 +211,28 @@ describe("session start and refresh", () => {
 });
 
 describe("profiles and configuration", () => {
-  test("a named profile without credentials is an error and never uses the legacy token", async () => {
+  test("a named profile without credentials is an error", async () => {
     const { stub, dir } = setup();
-    const { m } = manager(dir, stub.url, { profile: "reviewer", legacyToken: "legacy-xyz" });
+    const { m } = manager(dir, stub.url, { profile: "reviewer" });
     expect(m.source()).toBe("none");
     await expect(m.bearer()).rejects.toThrow(/profile "reviewer" is not signed in/);
   });
 
-  test("the default profile falls back to the legacy token; credentials win over it", async () => {
+  // RFC-014 slice 5b: the server rejects a static BRIDGE_TOKEN outright, so the
+  // manager no longer treats it as a credential source at all — only as a hint
+  // that whoever set it should run /bridge:login instead.
+  test("BRIDGE_TOKEN alone is not a credential: source is none, and the hint says so", async () => {
     const { stub, dir } = setup();
-    const { m } = manager(dir, stub.url, { legacyToken: "legacy-xyz" });
-    expect(await m.bearer()).toBe("legacy-xyz");
+    const { m } = manager(dir, stub.url, { staleStaticTokenPresent: true });
+    expect(m.source()).toBe("none");
+    await expect(m.bearer()).rejects.toThrow(/BRIDGE_TOKEN is no longer supported — run \/bridge:login/);
+    expect(m.status().hint).toMatch(/BRIDGE_TOKEN is no longer supported — run \/bridge:login/);
+    // Never sent anywhere — bearer() must go through the real flow once there
+    // IS a credential, ignoring BRIDGE_TOKEN entirely.
     enrolled(stub, dir);
     expect(m.source()).toBe("installation");
     expect(await m.bearer()).toStartWith("brg_at_");
+    expect(m.status().hint).toBeUndefined();
   });
 
   test("an invalid profile name is refused", () => {

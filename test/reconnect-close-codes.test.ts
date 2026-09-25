@@ -11,8 +11,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { createAgentAuthRoutes } from "./agent-auth-routes";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
+const ENROLMENT_KEY = "brg_ek_test";
 
 type Close = { code: number; reason: string };
 /** `firstClose` refuses auth #1; `closes` refuses auths #1..#n in order (overrides). */
@@ -22,11 +24,15 @@ function startStub(firstClose: Close | null, opts: { channels429?: boolean; clos
   let open = 0;
   let maxOpen = 0;
   let onFirstClose: (() => void) | null = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       if (srv.upgrade(req)) return;
       const path = new URL(req.url).pathname;
       if (path === "/api/channels" && opts.channels429) {
@@ -85,7 +91,7 @@ async function withPlugin<T>(
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
       BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_TOKEN: "test-token",
+      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
       BRIDGE_AUTOCONNECT: "1",
       CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
       CLAUDE_CODE_SSE_PORT: "",

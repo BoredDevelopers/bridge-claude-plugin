@@ -18,8 +18,10 @@ import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createAgentAuthRoutes } from "./agent-auth-routes";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
+const ENROLMENT_KEY = "brg_ek_test";
 const THREAD = "0190a000-0000-7000-9000-000000000001";
 const CHANNEL_ID = "ch-general-id";
 const CHANNEL_NAME = "general";
@@ -64,12 +66,16 @@ function startStub(): Stub {
   const readBodies: { path: string; body: any }[] = [];
   let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false };
   let cursor = 0; // the stored thread read position
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
 
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
         if (srv.upgrade(req)) return;
@@ -164,7 +170,7 @@ describe("read_thread / list_threads", () => {
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,

@@ -56,7 +56,6 @@ import { test, expect, describe, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
 
 const API_DIR = process.env.BRIDGE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
@@ -79,7 +78,6 @@ async function pgReachable(): Promise<boolean> {
 }
 const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
 
-const sha = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Torn down in afterAll so a failed assertion cannot leak a scratch database.
@@ -122,15 +120,33 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       await api.runMigrations();
       closeApiPool = async () => { await api.closePool(); };
 
-      const TOK_ME = "tok-me", TOK_OTHER = "tok-other";
       const { db, schema } = api;
 
       // Only the NOT NULL columns are set; `created_at` and friends carry schema
       // defaults. Fewer fields named here is fewer things to rot.
       await db.insert(schema.agents).values([
-        { id: "me", name: "Me", tokenHash: sha(TOK_ME) },
-        { id: "other", name: "Other", tokenHash: sha(TOK_OTHER) },
+        { id: "me", name: "Me" },
+        { id: "other", name: "Other" },
       ]);
+      // RFC-014: agents have NO static token (bridge 0048). Seat both in the
+      // 'default' workspace and mint each an enrolment key through the API's OWN
+      // credential module — `me` (the plugin) enrols from BRIDGE_ENROLMENT_KEY at
+      // boot; `other` enrols over HTTP below to post as a second agent.
+      await api.pool.query(`UPDATE principals SET tenant_id = 'default' WHERE id IN ('me', 'other')`);
+      // …and give each its @handle there (identity chain PR-1: mentions resolve through
+      // `tenant_handles`, not the agent id) — without it the @mention case cannot resolve.
+      await api.pool.query(
+        `INSERT INTO tenant_handles (tenant_id, principal_id, handle, folded_handle, created_at)
+         VALUES ('default', 'me', 'me', 'me', extract(epoch from now())::bigint),
+                ('default', 'other', 'other', 'other', extract(epoch from now())::bigint)`
+      );
+      const creds: any = await import(join(API_DIR, "src/agent-credentials.ts"));
+      const keyFor = async (id: string) => {
+        const k = await creds.mintEnrolmentKey(id, "default", { id, type: "agent", contextId: null }, {});
+        if (!k.ok) throw new Error(`mintEnrolmentKey(${id}): ${k.error}`);
+        return k.key as string;
+      };
+      const KEY_ME = await keyFor("me"), KEY_OTHER = await keyFor("other");
 
       /**
        * `me-tasks` IS NOW A REAL CASE, and used to be excluded from this list
@@ -177,6 +193,9 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       const server = Bun.spawn(["bun", join(API_DIR, "src/index.ts")], {
         env: {
           ...process.env, DATABASE_URL: dbUrl, PORT,
+          // The discovery document advertises endpoints under this origin (RFC 8414):
+          // it must be THIS server, or the plugin is sent to the wrong one.
+          BRIDGE_PUBLIC_URL: URL_,
           FORGE_OIDC_CLIENT_SECRET: "x",
           BETTER_AUTH_SECRET: "test-secret-at-least-32-characters-long",
           NODE_ENV: "test",
@@ -190,10 +209,31 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       }
       expect(up, "bridge server did not start").toBe(true);
 
+      // `other` signs in the real way: enrolment key → installation → session → access token.
+      const grant = async (body: Record<string, string>) =>
+        (await fetch(`${URL_}/api/agent-auth/token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).then((r) => r.json())) as any;
+      const inst = await grant({
+        grant_type: "urn:bridge:params:oauth:grant-type:enrolment-key",
+        enrolment_key: KEY_OTHER,
+        installation_name: "inbound-routing test",
+      });
+      const TOK_OTHER = (
+        await grant({
+          grant_type: "urn:bridge:params:oauth:grant-type:session",
+          installation_token: inst.installation_token,
+          session_key: "other-session",
+        })
+      ).access_token as string;
+      expect(TOK_OTHER, "other agent could not sign in").toMatch(/^brg_at_/);
+
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
         env: {
           ...process.env,
-          BRIDGE_API_URL: URL_, BRIDGE_TOKEN: TOK_ME, BRIDGE_AUTOCONNECT: "1",
+          BRIDGE_API_URL: URL_, BRIDGE_ENROLMENT_KEY: KEY_ME, BRIDGE_AUTOCONNECT: "1",
           BRIDGE_CHANNELS: "general",          // deliberately NOT other-tasks
           BRIDGE_SESSION_KEY: "test-session",
           BRIDGE_STATE_DIR: dir, CLAUDE_PLUGIN_DATA: dir, CLAUDE_PROJECT_DIR: dir,

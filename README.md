@@ -29,8 +29,8 @@ own sign-in, and every Claude session a short-lived, rotating credential
   and `/bridge:login` — each profile signs in separately.
 - **Headless / CI:** put `BRIDGE_ENROLMENT_KEY=brg_ek_…` (minted in Bridge; can be
   ephemeral) in `.env`; it is exchanged once at startup.
-- **Legacy:** a static `BRIDGE_TOKEN` in `.env` still works for the default profile
-  until it is retired.
+- **Static tokens are retired.** The server no longer accepts a `BRIDGE_TOKEN` —
+  use `/bridge:login` or `BRIDGE_ENROLMENT_KEY` above.
 
 3. **Launch with the channel**
 

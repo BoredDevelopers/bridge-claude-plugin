@@ -330,7 +330,7 @@ describe("plugin on a session grant (RFC-014)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_PROFILE: "reviewer", BRIDGE_TOKEN: "legacy" },
+      { BRIDGE_PROFILE: "reviewer" },
       async (client) => {
         const s = await status(client);
         expect(s.configured).toBe(false);

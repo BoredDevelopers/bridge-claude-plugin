@@ -17,8 +17,11 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { connectStateFileFor, writeConnectState } from "../connect-store";
+import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { writeInstallation } from "../auth/store";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
+const ENROLMENT_KEY = "brg_ek_test";
 
 describe("connect-on-demand: unconfigured startup", () => {
   test("stays alive and answers tools/list when unconfigured", async () => {
@@ -74,11 +77,15 @@ const CONNECT_DEADLINE_MS = 15_000;
 
 function startAuthStub() {
   let authFrame: any = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       if (srv.upgrade(req)) return;
       return new Response("no", { status: 400 });
     },
@@ -114,7 +121,7 @@ describe("connect-on-demand: wantConnected startup gate", () => {
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
       BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_TOKEN: "test-token",
+      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
       CLAUDE_CODE_SESSION_ID: CONNECT_SESSION_KEY,
       CLAUDE_CODE_SSE_PORT: "",
     };
@@ -138,7 +145,7 @@ describe("connect-on-demand: wantConnected startup gate", () => {
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
       BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_TOKEN: "test-token",
+      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
       CLAUDE_CODE_SESSION_ID: CONNECT_SESSION_KEY,
       CLAUDE_CODE_SSE_PORT: "",
       BRIDGE_AUTOCONNECT: "1",
@@ -169,7 +176,7 @@ describe("connect-on-demand: wantConnected startup gate", () => {
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
       BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_TOKEN: "test-token",
+      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
       CLAUDE_CODE_SESSION_ID: CONNECT_SESSION_KEY,
       CLAUDE_CODE_SSE_PORT: "",
       BRIDGE_AUTOCONNECT: "1",
@@ -205,11 +212,15 @@ const SESSION_KEY_SETTLE_MS = 4_000;
 
 function startToolStub() {
   const authFrames: any[] = [];
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       if (srv.upgrade(req)) return;
       return new Response("no", { status: 400 });
     },
@@ -247,7 +258,7 @@ function connectToolEnv(dir: string, stubPort: number, sessionKey: string): Reco
     CLAUDE_PLUGIN_DATA: dir,
     BRIDGE_STATE_DIR: dir,
     BRIDGE_API_URL: `http://127.0.0.1:${stubPort}`,
-    BRIDGE_TOKEN: "test-token",
+    BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
     CLAUDE_CODE_SESSION_ID: sessionKey,
     CLAUDE_CODE_SSE_PORT: "",
   };
@@ -441,14 +452,20 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
     // HOLDER: acquires and keeps the lock for `key` via the BRIDGE_SESSION_KEY
     // override (settles immediately, unlike the loser below). Points at a
     // closed port, like session-lock.test.ts's boot() — only the lock matters
-    // here, not whether the holder itself ever authenticates.
+    // here, not whether the holder itself ever authenticates. The lock is
+    // keyed by BRIDGE_STATE_DIR alone (not by profile), so the holder gets
+    // its OWN profile with credentials seeded straight to disk (matching its
+    // own closed-port URL) — it still contends for the same lock as the
+    // loser below, which uses the shared default profile against `stub`.
+    const holderDir = join(dir, "profiles", "holder");
+    writeInstallation(holderDir, { apiUrl: "http://127.0.0.1:1", installationId: crypto.randomUUID(), installationToken: "brg_it_test" });
     const holder = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
+        BRIDGE_PROFILE: "holder",
         BRIDGE_API_URL: "http://127.0.0.1:1",
-        BRIDGE_TOKEN: "test-token",
         BRIDGE_AUTOCONNECT: "1",
         BRIDGE_SESSION_KEY: key,
         CLAUDE_CODE_SSE_PORT: "",
@@ -484,7 +501,7 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_TOKEN: "test-token",
+        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
         BRIDGE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: key,
         CLAUDE_CODE_SSE_PORT: "",
@@ -609,11 +626,15 @@ describe("connect-on-demand: Finding 2 — pre-settle connect/disconnect intent"
  */
 function startGuardStub() {
   let authFrame: any = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
         if (srv.upgrade(req)) return;
@@ -689,9 +710,18 @@ describe("connect-on-demand: REST tool guard", () => {
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
     try {
       await client.connect(transport);
-      const result = await client.callTool({ name: "list_channels", arguments: {} });
-      expect(result?.isError).not.toBe(true);
-      const text = (result?.content as any)?.[0]?.text ?? "";
+      // BRIDGE_ENROLMENT_KEY enrols asynchronously (SESSION_KEY resolution
+      // then a real token exchange), unlike the old synchronous legacy
+      // token — poll rather than assume it has landed by the first call.
+      let text = "";
+      const deadline = Date.now() + SESSION_KEY_SETTLE_MS + 5_000;
+      while (Date.now() < deadline) {
+        const result = await client.callTool({ name: "list_channels", arguments: {} });
+        expect(result?.isError).not.toBe(true);
+        text = (result?.content as any)?.[0]?.text ?? "";
+        if (!text.startsWith("Bridge not configured")) break;
+        await Bun.sleep(100);
+      }
       expect(text).toContain("not connected");
       expect(text).toContain("/bridge:connect");
     } finally {
@@ -804,10 +834,19 @@ describe("connect-on-demand: status tool", () => {
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
     try {
       await client.connect(transport);
-      const result = await client.callTool({ name: "status", arguments: {} });
-      expect(result?.isError).not.toBe(true);
-      const text = (result?.content as any)?.[0]?.text ?? "";
-      const body = JSON.parse(text);
+      // BRIDGE_ENROLMENT_KEY enrols asynchronously (SESSION_KEY resolution
+      // then a real token exchange), unlike the old synchronous legacy
+      // token — poll rather than assume it has landed by the first call.
+      let body: any = null;
+      const deadline = Date.now() + SESSION_KEY_SETTLE_MS + 5_000;
+      while (Date.now() < deadline) {
+        const result = await client.callTool({ name: "status", arguments: {} });
+        expect(result?.isError).not.toBe(true);
+        const text = (result?.content as any)?.[0]?.text ?? "";
+        body = JSON.parse(text);
+        if (body.configured) break;
+        await Bun.sleep(100);
+      }
       expect(body.configured).toBe(true);
       expect(body.wantConnected).toBe(false);
     } finally {
