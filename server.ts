@@ -1792,7 +1792,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -1833,12 +1833,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           thread_id: {
             type: "string",
             description:
-              "Thread ID to reply into. Use the thread_id from the inbound message (or from read_messages) — every message carries the id of the thread it belongs to. Omit to start a new root message.",
+              "Thread ID to reply into. Use the thread_id from the inbound message (or from read_messages) — every message carries the id of the thread it belongs to. Omit to start a new thread — but first check list_threads(channel_id, query) for an existing thread on the same topic and reply into that instead.",
           },
           title: {
             type: "string",
             description:
-              "Title for a task thread (root only; ignored on thread replies). Use with type \"task\" to name the work; omitted, the server derives one from the content.",
+              "The new thread's title (root only; ignored on thread replies) — how it is named in the channel's thread list and found by list_threads(query). Pass one whenever you start a thread; REQUIRED with type \"task\". Omitted, the server derives one from the first line.",
           },
           context_id: {
             type: "string",
@@ -1951,7 +1951,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         "Read a thread: its root message and its replies, oldest first — including replies " +
         "sent while this session was not connected. Pass the thread_id shown on any message " +
         "(inbound or from read_messages) — NOT its message_id. Pages like read_messages: pass " +
-        "the returned next_since_seq as since_seq to continue. By default it marks the thread " +
+        "the returned next_since_seq as since_seq to continue. The first page also carries the " +
+        "thread's history (events: renames, resolves, answers marked or withdrawn). By default it marks the thread " +
         "read up to the last message returned (never further); pass mark_read: false to peek.",
       inputSchema: {
         type: "object",
@@ -1984,9 +1985,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_threads",
       description:
-        "List a channel's threads, most recently active first, with each thread's reply count " +
-        "and how many of its messages you have not read. Use it to find which threads need " +
-        "attention, then read_thread(thread_id) to read (and mark read) one.",
+        "List a channel's threads, most recently active first, with each thread's kind, reply " +
+        "count and how many of its messages you have not read. Use it to find which threads need " +
+        "attention, then read_thread(thread_id) to read (and mark read) one. With `query`, it " +
+        "SEARCHES instead: the few threads whose titles are most similar (open ones first) — " +
+        "call it before starting a new thread, and continue a match rather than duplicating it.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1998,8 +2001,53 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "boolean",
             description: "Only threads with unread messages (default false).",
           },
+          query: {
+            type: "string",
+            description:
+              "Search for similar threads by title (at least 3 characters) — what the thread you are about to start would be called.",
+          },
         },
         required: ["channel_id"],
+      },
+    },
+    {
+      name: "mark_answer",
+      description:
+        "Accept a reply as the answer to a QUESTION thread (read_thread shows kind: question) — " +
+        "it resolves the thread for everyone. Marking another reply moves the answer; unmark: true " +
+        "withdraws it and reopens the question. Only the thread's creator, the channel owner or a " +
+        "workspace admin may: an answer you wrote to someone else's question is theirs to accept.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread_id: { type: "string", description: "The question's thread_id." },
+          message_id: {
+            type: "string",
+            description: "The REPLY that answers it (its message id from read_thread) — not the question itself.",
+          },
+          unmark: {
+            type: "boolean",
+            description: "true = withdraw the current answer and reopen the question (omit message_id).",
+          },
+        },
+        required: ["thread_id"],
+      },
+    },
+    {
+      name: "set_thread_kind",
+      description:
+        "Switch a thread between discussion and question (read_thread shows its kind) — e.g. " +
+        "make a discussion that turned out to be a question a question, so its answer can be " +
+        "accepted with mark_answer. A task thread stays a task. Making a question a discussion " +
+        "withdraws its accepted answer. Only the thread's creator, the channel owner or a " +
+        "workspace admin may.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread_id: { type: "string", description: "The thread_id." },
+          kind: { type: "string", enum: ["discussion", "question"], description: "The new kind." },
+        },
+        required: ["thread_id", "kind"],
       },
     },
     {
@@ -2743,6 +2791,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               )
             : {};
 
+        // RFC-015 timeline — the thread's lifecycle history (renames, resolves, answers
+        // marked or withdrawn), on the FIRST page only, like the root: it is context.
+        // Every page already carries the thread's CURRENT status and answer. A server
+        // without the route (404) simply has no history to show.
+        let events: unknown[] | undefined;
+        if (!sinceSeq && data.thread) {
+          const ev = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/events`);
+          if (ev.ok) {
+            events = (((await ev.json()) as any).events ?? []).map((e: any) => ({
+              ts: e.occurredAt,
+              by: e.actorName ?? e.actorId,
+              action: e.action,
+              ...(e.detail ? { detail: e.detail } : {}),
+            }));
+          } else if (ev.status !== 404) {
+            throw new Error(`Bridge API error ${ev.status}: ${await ev.text()}`);
+          }
+        }
+
         const channelId = data.thread?.channelId ?? data.parent?.channelId;
         // Resume from the highest seq SEEN — on a first page with no replies the
         // server echoes cursor 0, and polling from 0 would resend the root.
@@ -2763,7 +2830,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                     ? {
                         id: data.thread.id,
                         title: data.thread.title,
+                        kind: data.thread.kind,
                         status: data.thread.status,
+                        // RFC-015 D4 — which reply is the accepted answer (questions only).
+                        answer_message_id: data.thread.answerMessageId ?? null,
                         reply_count: data.thread.replyCount,
                       }
                     : { id: threadId },
@@ -2774,6 +2844,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                   ...mark,
                   hint,
                   ...(includeParent ? { root: shape(data.parent) } : {}),
+                  ...(events && events.length > 0 ? { events } : {}),
                   replies,
                 },
                 null,
@@ -2788,7 +2859,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         { const gate = requireBridge(); if (gate) return gate; }
         const channelArg = args.channel_id as string;
         // The server resolves a name or an id (as the channel view does).
-        const res = await apiFetch(`/api/threads?channel=${encodeURIComponent(channelArg)}`);
+        // RFC-015 D5 — `query` turns the list into a similar-threads SEARCH (the
+        // server ranks and caps it). Sent only when given, so a plain list is unchanged.
+        const query = typeof args.query === "string" ? args.query.trim() : "";
+        const res = await apiFetch(
+          `/api/threads?channel=${encodeURIComponent(channelArg)}${query ? `&q=${encodeURIComponent(query)}` : ""}`
+        );
         if (res.status === 404) throw new Error(`Channel ${channelArg} not found, or not visible to this agent.`);
         if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
         const data = (await res.json()) as any;
@@ -2803,6 +2879,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const all = (data.threads ?? []).map((t: any) => ({
           thread_id: t.id,
           title: t.title,
+          // RFC-015 D3 — discussion | question | task (absent from an older server).
+          ...(typeof t.kind === "string" ? { kind: t.kind } : {}),
           status: t.status,
           replies: t.replyCount ?? 0,
           // ⚠️ `unread` absent, never defaulted to 0, when the server did not say:
@@ -2812,8 +2890,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }));
         const threads = args.unread_only === true ? all.filter((t: any) => (t.unread ?? 0) > 0) : all;
         const unreadThreads = all.filter((t: any) => (t.unread ?? 0) > 0).length;
-        const hint =
-          unreadThreads > 0
+        const hint = query
+          ? threads.length > 0
+            ? `${threads.length} similar thread(s) — if one is the same topic, continue it with reply(thread_id) instead of starting a new thread.`
+            : "No similar threads — starting a new thread is fine (give it a title)."
+          : unreadThreads > 0
             ? `${unreadThreads} thread(s) with unread messages — read_thread(thread_id) reads one and marks it read.`
             : "No unread threads.";
         return {
@@ -2821,6 +2902,87 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text",
               text: JSON.stringify({ channel_id: channelId, count: threads.length, hint, threads }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "mark_answer": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const threadId = args.thread_id;
+        if (typeof threadId !== "string" || threadId === "") {
+          throw new Error("thread_id is required — the question's thread_id.");
+        }
+        const unmark = args.unmark === true;
+        const messageId = typeof args.message_id === "string" ? args.message_id : "";
+        // Refuse the ambiguous call rather than guess which was meant: one withdraws
+        // the answer (and reopens), the other sets one (and resolves).
+        if (unmark && messageId) throw new Error("Pass message_id to mark an answer, OR unmark: true to withdraw it — not both.");
+        if (!unmark && !messageId) throw new Error("message_id is required — the reply that answers the question (or unmark: true to withdraw).");
+
+        const path = `/api/threads/${encodeURIComponent(threadId)}/answer`;
+        const res = await apiFetch(
+          path,
+          unmark
+            ? { method: "DELETE" }
+            : { method: "PUT", body: JSON.stringify({ messageId }) }
+        );
+        if (!res.ok) {
+          const reason = ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error;
+          if (res.status === 403) {
+            throw new Error("Not permitted: only the thread's creator, the channel owner or a workspace admin can accept an answer.");
+          }
+          if (res.status === 404) throw new Error(`Thread ${threadId} not found, or not visible to this agent.`);
+          if (res.status === 409) throw new Error("This thread has no answer to withdraw.");
+          // 422: the server's own reason (not a question / the question itself / not a reply here).
+          throw new Error(typeof reason === "string" ? reason : `Bridge API error ${res.status}`);
+        }
+        const t = (await res.json()) as any;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { thread_id: t.threadId, status: t.status, answer_message_id: t.answerMessageId ?? null },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "set_thread_kind": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const threadId = args.thread_id;
+        if (typeof threadId !== "string" || threadId === "") throw new Error("thread_id is required.");
+        const kind = args.kind;
+        // Refused locally: the server would 422 it too, but the agent learns why here.
+        if (kind !== "discussion" && kind !== "question") {
+          throw new Error(`kind must be "discussion" or "question" (a task stays a task), got ${JSON.stringify(kind)}`);
+        }
+        const res = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/kind`, {
+          method: "PUT",
+          body: JSON.stringify({ kind }),
+        });
+        if (!res.ok) {
+          const reason = ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error;
+          if (res.status === 403) {
+            throw new Error("Not permitted: only the thread's creator, the channel owner or a workspace admin can change its kind.");
+          }
+          if (res.status === 404) throw new Error(`Thread ${threadId} not found, or not visible to this agent.`);
+          throw new Error(typeof reason === "string" ? reason : `Bridge API error ${res.status}`);
+        }
+        const t = (await res.json()) as any;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { thread_id: t.threadId, kind: t.kind, status: t.status, answer_message_id: t.answerMessageId ?? null },
+                null,
+                2
+              ),
             },
           ],
         };

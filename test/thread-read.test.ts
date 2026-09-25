@@ -46,6 +46,10 @@ type Stub = {
   calls: string[];
   /** Bodies POSTed to a `/read` route, in order. */
   readBodies: { path: string; body: any }[];
+  /** Bodies sent to `/answer`, in order. */
+  answerBodies: any[];
+  /** Bodies sent to `/kind`, in order. */
+  kindBodies: any[];
   set: (s: Partial<State>) => void;
   stop: () => void;
 };
@@ -58,13 +62,22 @@ type State = {
   threads: Row[];
   /** Server shape that predates name resolution: no `channelId` echo. */
   legacyList: boolean;
+  /** PUT/DELETE /api/threads/:id/answer — status + `{error}` on refusal. */
+  answerStatus: number;
+  answerError: string;
+  /** GET /api/threads/:id/events — the timeline; `eventsStatus` 404 models an older server. */
+  events: Row[];
+  eventsStatus: number;
 };
 
 function startStub(): Stub {
   let socket: any = null;
   const calls: string[] = [];
   const readBodies: { path: string; body: any }[] = [];
-  let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false };
+  const answerBodies: any[] = [];
+  const kindBodies: any[] = [];
+  let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false, answerStatus: 200, answerError: "", events: [], eventsStatus: 200 };
+  let answer: string | null = null; // the thread's accepted answer
   let cursor = 0; // the stored thread read position
   const agentAuth = createAgentAuthRoutes();
   agentAuth.addEnrolmentKey(ENROLMENT_KEY);
@@ -93,6 +106,30 @@ function startStub(): Stub {
         if (st.legacyList) return Response.json({ threads: known ? st.threads : [] });
         return Response.json({ channelId: known ? CHANNEL_ID : null, threads: known ? st.threads : [] });
       }
+      const k = url.pathname.match(/^\/api\/threads\/([^/]+)\/kind$/);
+      if (k && req.method === "PUT") {
+        const body: any = await req.json().catch(() => null);
+        kindBodies.push(body);
+        if (st.answerStatus !== 200) return Response.json({ error: st.answerError }, { status: st.answerStatus });
+        return Response.json({ threadId: k[1], channelId: CHANNEL_ID, kind: body.kind, status: "open", answerMessageId: null });
+      }
+      const ev = url.pathname.match(/^\/api\/threads\/([^/]+)\/events$/);
+      if (ev && req.method === "GET") {
+        if (st.eventsStatus !== 200) return new Response("no", { status: st.eventsStatus });
+        return Response.json({ events: st.events });
+      }
+      // Models threads.ts PUT/DELETE /:id/answer (RFC-015 D4): mark resolves, unmark reopens.
+      const a = url.pathname.match(/^\/api\/threads\/([^/]+)\/answer$/);
+      if (a && (req.method === "PUT" || req.method === "DELETE")) {
+        const body: any = req.method === "PUT" ? await req.json().catch(() => null) : null;
+        answerBodies.push(body);
+        if (st.answerStatus !== 200) return Response.json({ error: st.answerError }, { status: st.answerStatus });
+        answer = req.method === "PUT" ? body.messageId : null;
+        return Response.json({
+          threadId: a[1], channelId: CHANNEL_ID, kind: "question",
+          status: answer ? "resolved" : "open", resolvedReason: answer ? "done" : null, answerMessageId: answer,
+        });
+      }
       const m = url.pathname.match(/^\/api\/threads\/([^/]+)\/(messages|read)$/);
       if (m && m[2] === "read" && req.method === "POST") {
         return req.json().catch(() => null).then((body: any) => {
@@ -120,7 +157,10 @@ function startStub(): Stub {
         const last = page[page.length - 1];
         const body: any = { parent: st.root, replies: page };
         if (!st.legacy) {
-          body.thread = { id: THREAD, channelId: CHANNEL_ID, title: "Bug: threaded replies", status: "open", replyCount: st.replies.length };
+          body.thread = {
+            id: THREAD, channelId: CHANNEL_ID, title: "Bug: threaded replies", kind: "question",
+            status: answer ? "resolved" : "open", answerMessageId: answer, replyCount: st.replies.length,
+          };
           body.hasMore = after.length > limit;
           body.nextSinceSeq = last ? last.seq : Number(since ?? 0);
         }
@@ -149,6 +189,8 @@ function startStub(): Stub {
     connected: () => socket !== null,
     calls,
     readBodies,
+    answerBodies,
+    kindBodies,
     set: (s) => { st = { ...st, ...s }; },
     stop: () => server.stop(true),
   };
@@ -313,6 +355,97 @@ describe("read_thread / list_threads", () => {
     expect(r.text).toContain("a message_id is not a thread_id");
   });
 
+  test("mark_answer PUTs the reply; read_thread then shows kind + the answer; unmark DELETEs (RFC-015 D4)", async () => {
+    const reply = String(msg(14, "r2").id);
+    const marked = await ok("mark_answer", { thread_id: THREAD, message_id: reply });
+    expect(marked).toEqual({ thread_id: THREAD, status: "resolved", answer_message_id: reply });
+    expect(stub.calls).toContain(`PUT /api/threads/${THREAD}/answer`);
+    expect(stub.answerBodies).toEqual([{ messageId: reply }]);
+
+    const read = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(read.thread).toMatchObject({ kind: "question", status: "resolved", answer_message_id: reply });
+
+    const unmarked = await ok("mark_answer", { thread_id: THREAD, unmark: true });
+    expect(unmarked).toEqual({ thread_id: THREAD, status: "open", answer_message_id: null });
+    expect(stub.calls).toContain(`DELETE /api/threads/${THREAD}/answer`);
+  });
+
+  test("read_thread's FIRST page carries the thread's history; a later page does not re-send it", async () => {
+    stub.set({
+      events: [
+        { id: "e1", action: "answer", detail: { messageId: "m1", from: null }, actorId: "u1", actorType: "human", actorName: "Jörgen", occurredAt: "2026-09-25T10:00:00.000Z" },
+        { id: "e2", action: "reopen", detail: null, actorId: "u2", actorType: "agent", actorName: null, occurredAt: "2026-09-25T10:05:00.000Z" },
+      ],
+    });
+    const first = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(first.events).toEqual([
+      { ts: "2026-09-25T10:00:00.000Z", by: "Jörgen", action: "answer", detail: { messageId: "m1", from: null } },
+      { ts: "2026-09-25T10:05:00.000Z", by: "u2", action: "reopen" },
+    ]);
+    const later = await ok("read_thread", { thread_id: THREAD, since_seq: 13, mark_read: false });
+    expect(later.events).toBeUndefined();
+    expect(stub.calls.filter((c) => c.endsWith("/events"))).toHaveLength(1);
+  });
+
+  test("read_thread against a server without the timeline (404) still reads, with no events", async () => {
+    stub.set({ eventsStatus: 404, events: [] });
+    const body = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(body.events).toBeUndefined();
+    expect(body.replies).toHaveLength(3);
+    stub.set({ eventsStatus: 500 });
+    const r = await callTool("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(r.isError).toBe(true);
+  });
+
+  test("set_thread_kind PUTs the kind and reports the result (RFC-015 slice 5)", async () => {
+    const r = await ok("set_thread_kind", { thread_id: THREAD, kind: "question" });
+    expect(r).toEqual({ thread_id: THREAD, kind: "question", status: "open", answer_message_id: null });
+    expect(stub.calls).toContain(`PUT /api/threads/${THREAD}/kind`);
+    expect(stub.kindBodies).toEqual([{ kind: "question" }]);
+  });
+
+  test("set_thread_kind refuses task/unknown locally, and explains 403 and the server's 422", async () => {
+    const task = await callTool("set_thread_kind", { thread_id: THREAD, kind: "task" });
+    expect(task.isError).toBe(true);
+    expect(task.text).toContain("a task stays a task");
+    expect(stub.kindBodies).toEqual([]);
+
+    stub.set({ answerStatus: 403, answerError: "Forbidden" });
+    const r403 = await callTool("set_thread_kind", { thread_id: THREAD, kind: "question" });
+    expect(r403.text).toContain("only the thread's creator, the channel owner or a workspace admin");
+
+    stub.set({ answerStatus: 422, answerError: "A task thread's kind cannot be changed" });
+    const r422 = await callTool("set_thread_kind", { thread_id: THREAD, kind: "discussion" });
+    expect(r422.isError).toBe(true);
+    expect(r422.text).toContain("A task thread's kind cannot be changed");
+  });
+
+  test("mark_answer refuses an ambiguous or empty call locally — nothing is sent", async () => {
+    const both = await callTool("mark_answer", { thread_id: THREAD, message_id: "x", unmark: true });
+    expect(both.isError).toBe(true);
+    expect(both.text).toContain("not both");
+    const neither = await callTool("mark_answer", { thread_id: THREAD });
+    expect(neither.isError).toBe(true);
+    expect(neither.text).toContain("message_id is required");
+    expect(stub.answerBodies).toEqual([]);
+  });
+
+  test("mark_answer explains a refusal: 403 standing, 409 nothing to withdraw, 422 the server's reason", async () => {
+    stub.set({ answerStatus: 403, answerError: "Forbidden" });
+    const r403 = await callTool("mark_answer", { thread_id: THREAD, message_id: "m" });
+    expect(r403.isError).toBe(true);
+    expect(r403.text).toContain("only the thread's creator, the channel owner or a workspace admin");
+
+    stub.set({ answerStatus: 409, answerError: "Thread has no answer" });
+    const r409 = await callTool("mark_answer", { thread_id: THREAD, unmark: true });
+    expect(r409.text).toContain("no answer to withdraw");
+
+    stub.set({ answerStatus: 422, answerError: "Only a question thread has an answer" });
+    const r422 = await callTool("mark_answer", { thread_id: THREAD, message_id: "m" });
+    expect(r422.isError).toBe(true);
+    expect(r422.text).toContain("Only a question thread has an answer");
+  });
+
   test("a masked or missing thread (404) is an error naming the id", async () => {
     stub.set({ threadStatus: 404 });
     const r = await callTool("read_thread", { thread_id: THREAD });
@@ -344,6 +477,31 @@ describe("read_thread / list_threads", () => {
 
     const unreadOnly = await ok("list_threads", { channel_id: CHANNEL_NAME, unread_only: true });
     expect(unreadOnly.threads.map((t: any) => t.thread_id)).toEqual([THREAD]);
+  });
+
+  test("list_threads(query) SEARCHES: sends q, reports kind, and says continue-don't-duplicate (RFC-015 D5)", async () => {
+    stub.set({
+      threads: [
+        { id: THREAD, title: "Picker double-fetch on workspace switch", kind: "question", status: "open", replyCount: 2, unreadCount: 0, lastActivityAt: "x" },
+      ],
+    });
+    const body = await ok("list_threads", { channel_id: CHANNEL_NAME, query: "  picker double fetch & more " });
+    // Trimmed and URL-encoded (a title can hold &, #, ?).
+    expect(stub.calls).toContain(`GET /api/threads?channel=${CHANNEL_NAME}&q=picker%20double%20fetch%20%26%20more`);
+    expect(body.threads[0]).toMatchObject({ thread_id: THREAD, kind: "question" });
+    expect(body.hint).toContain("1 similar thread(s)");
+    expect(body.hint).toContain("reply(thread_id)");
+
+    stub.set({ threads: [] });
+    const none = await ok("list_threads", { channel_id: CHANNEL_NAME, query: "nightly deploy" });
+    expect(none.hint).toContain("No similar threads");
+  });
+
+  test("list_threads WITHOUT a query sends no q (the plain list is unchanged)", async () => {
+    stub.set({ threads: [] });
+    await ok("list_threads", { channel_id: CHANNEL_NAME });
+    expect(stub.calls).toContain(`GET /api/threads?channel=${CHANNEL_NAME}`);
+    expect(stub.calls.some((c) => c.includes("&q="))).toBe(false);
   });
 
   test("an unknown channel is an error, never a false 'No unread threads.'", async () => {
