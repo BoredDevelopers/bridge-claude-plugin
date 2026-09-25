@@ -48,6 +48,8 @@ type Stub = {
   readBodies: { path: string; body: any }[];
   /** Bodies sent to `/answer`, in order. */
   answerBodies: any[];
+  /** Bodies sent to `/kind`, in order. */
+  kindBodies: any[];
   set: (s: Partial<State>) => void;
   stop: () => void;
 };
@@ -73,6 +75,7 @@ function startStub(): Stub {
   const calls: string[] = [];
   const readBodies: { path: string; body: any }[] = [];
   const answerBodies: any[] = [];
+  const kindBodies: any[] = [];
   let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false, answerStatus: 200, answerError: "", events: [], eventsStatus: 200 };
   let answer: string | null = null; // the thread's accepted answer
   let cursor = 0; // the stored thread read position
@@ -102,6 +105,13 @@ function startStub(): Stub {
         const known = c === CHANNEL_ID || c === CHANNEL_NAME;
         if (st.legacyList) return Response.json({ threads: known ? st.threads : [] });
         return Response.json({ channelId: known ? CHANNEL_ID : null, threads: known ? st.threads : [] });
+      }
+      const k = url.pathname.match(/^\/api\/threads\/([^/]+)\/kind$/);
+      if (k && req.method === "PUT") {
+        const body: any = await req.json().catch(() => null);
+        kindBodies.push(body);
+        if (st.answerStatus !== 200) return Response.json({ error: st.answerError }, { status: st.answerStatus });
+        return Response.json({ threadId: k[1], channelId: CHANNEL_ID, kind: body.kind, status: "open", answerMessageId: null });
       }
       const ev = url.pathname.match(/^\/api\/threads\/([^/]+)\/events$/);
       if (ev && req.method === "GET") {
@@ -180,6 +190,7 @@ function startStub(): Stub {
     calls,
     readBodies,
     answerBodies,
+    kindBodies,
     set: (s) => { st = { ...st, ...s }; },
     stop: () => server.stop(true),
   };
@@ -384,6 +395,29 @@ describe("read_thread / list_threads", () => {
     stub.set({ eventsStatus: 500 });
     const r = await callTool("read_thread", { thread_id: THREAD, mark_read: false });
     expect(r.isError).toBe(true);
+  });
+
+  test("set_thread_kind PUTs the kind and reports the result (RFC-015 slice 5)", async () => {
+    const r = await ok("set_thread_kind", { thread_id: THREAD, kind: "question" });
+    expect(r).toEqual({ thread_id: THREAD, kind: "question", status: "open", answer_message_id: null });
+    expect(stub.calls).toContain(`PUT /api/threads/${THREAD}/kind`);
+    expect(stub.kindBodies).toEqual([{ kind: "question" }]);
+  });
+
+  test("set_thread_kind refuses task/unknown locally, and explains 403 and the server's 422", async () => {
+    const task = await callTool("set_thread_kind", { thread_id: THREAD, kind: "task" });
+    expect(task.isError).toBe(true);
+    expect(task.text).toContain("a task stays a task");
+    expect(stub.kindBodies).toEqual([]);
+
+    stub.set({ answerStatus: 403, answerError: "Forbidden" });
+    const r403 = await callTool("set_thread_kind", { thread_id: THREAD, kind: "question" });
+    expect(r403.text).toContain("only the thread's creator, the channel owner or a workspace admin");
+
+    stub.set({ answerStatus: 422, answerError: "A task thread's kind cannot be changed" });
+    const r422 = await callTool("set_thread_kind", { thread_id: THREAD, kind: "discussion" });
+    expect(r422.isError).toBe(true);
+    expect(r422.text).toContain("A task thread's kind cannot be changed");
   });
 
   test("mark_answer refuses an ambiguous or empty call locally — nothing is sent", async () => {

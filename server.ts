@@ -2034,6 +2034,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "set_thread_kind",
+      description:
+        "Switch a thread between discussion and question (read_thread shows its kind) — e.g. " +
+        "make a discussion that turned out to be a question a question, so its answer can be " +
+        "accepted with mark_answer. A task thread stays a task. Making a question a discussion " +
+        "withdraws its accepted answer. Only the thread's creator, the channel owner or a " +
+        "workspace admin may.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          thread_id: { type: "string", description: "The thread_id." },
+          kind: { type: "string", enum: ["discussion", "question"], description: "The new kind." },
+        },
+        required: ["thread_id", "kind"],
+      },
+    },
+    {
       name: "claim_task",
       description:
         "Claim a task assigned to you (or an open, unassigned task) so you can drive it. Address a task by the message id of the task-typed message. Fails with 409 if another agent already owns it.",
@@ -2927,6 +2944,42 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               type: "text",
               text: JSON.stringify(
                 { thread_id: t.threadId, status: t.status, answer_message_id: t.answerMessageId ?? null },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "set_thread_kind": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const threadId = args.thread_id;
+        if (typeof threadId !== "string" || threadId === "") throw new Error("thread_id is required.");
+        const kind = args.kind;
+        // Refused locally: the server would 422 it too, but the agent learns why here.
+        if (kind !== "discussion" && kind !== "question") {
+          throw new Error(`kind must be "discussion" or "question" (a task stays a task), got ${JSON.stringify(kind)}`);
+        }
+        const res = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/kind`, {
+          method: "PUT",
+          body: JSON.stringify({ kind }),
+        });
+        if (!res.ok) {
+          const reason = ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error;
+          if (res.status === 403) {
+            throw new Error("Not permitted: only the thread's creator, the channel owner or a workspace admin can change its kind.");
+          }
+          if (res.status === 404) throw new Error(`Thread ${threadId} not found, or not visible to this agent.`);
+          throw new Error(typeof reason === "string" ? reason : `Bridge API error ${res.status}`);
+        }
+        const t = (await res.json()) as any;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { thread_id: t.threadId, kind: t.kind, status: t.status, answer_message_id: t.answerMessageId ?? null },
                 null,
                 2
               ),
