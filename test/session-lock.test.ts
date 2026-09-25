@@ -31,12 +31,21 @@ import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { writeInstallation } from "../auth/store";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
 const SESSION_ID = "aaaaaaaa-1111-2222-3333-444444444444";
+// Every test here points at a closed port — the lock mechanism is what's under
+// test, not a real connection. `configError()` just needs a credential ON DISK
+// (source() only reads it, never dials out) to let `connectUnlessDuplicate()`
+// past the startup gate at all — no live agent-auth server needed.
+const CLOSED_PORT_API_URL = "http://127.0.0.1:1";
 
 let dir = "";
 const lockFile = () => join(dir, "locks", `${SESSION_ID}.lock`);
+function seedCredentials(d: string): void {
+  writeInstallation(d, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), installationToken: "brg_it_test" });
+}
 
 function procStart(pid: number): string {
   const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
@@ -69,8 +78,8 @@ async function boot(waitMs = 9000): Promise<{ err: string; declined: boolean; co
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: "http://127.0.0.1:1",
-      BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+      BRIDGE_API_URL: CLOSED_PORT_API_URL,
+      BRIDGE_AUTOCONNECT: "1",
       BRIDGE_SESSION_KEY: SESSION_ID,
       CLAUDE_CODE_SSE_PORT: "",
     } as Record<string, string>,
@@ -99,7 +108,7 @@ async function boot(waitMs = 9000): Promise<{ err: string; declined: boolean; co
 }
 
 describe("single instance per session key", () => {
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "lock-")); });
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "lock-")); seedCredentials(dir); });
   afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
 
   test("a lone instance connects and holds the lock", async () => {
@@ -183,7 +192,7 @@ describe("single instance per session key", () => {
         ...process.env,
         PATH: `${shimBin}:${process.env.PATH}`, // `ps` resolves to the failing shim
         CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t", BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
         BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -227,7 +236,7 @@ describe("single instance per session key", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t", BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
         BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -254,7 +263,7 @@ describe("single instance per session key", () => {
         env: {
           ...process.env,
           CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: "http://127.0.0.1:1", BRIDGE_TOKEN: "t", BRIDGE_AUTOCONNECT: "1",
+          BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
           BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",

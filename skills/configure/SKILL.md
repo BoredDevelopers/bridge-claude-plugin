@@ -1,6 +1,6 @@
 ---
 name: configure
-description: Set up the Bridge channel — save the API URL (then sign in with /bridge:login). Use when the user wants to configure Bridge, pastes a Bridge URL or legacy token, or asks about channel setup.
+description: Set up the Bridge channel — save the API URL (then sign in with /bridge:login). Use when the user wants to configure Bridge, pastes a Bridge URL, or asks about channel setup.
 user-invocable: true
 allowed-tools:
   - Read
@@ -13,7 +13,8 @@ allowed-tools:
 
 Writes the Bridge API URL to `~/.claude/channels/bridge/.env` and orients the
 user on the current state. The machine then signs in with `/bridge:login` — no
-token is pasted anywhere. (`<url> <token>` still saves a legacy static token.)
+token is pasted anywhere. Static tokens are retired; the server no longer
+accepts them.
 
 Arguments passed: `$ARGUMENTS`
 
@@ -29,7 +30,8 @@ Read both config values and give the user the full picture:
    Show set/not-set.
 
 2. **Sign-in** — call the `status` MCP tool and show its `auth` block
-   (profile, credential `installation` / `legacy` / `none`, installation name).
+   (profile, credential `installation` / `none`, installation name). If it
+   carries a `hint` (BRIDGE_TOKEN set but no credential), show that too.
 
 3. **Channel filter** — check `BRIDGE_CHANNELS`. Show the filter or "all
    channels" if empty.
@@ -37,8 +39,8 @@ Read both config values and give the user the full picture:
 4. **What next** — based on state:
    - No URL → *"Run `/bridge:configure <url>` to set up Bridge."*
    - URL set, credential `none` → *"Run `/bridge:login` to sign this machine in."*
-   - credential `legacy` → *"Works, but run `/bridge:login` to switch to a
-     per-machine sign-in (the static token is being retired)."*
+   - URL set, credential `none`, hint present → *"BRIDGE_TOKEN is no longer
+     supported — run `/bridge:login` instead."*
    - credential `installation` → *"Ready. Run `/bridge:connect` to join Bridge in
      this session (or use `claudeb`, which auto-connects)."*
 
@@ -50,15 +52,6 @@ Read both config values and give the user the full picture:
 3. `chmod 600 ~/.claude/channels/bridge/.env`.
 4. Confirm, then tell the user to restart the session (or `/reload-plugins`) and
    run `/bridge:login`.
-
-### `<url> <token>` — save both (legacy static token)
-
-1. Parse `$ARGUMENTS`: first arg is URL (starts with http), second is token.
-2. `mkdir -p ~/.claude/channels/bridge`
-3. Read existing `.env` if present; update/add `BRIDGE_API_URL=` and
-   `BRIDGE_TOKEN=` lines, preserve other keys (`BRIDGE_CHANNELS` etc).
-4. `chmod 600 ~/.claude/channels/bridge/.env` — token is a credential.
-5. Confirm, then show the status view.
 
 ### `channels <list>` — set channel filter
 
@@ -74,7 +67,9 @@ list, so a narrow filter cannot cost a message meant for it.
 
 ### `clear` — remove credentials
 
-Delete `BRIDGE_API_URL=` and `BRIDGE_TOKEN=` lines from `.env`.
+Delete `BRIDGE_API_URL=` and `BRIDGE_TOKEN=` lines from `.env` (a leftover
+`BRIDGE_TOKEN=` line is dead — the server no longer accepts it — but clear it
+anyway so it stops showing up in the sign-in hint).
 
 ---
 

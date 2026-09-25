@@ -2,16 +2,25 @@ import { describe, test, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createAgentAuthRoutes } from "./agent-auth-routes";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
+const ENROLMENT_KEY = "brg_ek_test";
 
 function startStub() {
   let authFrame: any = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) { if (srv.upgrade(req)) return; return new Response("no", { status: 400 }); },
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
+      if (srv.upgrade(req)) return;
+      return new Response("no", { status: 400 });
+    },
     websocket: {
       message(ws, raw) {
         let frame: any = {};
@@ -38,7 +47,7 @@ async function authFrameWith(label: string): Promise<any> {
       CLAUDE_PLUGIN_DATA: dir,
       BRIDGE_STATE_DIR: dir,
       BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
       CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
       CLAUDE_CODE_SSE_PORT: "",
       BRIDGE_SESSION_LABEL: label,

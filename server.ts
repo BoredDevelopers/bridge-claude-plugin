@@ -11,8 +11,9 @@
  *   BRIDGE_CHANNELS=general,dev (optional, empty = all)
  * Credentials come from /bridge:login (RFC-014): a per-machine installation in
  * <state>/credentials.json (or <state>/profiles/<BRIDGE_PROFILE>/), and a
- * rotating session grant per Claude session. BRIDGE_TOKEN (the legacy static
- * token) still works for the default profile until the cutover.
+ * rotating session grant per Claude session. The static BRIDGE_TOKEN is
+ * retired — the server rejects it, so a leftover one is worth nothing but is
+ * still surfaced as a hint (see CredentialManager.staleStaticTokenPresent).
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -343,11 +344,13 @@ let SESSION_KEY: string = FALLBACK_SESSION_KEY;
 
 // ── Credentials (RFC-014) ───────────────────────────────────────────────────
 // The bearer for this session: an access token from its own session grant under
-// the profile's installation, or the legacy BRIDGE_TOKEN. See auth/manager.ts.
+// the profile's installation. See auth/manager.ts.
 const creds = new CredentialManager({
   profile: PROFILE,
   envApiUrl: ENV_API_URL,
-  legacyToken: process.env.BRIDGE_TOKEN ?? "",
+  // Presence only — never the value. Powers a "that's retired" hint when
+  // there is no real credential; the token itself is never read or sent.
+  staleStaticTokenPresent: !!process.env.BRIDGE_TOKEN,
   enrolmentKey: process.env.BRIDGE_ENROLMENT_KEY ?? "",
   sessionKey: () => SESSION_KEY,
   sessionKeyReady: () => sessionKeyReady ?? Promise.resolve(),

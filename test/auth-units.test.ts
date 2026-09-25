@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pollDevice } from "../auth/device";
 import { isHeadless } from "../auth/browser";
 import { withProfileLock } from "../auth/lock";
-import type { AuthMetadata } from "../auth/oauth";
+import { assertSameAuthority, type AuthMetadata } from "../auth/oauth";
 import { writeSession, sessionFileFor, sweepSessions } from "../auth/store";
 
 function tokenServer(answers: string[]) {
@@ -195,5 +195,32 @@ describe("session file sweep", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("discovery authority (RFC 8414 §3.3)", () => {
+  const api = "https://bridge-api.example.test";
+  const meta = (over: Partial<AuthMetadata> = {}): AuthMetadata => ({
+    issuer: `${api}/api/agent-auth`,
+    authorization_endpoint: `${api}/api/agent-auth/authorize`,
+    device_authorization_endpoint: `${api}/api/agent-auth/device_authorization`,
+    token_endpoint: `${api}/api/agent-auth/token`,
+    revocation_endpoint: `${api}/api/agent-auth/revoke`,
+    bridge_connect_done_uri: "https://bridge-web.example.test/connect/done",
+    ...over,
+  });
+
+  test("the API's own document is accepted (a trailing slash on the URL too; the web done-URI may differ)", () => {
+    expect(() => assertSameAuthority(api, meta())).not.toThrow();
+    expect(() => assertSameAuthority(`${api}/`, meta())).not.toThrow();
+  });
+
+  test("a different issuer is refused", () => {
+    expect(() => assertSameAuthority(api, meta({ issuer: "https://evil.example.test/api/agent-auth" }))).toThrow(/issuer/);
+  });
+
+  test("a credential endpoint on another origin is refused, even with the right issuer", () => {
+    expect(() => assertSameAuthority(api, meta({ token_endpoint: "https://evil.example.test/token" }))).toThrow(/token_endpoint/);
+    expect(() => assertSameAuthority(api, meta({ revocation_endpoint: "http://bridge-api.example.test/revoke" }))).toThrow(/revocation_endpoint/);
   });
 });

@@ -22,9 +22,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { createAgentAuthRoutes } from "./agent-auth-routes";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
 const SESSION_KEY = "11111111-2222-3333-4444-555555555555";
+const ENROLMENT_KEY = "brg_ek_test";
 
 function labelFilePath(dir: string, key: string): string {
   return join(dir, `.session-label-${key}`);
@@ -34,11 +36,15 @@ function labelFilePath(dir: string, key: string): string {
 
 function startStub() {
   let authFrame: any = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       if (srv.upgrade(req)) return;
       return new Response("no", { status: 400 });
     },
@@ -79,7 +85,7 @@ async function authFrameWithStore(opts: {
     CLAUDE_PLUGIN_DATA: dir,
     BRIDGE_STATE_DIR: dir,
     BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-    BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+    BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
     CLAUDE_CODE_SESSION_ID: SESSION_KEY,
     CLAUDE_CODE_SSE_PORT: "",
   };
@@ -140,11 +146,15 @@ function startLabelStub() {
   // force a reconnect deterministically by closing the transport out from
   // under the client, rather than waiting on the 90s liveness timeout.
   let liveWs: any = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
     async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       const url = new URL(req.url);
       if (req.method === "PUT" && /^\/api\/agents\/[^/]+\/contexts\/[^/]+\/label$/.test(url.pathname)) {
         let body: any = {};
@@ -211,7 +221,7 @@ describe("set_session_label tool (best effort — stdio round trip)", () => {
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: SESSION_KEY,
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
@@ -275,7 +285,7 @@ describe("set_session_label persists across reconnect (regression: no double-suf
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: SESSION_KEY,
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,

@@ -32,6 +32,33 @@ export class OAuthError extends Error {
   }
 }
 
+/**
+ * RFC 8414 §3.3: the metadata's `issuer` MUST equal the issuer the discovery URL was
+ * built from, or the document is not used. We also pin every endpoint the plugin will
+ * send a credential to (token, revocation, authorize, device) to the API's own origin —
+ * a wrong or tampered discovery answer must never route an installation or refresh
+ * token to another host. (`bridge_connect_done_uri` is the WEB origin by design and
+ * carries no credential.)
+ */
+export function assertSameAuthority(apiUrl: string, m: AuthMetadata): void {
+  const base = apiUrl.replace(/\/+$/, "");
+  const origin = new URL(base).origin;
+  if (m.issuer !== `${base}/api/agent-auth`) {
+    throw new Error(`Bridge agent-auth discovery issuer ${JSON.stringify(m.issuer)} does not match ${base} — refusing it`);
+  }
+  for (const k of ["token_endpoint", "revocation_endpoint", "authorization_endpoint", "device_authorization_endpoint"] as const) {
+    const v = m[k];
+    if (v === undefined) continue;
+    let o: string;
+    try {
+      o = new URL(v).origin;
+    } catch {
+      throw new Error(`Bridge agent-auth discovery ${k} is not a URL — refusing it`);
+    }
+    if (o !== origin) throw new Error(`Bridge agent-auth discovery ${k} points at ${o}, not ${origin} — refusing it`);
+  }
+}
+
 const metadataCache = new Map<string, Promise<AuthMetadata>>();
 
 /** RFC 8414 discovery; cached per API URL for the process (a failure is not cached). */
@@ -45,6 +72,7 @@ export function discover(apiUrl: string): Promise<AuthMetadata> {
       if (!res.ok) throw new Error(`Bridge agent-auth discovery failed (${res.status}) — is ${apiUrl} a Bridge API?`);
       const m = (await res.json()) as AuthMetadata;
       if (!m.token_endpoint || !m.issuer) throw new Error("Bridge agent-auth discovery returned no token endpoint");
+      assertSameAuthority(apiUrl, m);
       return m;
     })();
     metadataCache.set(apiUrl, p);

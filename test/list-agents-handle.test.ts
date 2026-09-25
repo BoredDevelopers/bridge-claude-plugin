@@ -18,8 +18,10 @@ import { test, expect, describe, beforeAll, beforeEach, afterAll } from "bun:tes
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createAgentAuthRoutes } from "./agent-auth-routes";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
+const ENROLMENT_KEY = "brg_ek_test";
 
 type Row = Record<string, unknown>;
 
@@ -33,12 +35,16 @@ type Stub = {
 function startStub(): Stub {
   let socket: any = null;
   let agents: Row[] = [];
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
 
   const server = Bun.serve({
     port: 0,
     // 127.0.0.1, never the wildcard default — see stub-loopback-bind.test.ts.
     hostname: "127.0.0.1",
-    fetch(req, srv) {
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
       const url = new URL(req.url);
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
         if (srv.upgrade(req)) return;
@@ -98,7 +104,7 @@ describe("list_agents surfaces the per-tenant handle", () => {
         CLAUDE_PLUGIN_DATA: dir,
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-666666666666",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
