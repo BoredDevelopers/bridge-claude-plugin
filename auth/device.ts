@@ -30,7 +30,11 @@ export async function pollDevice(
     opts.sleep ??
     ((ms: number) =>
       new Promise<void>((r) => {
-        const done = () => (clearTimeout(t), r());
+        const done = () => {
+          clearTimeout(t);
+          opts.signal?.removeEventListener("abort", done); // one listener per wait, never accumulated
+          r();
+        };
         const t = setTimeout(done, ms);
         opts.signal?.addEventListener("abort", done, { once: true });
       }));

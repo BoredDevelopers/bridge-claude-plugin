@@ -156,12 +156,17 @@ export class CredentialManager {
   /**
    * A stop-class refusal (§3.3 — retrying will not fix it: clock, corrupt_state,
    * update_required, an unlisted refusal such as attempt_invalid, session_limit, a
-   * server too old, an incomplete sign-in). While set, nothing mints — not the ticker,
-   * not an on-demand use; only the person acting clears it (/bridge:connect →
-   * requestSessionReconnect, a login, an enrolment, a logout). server.ts reads it
-   * through stopReason() (its awaiting-credentials watch must not re-mint either).
+   * server too old, an incomplete sign-in) and the installation it was about. While it
+   * stands, nothing mints — not the ticker, not an on-demand use. It is cleared by the
+   * person acting in THIS process (/bridge:connect → requestSessionReconnect, a login, an
+   * enrolment, a logout) — or by a different installation on disk (a /bridge:login in
+   * ANOTHER session: the refusal was about the old one). stopReason() exposes it; its
+   * intended consumer is server.ts's awaiting-credentials watch (Task 8 W5), which must
+   * not re-mint into the same refusal either.
    */
-  private stopped: CredentialError | null = null;
+  private stopped: { err: CredentialError; installationId: string | null } | null = null;
+  /** The installation the current / last mint read from disk (under the lock). */
+  private mintingFor: string | null = null;
   /** A token was dropped (a 401 / 4001 / 4009): the next mint must reach the live socket too (`reauth`). */
   private rotateOnNextMint = false;
   /** The session of the last mint — kept when the token is dropped, so a 4008 can be matched to it. */
@@ -324,12 +329,16 @@ export class CredentialManager {
 
   /** The stop-class refusal that halted minting, or null (see `stopped`). */
   stopReason(): CredentialError | null {
-    return this.stopped;
+    return this.stopped?.err ?? null;
   }
 
   /** Mint now. Single-flight across callers in this process. */
   renew(reason: string): Promise<Access> {
-    if (this.stopped) return Promise.reject(this.stopped);
+    if (this.stopped) {
+      // Stale when the profile now holds another installation (logged in elsewhere).
+      if ((this.installation()?.installationId ?? null) !== this.stopped.installationId) this.stopped = null;
+      else return Promise.reject(this.stopped.err);
+    }
     if (!this.inflight) {
       // A live socket rides the current token — or the one just dropped by a 401: either
       // way it must get the new one in-band.
@@ -363,7 +372,9 @@ export class CredentialManager {
       // Everything that is not a known terminal state is retryable: discovery 5xx
       // during a deploy, the lock wait cap, a timeout, a failed state write.
       const err = this.networkError(e);
-      if (err instanceof CredentialError && (err.kind === "refused" || err.kind === "session_limit")) this.stopped = err;
+      if (err instanceof CredentialError && (err.kind === "refused" || err.kind === "session_limit")) {
+        this.stopped = { err, installationId: this.mintingFor };
+      }
       throw err;
     }
   }
@@ -381,6 +392,7 @@ export class CredentialManager {
   private async mintInside(dir: string, reason: string, signal: AbortSignal): Promise<Access> {
     // ⚠️ From disk, HERE — under the lock. Never earlier, never from memory.
     const inst = store.readInstallation(dir);
+    this.mintingFor = inst?.installationId ?? null;
     if (!inst) throw new CredentialError("logged_out", "signed out of Bridge — run /bridge:login");
     const jwk = store.readKey(dir);
     const state = store.readState(dir);
@@ -512,13 +524,13 @@ export class CredentialManager {
    */
   private armTicker(): void {
     if (this.ticker) return;
-    // Due = a token, no mint in flight, past its refresh point. RE-CHECKED when a late
-    // tick's random delay ends: every tick inside that delay schedules a `go` too, and
-    // only the first may mint — the rest find a fresh token (or one in flight). A stop
-    // (stopped) is enforced by renew() itself, for the ticker and every other caller.
+    // Due = a token, no mint in flight, no stop, past its refresh point. RE-CHECKED when a
+    // late tick's random delay ends: every tick inside that delay schedules a `go` too,
+    // and only the first may mint — the rest find a fresh token (or one in flight). While
+    // stopped the ticker does not even call renew() (which would refuse — and log — each tick).
     const due = () => {
       const a = this.access;
-      return a !== null && !this.inflight && this.now() >= a.refreshAt;
+      return a !== null && !this.inflight && !this.stopped && this.now() >= a.refreshAt;
     };
     const go = () => {
       if (!due()) return;
@@ -1009,6 +1021,8 @@ export class CredentialManager {
       this.d.log("bridge auth: signed out with /bridge:logout — not re-enrolling from BRIDGE_ENROLMENT_KEY (run /bridge:login)");
       return;
     }
+    // Set when Bridge DID enrol but the files could not be written: not a key problem.
+    let saveFailure: string | null = null;
     try {
       await withInstallationLock(
         p.dir,
@@ -1034,7 +1048,7 @@ export class CredentialManager {
           } catch (e) {
             // Enrolled in Bridge, but unusable here: revoke it rather than leave it live.
             const left = await this.abandonEnrolment(p.dir, meta, key.signer, g, signal);
-            throw new Error(`its sign-in could not be saved on this machine (${errDetail(e)})${stillEnrolled(left)}`);
+            saveFailure = `its sign-in could not be saved on this machine (${errDetail(e)})${stillEnrolled(left)}`;
           }
           this.d.log(`bridge auth: enrolled installation ${g.installation_id} with BRIDGE_ENROLMENT_KEY`);
         },
@@ -1043,6 +1057,12 @@ export class CredentialManager {
     } catch (e) {
       const why = errDetail(e);
       this.d.notify(`Bridge: BRIDGE_ENROLMENT_KEY could not enrol this machine (${why}) — the key may be used up or expired, or Bridge did not answer in time.`);
+      return;
+    }
+    if (saveFailure) {
+      this.d.notify(
+        `Bridge: BRIDGE_ENROLMENT_KEY enrolled this machine, but ${saveFailure}. The key's use is spent; fix the disk problem, then run /bridge:login (or set a new enrolment key).`
+      );
     }
   }
 
@@ -1064,9 +1084,9 @@ function machineLabel(inst: store.Installation): string {
 
 /** The warning for installations that could not be revoked from here ("" when none). */
 function stillEnrolled(labels: string[]): string {
-  return labels.length === 0
-    ? ""
-    : ` ⚠️ ${labels.map((l) => `"${l}"`).join(" and ")} STAYS ENROLLED in Bridge until you revoke it in Settings → Agents → Machines.`;
+  if (labels.length === 0) return "";
+  const [verb, pronoun] = labels.length === 1 ? ["STAYS", "it"] : ["STAY", "them"];
+  return ` ⚠️ ${labels.map((l) => `"${l}"`).join(" and ")} ${verb} ENROLLED in Bridge until you revoke ${pronoun} in Settings → Agents → Machines.`;
 }
 
 /** What the person is told when Bridge says this installation is gone for good (§3.3, §5.4). */

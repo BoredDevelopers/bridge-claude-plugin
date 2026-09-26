@@ -377,7 +377,8 @@ describe("stop-class refusals and the ticker", () => {
     const opts: StubOptions = { accessTtlS: 6 };
     const { stub, dir } = setup(opts);
     const inst = await enrolledProfile(stub, dir);
-    const { m } = manager(dir, stub.url, { tickMs: 50, random: () => 0 });
+    const logs: string[] = [];
+    const { m } = manager(dir, stub.url, { tickMs: 50, random: () => 0, log: (t) => logs.push(t) });
     await m.accessToken();
     // The session is evicted and the cap is full: the ticker's next mint is refused session_limit.
     for (const s of stub.sessionsFor(inst)) s.revoked = "evicted";
@@ -385,8 +386,10 @@ describe("stop-class refusals and the ticker", () => {
     expect(await until(() => stub.stats.mintBodies.length >= 2)).toBe(true);
     expect(m.stopReason()?.kind).toBe("session_limit");
     const after = stub.stats.mintBodies.length;
+    const logged = logs.length;
     await Bun.sleep(1_000); // 20 ticks, each of which would have minted
     expect(stub.stats.mintBodies.length).toBe(after);
+    expect(logs.slice(logged)).toEqual([]); // the ticker does not even try (no log line per tick)
     // On demand too: fail fast, nothing sent.
     expect((await m.accessToken().catch((x) => x)).kind).toBe("session_limit");
     expect(stub.stats.mintBodies.length).toBe(after);
@@ -396,6 +399,22 @@ describe("stop-class refusals and the ticker", () => {
     expect(m.stopReason()).toBeNull();
     expect(await m.accessToken()).toStartWith("brg_at_");
   }, 20_000);
+
+  test("a stop is per INSTALLATION: a /bridge:login in ANOTHER session lets this one mint again, without /bridge:connect", async () => {
+    const { stub, dir } = setup();
+    await enrolledProfile(stub, dir);
+    // A damaged state file (its CRC is wrong): every session is refused corrupt_state.
+    const st = readState(dir)!;
+    writeFileSync(join(dir, "state"), st.slice(0, 20) + (st[20] === "A" ? "B" : "A") + st.slice(21) + "\n");
+    const a = manager(dir, stub.url, { key: "a" }).m;
+    const b = manager(dir, stub.url, { key: "b" }).m;
+    for (const m of [a, b]) expect((await m.accessToken().catch((x) => x)).message).toMatch(/corrupt_state/);
+    expect(b.stopReason()?.kind).toBe("refused");
+    const url = (await a.login("browser")).match(/https?:\/\/\S+/)![0]; // session A re-enrols
+    await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!, { redirect: "manual" });
+    expect(await b.accessToken()).toStartWith("brg_at_"); // B follows the new installation
+    expect(b.stopReason()).toBeNull();
+  });
 
   test("a LATE tick (the laptop woke past the refresh point) mints ONCE, not once per tick while its random delay runs", async () => {
     const { stub, dir } = setup();
@@ -739,10 +758,10 @@ describe("login", () => {
     expect(stub.isRevoked(stub.stats.revokes.find((r) => r.id !== old)!.id)).toBe("installation_revoked");
     expect(events.loggedIn).toBe(0);
     expect(events.notices.join()).toMatch(/could not be saved on this machine .*ENOSPC/);
-    expect(events.notices.join()).not.toMatch(/STAYS ENROLLED/);
+    expect(events.notices.join()).not.toMatch(/STAYS? ENROLLED/);
   });
 
-  test("…and when those revokes fail too, the person is told what STAYS ENROLLED and where to revoke it", async () => {
+  test("…and when those revokes fail too, the person is told what STAYS ENROLLED and where to revoke them", async () => {
     const { stub, dir } = setup({ revokeBodyEmpty: true });
     await enrolledProfile(stub, dir);
     const { m, events } = manager(dir, stub.url);
@@ -750,7 +769,7 @@ describe("login", () => {
     failInstallationWrites = 1;
     await drive(url);
     expect(readInstallation(dir)).toBeNull();
-    expect(events.notices.join()).toMatch(/"the new sign-in [0-9a-f-]+" and ".+" STAYS ENROLLED .* Settings → Agents → Machines/);
+    expect(events.notices.join()).toMatch(/"the new sign-in [0-9a-f-]+" and ".+" STAY ENROLLED in Bridge until you revoke them in Settings → Agents → Machines/);
   });
 
   test("loopback denied: browser sent to result=denied, credentials untouched, person told", async () => {
@@ -1087,7 +1106,17 @@ describe("logout and enrolment keys", () => {
     expect(stub.stats.enrols).toBe(1);
     expect(stub.stats.revokes).toHaveLength(1);
     expect(stub.isRevoked(stub.stats.revokes[0]!.id)).toBe("installation_revoked");
-    expect(events.notices.join()).toMatch(/could not enrol .*could not be saved on this machine .*ENOSPC/);
+    expect(events.notices.join()).toMatch(/BRIDGE_ENROLMENT_KEY enrolled this machine, but its sign-in could not be saved on this machine .*ENOSPC/);
+    expect(events.notices.join()).not.toMatch(/used up or expired/); // the key was fine
+  });
+
+  test("…and when that revoke fails, the ONE installation left is named: it STAYS ENROLLED until revoked in Settings", async () => {
+    const { stub, dir } = setup({ revokeBodyEmpty: true });
+    const { m, events } = manager(dir, stub.url, { enrolmentKey: stub.mintEnrolmentKey(5) });
+    failInstallationWrites = 1;
+    await m.enrolFromKeyIfNeeded();
+    expect(readInstallation(dir)).toBeNull();
+    expect(events.notices.join()).toMatch(/"the new sign-in [0-9a-f-]+" STAYS ENROLLED in Bridge until you revoke it in Settings → Agents → Machines/);
   });
 
   test("a used-up enrolment key tells the person, and nothing is written", async () => {

@@ -76,6 +76,22 @@ describe("device polling — cancel", () => {
   });
 });
 
+describe("device polling — listeners", () => {
+  test("each wait removes its abort listener when it ends (none accumulate over a long flow)", async () => {
+    let live = 0;
+    const signal = {
+      aborted: false,
+      addEventListener: () => void live++,
+      removeEventListener: () => void live--,
+    } as unknown as AbortSignal;
+    const s = answers(["authorization_pending", "ok"]);
+    const r = await pollDevice(s.poll, { ...auth, interval: 1 }, { signal });
+    expect(r.ok).toBe(true);
+    expect(s.polls()).toBe(2);
+    expect(live).toBe(0);
+  });
+});
+
 describe("headless detection", () => {
   test("SSH and CI are headless everywhere; Linux needs a display; macOS is not", () => {
     expect(isHeadless({ SSH_CONNECTION: "a" }, "darwin")).toBe(true);
