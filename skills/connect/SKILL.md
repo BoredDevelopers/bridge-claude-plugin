@@ -34,5 +34,7 @@ Arguments passed: `$ARGUMENTS`
 
 ## Notes
 - Idempotent — calling it while already connected is a no-op on the socket.
-- If Bridge isn't configured yet (no API URL/token), the tool says so —
-  run `/bridge:configure` first.
+- If Bridge isn't set up yet, the tool says what is missing — no API URL →
+  `/bridge:configure`; not signed in → `/bridge:login`.
+- If this session was **revoked** in Bridge, `/bridge:connect` starts a new one. A
+  session **evicted** under the agent's live-session cap reconnects by itself.

@@ -30,8 +30,9 @@ Read both config values and give the user the full picture:
    Show set/not-set.
 
 2. **Sign-in** — call the `status` MCP tool and show its `auth` block
-   (profile, credential `installation` / `none`, installation name). If it
-   carries a `hint` (BRIDGE_TOKEN set but no credential), show that too.
+   (profile, credential `installation` / `none`, installation name,
+   `key_storage`, `key_thumbprint`). If it carries a `problem` or a `hint`
+   (BRIDGE_TOKEN set but no credential), show that too.
 
 3. **Channel filter** — check `BRIDGE_CHANNELS`. Show the filter or "all
    channels" if empty.
@@ -45,6 +46,12 @@ Read both config values and give the user the full picture:
      this session (or use `claudeb`, which auto-connects)."*
 
 ### `<url>` — save the API URL
+
+The URL must be the API's bare **origin** — scheme, host, optional port, no path,
+query or trailing segments (`https://bridge-api.example.com`) — and exactly the origin
+the server publishes as its public URL: every request is signed over it, so another
+port, scheme or host alias is refused. Strip a trailing `/`; if the user gave a path,
+say it will be refused and ask for the origin.
 
 1. `mkdir -p ~/.claude/channels/bridge`
 2. Read existing `.env` if present; update/add the `BRIDGE_API_URL=` line,
@@ -91,7 +98,9 @@ Bridge is available in every repo without reinstalling it each time.
 - The channels dir might not exist. Missing file = not configured, not an error.
 - The server reads `.env` once at boot. Changes need `/reload-plugins` or
   session restart.
-- Never echo the full token back to the user.
+- Never echo an enrolment key back to the user, and never touch the credential
+  files (`key.json`, `state`, `attempt`, `installation.json`) — `/bridge:login` and
+  `/bridge:logout` own them.
 - New agents are not created here: `/bridge:login` opens a page where the person
   picks an existing agent or creates one (agent invite codes are retired).
 - **Do NOT add a `bridge` entry to `~/.claude.json` mcpServers.** The plugin manages

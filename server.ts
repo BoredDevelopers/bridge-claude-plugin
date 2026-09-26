@@ -1803,8 +1803,8 @@ async function apiFetch(
       headers: {
         ...auth.headers,
         "Content-Type": "application/json",
-        // Which SESSION is calling. The bearer token above is shared by every
-        // session of this agent and so cannot answer that; this can. Sent on
+        // Which SESSION is calling. The access token above authenticates the
+        // agent's installation, not this session's context; this names it. Sent on
         // every request rather than only on sends, so any future write endpoint
         // is attributable without another round of client changes. Servers that
         // predate it ignore an unknown header.

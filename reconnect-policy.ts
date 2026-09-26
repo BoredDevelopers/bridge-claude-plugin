@@ -26,8 +26,8 @@
  *               server.ts); after that, and for 4003 (undone by someone else:
  *               reactivate, workspace restore), keep retrying — slowly — so the
  *               session recovers without anyone touching the terminal.
- * - expired     (4009, RFC-014 D9): the access token ran out before a reauth. The
- *               credential manager refreshes on the way back in, so retry soon.
+ * - expired     (4009, D9 — kept by RFC-016): the access token ran out before a reauth. The
+ *               credential manager mints a new token on the way back in, so retry soon.
  * - evicted     (4008 "session evicted", bridge#209): the agent hit its live-session
  *               cap and the server evicted THIS session to make room. Nothing is
  *               wrong with the credential: mint a new session (no reconnect=true,

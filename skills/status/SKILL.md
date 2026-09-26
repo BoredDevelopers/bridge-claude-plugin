@@ -22,13 +22,15 @@ Arguments passed: `$ARGUMENTS`
 configured-but-idle, or connected, which decides everything else below.
 
 It returns `{ configured, wantConnected, websocket, receiving_messages,
-agent, context_id, channel_filter, label }`.
+agent, context_id, channel_filter, auth, label }` (`auth` = the sign-in:
+profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 
 ### 1. Unconfigured (`configured: false`)
 
-Bridge has no API URL/token saved yet. Report that plainly and stop — don't
-call any other Bridge tool, they'll just repeat the same thing. Next step:
-run `/bridge:configure`.
+Bridge has no API URL, or this machine is not signed in (or its sign-in was
+locked / revoked). Report `auth.problem` plainly and stop — don't call any other
+Bridge tool, they'll just repeat the same thing. Next step: whatever it names
+(`/bridge:configure` for the URL, `/bridge:login` to sign in).
 
 ### 2. Idle (`configured: true`, `wantConnected: false`)
 
@@ -50,6 +52,9 @@ Report the snapshot itself:
 - Agent identity (`agent`), this session's context id (`context_id`), and
   its display label (`label`, or "derived default" if null).
 - Channel filter (`channel_filter`) — "all" or the configured list.
+- Sign-in (`auth`): installation name, `key_storage` (`software`), and
+  `key_thumbprint`; if `auth.session` says the session was revoked, the next
+  step is `/bridge:connect`.
 
 Then, for the fuller picture, also call:
 - **Channels** — the `list_channels` Bridge tool: available channels with
