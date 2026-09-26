@@ -28,6 +28,11 @@
  *               session recovers without anyone touching the terminal.
  * - expired     (4009, RFC-014 D9): the access token ran out before a reauth. The
  *               credential manager refreshes on the way back in, so retry soon.
+ * - evicted     (4008 "session evicted", bridge#209): the agent hit its live-session
+ *               cap and the server evicted THIS session to make room. Nothing is
+ *               wrong with the credential: mint a new session (no reconnect=true,
+ *               no block — E9's stop is for a session a PERSON revoked) and
+ *               reconnect soon.
  * - revoked     (4008): the session or the machine's installation was revoked
  *               ("session revoked" / "installation revoked") or LOCKED because a
  *               copy of its credential was used ("installation locked", RFC-016 E8)
@@ -35,16 +40,17 @@
  *               user.
  */
 
-export type CloseClass = "transient" | "expired" | "session-cap" | "credential" | "revoked";
+export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked";
 
 const SCHEDULE: Record<Exclude<CloseClass, "revoked">, { baseMs: number; capMs: number }> = {
   transient: { baseMs: 1_000, capMs: 30_000 },
   expired: { baseMs: 1_000, capMs: 30_000 },
+  evicted: { baseMs: 1_000, capMs: 30_000 },
   "session-cap": { baseMs: 30_000, capMs: 300_000 },
   credential: { baseMs: 60_000, capMs: 300_000 },
 };
 
-export function classifyClose(code: number | undefined): CloseClass {
+export function classifyClose(code: number | undefined, reason?: string): CloseClass {
   switch (code) {
     case 4007:
       return "session-cap";
@@ -52,7 +58,7 @@ export function classifyClose(code: number | undefined): CloseClass {
     case 4003:
       return "credential";
     case 4008:
-      return "revoked";
+      return reason === "session evicted" ? "evicted" : "revoked";
     case 4009:
       return "expired";
     default:
@@ -95,6 +101,8 @@ export function describeClose(
       }
     case "expired":
       return `access token expired (${tail}) — refreshing`;
+    case "evicted":
+      return `this session was evicted to make room under the agent's live-session cap (${tail}) — reconnecting with a new session`;
     case "revoked":
       if (reason === "session revoked") return `this session was revoked in Bridge (${tail}) — /bridge:connect starts a new session`;
       if (reason === "installation revoked")

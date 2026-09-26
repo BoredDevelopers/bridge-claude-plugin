@@ -23,6 +23,19 @@ describe("classifyClose", () => {
   });
 });
 
+describe("4008 session evicted (bridge#209: evicted at the live-session cap)", () => {
+  test("is its own class: reconnect soon with a NEW session — never the revoked stop", () => {
+    expect(classifyClose(4008, "session evicted")).toBe("evicted");
+    expect(classifyClose(4008, "session revoked")).toBe("revoked");
+    expect(classifyClose(4008, undefined)).toBe("revoked");
+    expect(reconnectDelay(1, "evicted", hi)).toBeLessThanOrEqual(1000);
+    expect(reconnectDelay(9, "evicted")).not.toBeNull();
+    const t = describeClose("evicted", 4008, "session evicted");
+    expect(t).toContain("new session");
+    expect(t).not.toContain("/bridge:connect");
+  });
+});
+
 describe("reconnectDelay", () => {
   test("transient: 1s → 30s, same curve as the web client", () => {
     expect(reconnectDelay(1, "transient", hi)).toBeLessThanOrEqual(1000);

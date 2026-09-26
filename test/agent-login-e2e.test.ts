@@ -327,6 +327,30 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("4008 session evicted (the agent hit its live-session cap): drops the token, mints a NEW session without reconnect=true, reconnects at once — no block, no notice", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices) => {
+        expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
+        const inst = readInstallation(dir)!.installationId;
+        stub.evictSession(stub.sessionsFor(inst)[0]!.id);
+        expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
+        expect(stub.stats.authTokens[1]).not.toBe(stub.stats.authTokens[0]);
+        expect(stub.stats.mintBodies).toHaveLength(2);
+        expect(stub.stats.mintBodies[1]!.reconnect).toBeUndefined();
+        expect(stub.sessionsFor(inst)).toHaveLength(2);
+        expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
+        expect(notices()).toEqual([]);
+        // Not blocked: a tool call works without /bridge:connect.
+        const r: any = await client.callTool({ name: "list_channels", arguments: {} });
+        expect(r.isError).not.toBe(true);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
   test("4008 installation revoked: key + state deleted, told to run /bridge:login, no reconnect", async () => {
     const stub = startAuthStub();
     await withPlugin(

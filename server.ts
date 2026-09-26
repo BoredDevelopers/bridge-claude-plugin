@@ -1047,7 +1047,7 @@ function connectWs(): void {
     authenticatedAt = null;
     const code = (event as CloseEvent).code;
     const reason = (event as CloseEvent).reason || undefined;
-    const cls = classifyClose(code);
+    const cls = classifyClose(code, reason);
     // A new KIND of refusal starts its own schedule from the bottom; a repeat
     // of the same kind keeps climbing it.
     if (cls !== lastClose.cls) reconnectAttempt = 0;
@@ -1059,7 +1059,10 @@ function connectWs(): void {
     // attempt must MINT (the mint then reports the real reason, §3.3), where
     // re-presenting the dead token would only loop on 4001. sockBearer follows an
     // in-band reauth (reauthedWith), so it is the token the server just refused.
-    if (cls === "expired" || code === 4001) creds.invalidateAccess(sockBearer);
+    // 4008 "session evicted" (bridge#209): the session is gone but nothing is wrong with
+    // the credential — drop its token so the reconnect MINTS a new session. No
+    // sessionRevoked(): that block (E9) is for a session a person revoked.
+    if (cls === "expired" || cls === "evicted" || code === 4001) creds.invalidateAccess(sockBearer);
     if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);
     if (cls === "revoked" && (reason === "installation revoked" || reason === "installation locked")) {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
@@ -1324,6 +1327,7 @@ function stopConnection(): void {
  */
 function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined, keyDeleted = false): void {
   if (code !== 4003 && code !== 4008 && code !== 4001) return;
+  if (cls === "evicted") return; // recovers on its own with a new session: nobody must act
   const key = `${code}:${reason ?? ""}`;
   if (notifiedRefusal === key) return;
   notifiedRefusal = key;
