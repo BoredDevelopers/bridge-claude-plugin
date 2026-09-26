@@ -294,6 +294,47 @@ describe("mint (§3.3, §5.2)", () => {
     expect((await fetch(`${stub.url}/api/channels`, { headers })).status).toBe(200);
   });
 
+  test("a 401-triggered re-mint hands the fresh token (+ a WS proof) to the live socket", async () => {
+    const { stub, dir } = setup();
+    await enrolledProfile(stub, dir);
+    const { m, events } = manager(dir, stub.url);
+    const old = await m.accessToken();
+    m.invalidateAccess(old); // what apiFetch does on a 401
+    const fresh = await m.accessToken();
+    expect(events.rotated).toHaveLength(1);
+    expect(events.rotated[0]!.token).toBe(fresh);
+    expect(parseJws(events.rotated[0]!.dpop)!.claims).toMatchObject({ htm: "GET", htu: `${stub.url}/ws`, ath: sha256b64u(fresh) });
+    // One-shot: a later mint after the token went away WITHOUT a 401 (a 4008 session
+    // revoke closes the socket; /bridge:connect reconnects) hands the socket nothing.
+    m.sessionRevoked(m.grant()!.sessionId);
+    m.requestSessionReconnect();
+    await m.accessToken();
+    expect(events.rotated).toHaveLength(1);
+  });
+
+  test("logout and a new login forget the old installation's 429 gate and resource nonce", async () => {
+    const { stub, dir } = setup({ rateLimitMints: 1 });
+    await enrolledProfile(stub, dir);
+    const { m } = manager(dir, stub.url);
+    expect((await m.accessToken().catch((x) => x)).message).toMatch(/rate-limited/); // gate armed (1 s)
+    m.noteResourceNonce("rn-old");
+    await m.logout(true);
+    await enrolledProfile(stub, dir);
+    expect(await m.accessToken()).toStartWith("brg_at_"); // no "retrying in 1s"
+    expect(parseJws((await m.httpAuth("GET", "/api/x")).headers.DPoP)!.claims.nonce).toBeUndefined();
+
+    // The same through a login (no logout in between).
+    const s2 = setup({ rateLimitMints: 1 });
+    await enrolledProfile(s2.stub, s2.dir);
+    const b = manager(s2.dir, s2.stub.url).m;
+    await b.accessToken().catch(() => {});
+    b.noteResourceNonce("rn-old");
+    const url = (await b.login("browser")).match(/https?:\/\/\S+/)![0];
+    await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!, { redirect: "manual" });
+    expect(await b.accessToken()).toStartWith("brg_at_");
+    expect(parseJws((await b.httpAuth("GET", "/api/x")).headers.DPoP)!.claims.nonce).toBeUndefined();
+  });
+
   test("invalidating with a token that is no longer current keeps the current one", async () => {
     const { stub, dir } = setup();
     await enrolledProfile(stub, dir);
@@ -529,6 +570,15 @@ describe("profiles and configuration", () => {
     expect(existsSync(freshTomb)).toBe(true);
   });
 
+  test("a BRIDGE_API_URL with a path is refused up front, with a clear message, and nothing is sent", async () => {
+    const { stub, dir } = setup();
+    const { m } = manager(dir, `${stub.url}/bridge`);
+    expect(m.configError()).toMatch(/BRIDGE_API_URL .*must be an origin/);
+    await expect(m.accessToken()).rejects.toThrow(/must be an origin/);
+    expect(await m.login("browser")).toMatch(/must be an origin/);
+    expect(stub.stats.discoveryHits).toBe(0);
+  });
+
   test("an invalid profile name is refused", () => {
     expect(resolveProfile("/x", "Bad Name")).toHaveProperty("error");
     expect(resolveProfile("/x", "reviewer")).toEqual({ name: "reviewer", dir: "/x/profiles/reviewer" });
@@ -583,6 +633,22 @@ describe("revocation", () => {
     m.requestSessionReconnect();
     expect(await m.accessToken()).toStartWith("brg_at_");
     expect(stub.stats.locks).toBe(0);
+  });
+
+  test("a revoke for an OLDER session never blocks the current one", async () => {
+    const { stub, dir } = setup();
+    await enrolledProfile(stub, dir);
+    const { m } = manager(dir, stub.url);
+    const at = await m.accessToken();
+    m.sessionRevoked(crypto.randomUUID()); // a late 4008 for a session this process no longer uses
+    expect(await m.accessToken()).toBe(at); // the current token was kept
+    m.invalidateAccess();
+    expect(await m.accessToken()).toStartWith("brg_at_"); // …and minting was not blocked
+    expect(stub.stats.mintBodies[1]!.reconnect).toBeUndefined();
+    expect(m.status().session).toBeUndefined();
+    // Unknown (null) and the CURRENT session still block.
+    m.sessionRevoked(m.grant()!.sessionId);
+    expect((await m.accessToken().catch((x) => x)).kind).toBe("session_revoked");
   });
 
   test("requestSessionReconnect without a revoke sends nothing special", async () => {

@@ -30,6 +30,7 @@ import {
   dpopProof,
   httpHtu,
   wsHtu,
+  apiOrigin,
   generateSoftwareKey,
   softwareSigner,
   type AuthMetadata,
@@ -161,6 +162,10 @@ export class CredentialManager {
    * through stopReason() (its awaiting-credentials watch must not re-mint either).
    */
   private stopped: CredentialError | null = null;
+  /** A token was dropped (a 401 / 4001 / 4009): the next mint must reach the live socket too (`reauth`). */
+  private rotateOnNextMint = false;
+  /** The session of the last mint — kept when the token is dropped, so a 4008 can be matched to it. */
+  private lastSessionId: string | null = null;
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly clock: Clock;
@@ -225,6 +230,12 @@ export class CredentialManager {
     }
     // Login needs the API URL, so that hint comes first.
     if (!this.apiUrl()) return "BRIDGE_API_URL is not set — run /bridge:configure, then /bridge:login";
+    try {
+      // Proofs sign the API ORIGIN (§3.4, C16): a URL with a path could never be accepted.
+      apiOrigin(this.apiUrl());
+    } catch (e) {
+      return `BRIDGE_API_URL is unusable: ${errDetail(e)} — fix it with /bridge:configure`;
+    }
     if (this.source() === "none") {
       // The marker (after retirement) — or the RFC-014 files themselves, in the moment
       // before startup retires them.
@@ -290,6 +301,7 @@ export class CredentialManager {
    */
   invalidateAccess(tokenUsed?: string): void {
     if (tokenUsed !== undefined && this.access?.token !== tokenUsed) return;
+    if (this.access) this.rotateOnNextMint = true;
     this.access = null;
   }
 
@@ -316,10 +328,14 @@ export class CredentialManager {
   renew(reason: string): Promise<Access> {
     if (this.stopped) return Promise.reject(this.stopped);
     if (!this.inflight) {
-      const hadAccess = this.access !== null;
+      // A live socket rides the current token — or the one just dropped by a 401: either
+      // way it must get the new one in-band.
+      const hadAccess = this.access !== null || this.rotateOnNextMint;
       this.inflight = this.renewUnderLock(reason)
         .then(async (a) => {
           this.access = a;
+          this.lastSessionId = a.sessionId;
+          if (hadAccess) this.rotateOnNextMint = false;
           this.armTicker();
           if (hadAccess) {
             try {
@@ -516,7 +532,10 @@ export class CredentialManager {
 
   /** 4008 "session revoked": this session is over until an explicit /bridge:connect (E9). */
   sessionRevoked(sessionId: string | null): void {
-    if (sessionId === null || this.access?.sessionId === sessionId) this.access = null;
+    // Only THIS session (or an unknown one): a late 4008 for an older session of this
+    // process must not block the one it runs now.
+    if (sessionId !== null && sessionId !== this.lastSessionId) return;
+    this.access = null;
     this.sessionBlocked = true;
     this.reconnectNext = false;
   }
@@ -797,7 +816,14 @@ export class CredentialManager {
     store.clearLoggedOutMarker(dir);
     store.clearUpgradeMarker(dir);
     // A new installation: whatever stopped minting on the old one does not apply.
+    this.forgetInstallationState();
+  }
+
+  /** Per-installation state that must not outlive it (logout, a new enrolment). */
+  private forgetInstallationState(): void {
     this.stopped = null;
+    this.mintNotBefore = 0;
+    this.resourceNonce = undefined;
   }
 
   /**
@@ -951,7 +977,7 @@ export class CredentialManager {
       this.lockOpts()
     );
     this.access = null;
-    this.stopped = null;
+    this.forgetInstallationState();
     this.d.onLoggedOut();
     const { inst, revoke } = r;
     if (!inst) return `Profile ${profileLabel(p)} was not signed in.`;
