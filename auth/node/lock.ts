@@ -32,7 +32,8 @@
  *
  * Node `fs` + timers only (no Bun API): the SDK's node adapter.
  */
-import { mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from "fs";
+import * as fs from "fs";
+import { mkdirSync, readFileSync, statSync } from "fs";
 import { join } from "path";
 
 export const LOCK_DIR_NAME = ".install-lock";
@@ -43,8 +44,18 @@ export const HOLD_BUDGET_MS = 90_000;
 export const LOCK_WAIT_MS = 150_000;
 const BREAK_STALE_MS = 10_000;
 const RETRY_MS = 100;
+/** Errors a concurrent breaker / a Windows scanner can cause mid-delete: retried, never fatal. */
+const TRANSIENT_FS = new Set(["ENOENT", "ENOTEMPTY", "EPERM", "EBUSY"]);
+
+/** The mutating calls, as one object so tests can inject failures (ESM imports cannot be spied on). */
+export const __lockIo = {
+  rmSync: fs.rmSync,
+  renameSync: fs.renameSync,
+  writeFileSync: fs.writeFileSync,
+};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const codeOf = (e: unknown) => (e as NodeJS.ErrnoException)?.code ?? "";
 
 function ageMs(path: string): number | null {
   try {
@@ -67,30 +78,84 @@ function isStale(lockDir: string): boolean {
   return age !== null && age > STALE_MS;
 }
 
-/** Remove `lockDir` only if it is (still) stale, with breaking serialized. */
+/**
+ * Remove `lockDir` only if it is (still) stale, with breaking serialized.
+ *
+ * Residual: a `.break` older than BREAK_STALE_MS is reclaimed as a dead breaker's — if
+ * that breaker is merely slow (suspended between its re-check and its rm for 10 s), two
+ * breakers can each remove a lock and two holders can end up inside. That is safe for
+ * the same reason a stale break is: both present the same state + attempt, and the
+ * server converges them (E6b).
+ */
 function breakIfStale(lockDir: string): void {
   const breakDir = `${lockDir}.break`;
   try {
     mkdirSync(breakDir, { mode: 0o700 });
   } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+    if (codeOf(err) !== "EEXIST") throw err;
     // A breaker that died mid-break (the section is two syscalls) leaves this behind.
     const age = ageMs(breakDir);
-    if (age !== null && age > BREAK_STALE_MS) rmSync(breakDir, { recursive: true, force: true });
+    if (age !== null && age > BREAK_STALE_MS) __lockIo.rmSync(breakDir, { recursive: true, force: true });
     return;
   }
   try {
-    if (isStale(lockDir)) rmSync(lockDir, { recursive: true, force: true });
+    if (isStale(lockDir)) __lockIo.rmSync(lockDir, { recursive: true, force: true });
   } finally {
-    rmSync(breakDir, { recursive: true, force: true });
+    __lockIo.rmSync(breakDir, { recursive: true, force: true });
   }
+}
+
+/** Run `op`, retrying a few times (≈ 300 ms) on the transient codes; rethrow anything else. */
+async function withFsRetry(op: () => void): Promise<void> {
+  for (let i = 0; ; i++) {
+    try {
+      op();
+      return;
+    } catch (e) {
+      if (!TRANSIENT_FS.has(codeOf(e)) || i >= 5) throw e;
+      await sleep(50);
+    }
+  }
+}
+
+/**
+ * Release OUR lock and nothing else. A plain "check nonce, then rm" would delete a NEWER
+ * owner's lock if ours was broken and re-taken between the check and the rm. So: check,
+ * atomically RENAME the directory to a tombstone unique to our nonce, then check what we
+ * moved; if it is not ours, put it back.
+ *
+ * Residual: if, after we moved a newer owner's lock aside, a THIRD process creates a lock
+ * before we can put it back, the rename-back fails and that newer owner runs on without a
+ * lock file. Its critical section still presents the one current state + attempt from
+ * disk, so it converges with the third through E6(b) — the same guarantee as a stale break.
+ */
+async function release(lockDir: string, nonce: string): Promise<void> {
+  if (readOwner(lockDir)?.nonce !== nonce) return; // taken over (broken as stale): not ours
+  const tomb = `${lockDir}.released-${nonce}`;
+  try {
+    await withFsRetry(() => __lockIo.renameSync(lockDir, tomb));
+  } catch (e) {
+    if (codeOf(e) === "ENOENT") return; // broken between the check and the rename
+    throw e;
+  }
+  if (readOwner(tomb)?.nonce !== nonce) {
+    try {
+      __lockIo.renameSync(tomb, lockDir);
+    } catch {}
+    return;
+  }
+  await withFsRetry(() => __lockIo.rmSync(tomb, { recursive: true, force: true }));
 }
 
 export interface LockOptions {
   /** How long to wait for the lock (default LOCK_WAIT_MS). */
   waitMs?: number;
-  /** The holder's budget; `signal` aborts when it is spent (default HOLD_BUDGET_MS). */
+  /** The holder's budget; `signal` aborts when it is spent (default HOLD_BUDGET_MS; must be < STALE_MS). */
   holdMs?: number;
+  /** Stop WAITING (not holding) — rejects with the signal's reason. */
+  signal?: AbortSignal;
+  /** Where a failed release is reported (it never fails the caller: the stale break reclaims the lock). */
+  log?: (msg: string) => void;
 }
 
 export async function withInstallationLock<T>(
@@ -99,35 +164,53 @@ export async function withInstallationLock<T>(
   o: LockOptions = {}
 ): Promise<T> {
   const waitMs = o.waitMs ?? LOCK_WAIT_MS;
+  const holdMs = o.holdMs ?? HOLD_BUDGET_MS;
+  // A holder allowed to outlive the stale break would be broken while live, every time.
+  if (!(holdMs > 0 && holdMs < STALE_MS)) throw new RangeError(`installation lock holdMs must be in (0, ${STALE_MS}), got ${holdMs}`);
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
   const lockDir = join(profileDir, LOCK_DIR_NAME);
   const nonce = crypto.randomUUID();
   const deadline = Date.now() + waitMs;
   for (;;) {
-    let acquired = false;
+    o.signal?.throwIfAborted();
+    let created = false;
     try {
       mkdirSync(lockDir, { mode: 0o700 });
-      acquired = true;
-      writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, nonce }), { mode: 0o600 });
+      created = true;
+      __lockIo.writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, nonce }), { mode: 0o600 });
       break;
     } catch (err) {
-      // Our fresh lock vanished before we could claim it — only possible if something
-      // outside this protocol removed it; start over rather than run unprotected.
-      if (acquired) continue;
-      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+      if (created) {
+        // Our fresh lock vanished before we could claim it (ENOENT) — only possible if
+        // something outside this protocol removed it; start over rather than run unprotected.
+        if (codeOf(err) === "ENOENT") continue;
+        // Any other failure (ENOSPC, EACCES, …): an ownerless lock would block everyone
+        // until the stale break. Take it back down and say why.
+        try {
+          __lockIo.rmSync(lockDir, { recursive: true, force: true });
+        } catch {}
+        throw err;
+      }
+      if (codeOf(err) !== "EEXIST") throw err;
     }
     try {
       if (isStale(lockDir)) breakIfStale(lockDir);
-    } catch {
-      // A concurrent breaker's rm (EPERM / ENOTEMPTY mid-delete): retry.
+    } catch (err) {
+      // A concurrent breaker's rm mid-delete: retry. Anything else (EACCES, EROFS, …) is real.
+      if (!TRANSIENT_FS.has(codeOf(err))) throw err;
     }
     if (Date.now() > deadline) throw new Error(`bridge: installation lock ${lockDir} held for over ${waitMs / 1000}s`);
     await sleep(RETRY_MS);
   }
   try {
-    return await fn({ signal: AbortSignal.timeout(o.holdMs ?? HOLD_BUDGET_MS) });
+    return await fn({ signal: AbortSignal.timeout(holdMs) });
   } finally {
-    // Only our own lock (by nonce, not pid: one process can wait on itself).
-    if (readOwner(lockDir)?.nonce === nonce) rmSync(lockDir, { recursive: true, force: true });
+    // Never let a failed release replace fn's result (or its error): report it; the lock
+    // then ages out through the stale break.
+    try {
+      await release(lockDir, nonce);
+    } catch (e) {
+      (o.log ?? ((m: string) => console.error(m)))(`bridge: could not release installation lock ${lockDir}: ${e instanceof Error ? e.message : e}`);
+    }
   }
 }

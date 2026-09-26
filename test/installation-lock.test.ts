@@ -8,7 +8,9 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, utimesSync, existsSync, 
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { withInstallationLock, STALE_MS, LOCK_WAIT_MS, HOLD_BUDGET_MS, LOCK_DIR_NAME } from "../auth/node/lock";
+import { fileURLToPath } from "node:url";
+import { withInstallationLock, STALE_MS, LOCK_WAIT_MS, HOLD_BUDGET_MS, LOCK_DIR_NAME, __lockIo } from "../auth/node/lock";
+import { spawnRacers } from "./fixtures/go-signal";
 import { withProfileLock as withProfileLock024 } from "./fixtures/v024/lock";
 
 const DEAD_PID = 2 ** 22 + 12345;
@@ -24,14 +26,13 @@ const plant = (lockDir: string, owner: object) => {
 
 describe("installation lock (RFC-016 §5.2: mkdir + 120 s time-based stale break)", () => {
   test("8 processes racing to break the same stale lock: never two inside", async () => {
-    const holder = new URL("./fixtures/installation-lock-holder.ts", import.meta.url).pathname;
+    const holder = fileURLToPath(new URL("./fixtures/installation-lock-holder.ts", import.meta.url));
     for (let t = 0; t < 6; t++) {
       const dir = mkdtempSync(join(tmpdir(), "lock-mp-"));
       try {
         plant(lockOf(dir), { pid: process.pid, nonce: "stale" });
         age(lockOf(dir), STALE_MS + 5_000);
-        const startAt = Date.now() + 600;
-        const ps = Array.from({ length: 8 }, () => Bun.spawn(["bun", holder, dir, String(startAt)], { stderr: "pipe" }));
+        const ps = await spawnRacers(8, ["bun", holder, dir]);
         const codes = await Promise.all(ps.map((p) => p.exited));
         expect(codes.every((c) => c === 0)).toBe(true);
         let inside = 0;
@@ -51,10 +52,11 @@ describe("installation lock (RFC-016 §5.2: mkdir + 120 s time-based stale break
 
   test("stale is by AGE only: a dead pid's young lock is waited for; a live pid's 121 s-old lock is broken", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lock-age-"));
+    const stop = new AbortController(); // an early failure must not leave the waiter polling for 150 s
     try {
       // Dead holder, fresh lock: NOT broken (pid liveness is deliberately not consulted).
       plant(lockOf(dir), { pid: DEAD_PID, nonce: "dead" });
-      const waiter = withInstallationLock(dir, async () => "got it");
+      const waiter = withInstallationLock(dir, async () => "got it", { signal: stop.signal });
       expect(await Promise.race([waiter, Bun.sleep(600).then(() => "waited")])).toBe("waited");
       // Just under the threshold: still waiting.
       age(lockOf(dir), STALE_MS - 5_000);
@@ -64,22 +66,25 @@ describe("installation lock (RFC-016 §5.2: mkdir + 120 s time-based stale break
       age(lockOf(dir), STALE_MS + 1_000);
       expect(await waiter).toBe("got it");
     } finally {
+      stop.abort();
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
   test("breaking is serialized: while another breaker holds `.break`, a stale lock is left to it (deterministic L3)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lock-brk-"));
+    const stop = new AbortController();
     try {
       plant(lockOf(dir), { pid: process.pid, nonce: "stale" });
       age(lockOf(dir), STALE_MS + 5_000);
       mkdirSync(`${lockOf(dir)}.break`); // a breaker mid-break (young: < 10 s)
-      const waiter = withInstallationLock(dir, async () => "got it");
+      const waiter = withInstallationLock(dir, async () => "got it", { signal: stop.signal });
       expect(await Promise.race([waiter, Bun.sleep(700).then(() => "waited")])).toBe("waited");
       expect(JSON.parse(readFileSync(join(lockOf(dir), "owner.json"), "utf8")).nonce).toBe("stale");
       rmSync(`${lockOf(dir)}.break`, { recursive: true, force: true }); // the breaker finished without breaking
       expect(await waiter).toBe("got it");
     } finally {
+      stop.abort();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -144,6 +149,102 @@ describe("installation lock (RFC-016 §5.2: mkdir + 120 s time-based stale break
       );
       expect(reason).toBe("TimeoutError");
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a holder budget at or past the stale break is refused (it would be broken while live)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-hold-"));
+    try {
+      await expect(withInstallationLock(dir, async () => 1, { holdMs: STALE_MS })).rejects.toBeInstanceOf(RangeError);
+      expect(existsSync(lockOf(dir))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("release never deletes a NEWER owner's lock that replaced ours between the check and the removal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-rel-"));
+    const saved = __lockIo.renameSync;
+    try {
+      let raced = false;
+      __lockIo.renameSync = ((from: any, to: any) => {
+        if (!raced && String(from) === lockOf(dir)) {
+          raced = true; // our lock was broken as stale and re-taken, right after our nonce check
+          rmSync(lockOf(dir), { recursive: true, force: true });
+          plant(lockOf(dir), { pid: process.pid, nonce: "newer" });
+        }
+        return saved(from, to);
+      }) as any;
+      expect(await withInstallationLock(dir, async () => "done")).toBe("done");
+      expect(raced).toBe(true);
+      expect(JSON.parse(readFileSync(join(lockOf(dir), "owner.json"), "utf8")).nonce).toBe("newer");
+    } finally {
+      __lockIo.renameSync = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a release that keeps failing never replaces fn's result — it is logged, and a transient one is retried", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-relfail-"));
+    const saved = __lockIo.rmSync;
+    try {
+      const logs: string[] = [];
+      __lockIo.rmSync = (() => {
+        throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      }) as any;
+      expect(await withInstallationLock(dir, async () => "result", { log: (m) => logs.push(m) })).toBe("result");
+      expect(logs.join()).toContain("could not release");
+      // Transient once, then fine: released cleanly, nothing logged.
+      __lockIo.rmSync = saved;
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir);
+      let once = true;
+      __lockIo.rmSync = ((p: any, o: any) => {
+        if (once) {
+          once = false;
+          throw Object.assign(new Error("busy"), { code: "EBUSY" });
+        }
+        return saved(p, o);
+      }) as any;
+      const logs2: string[] = [];
+      expect(await withInstallationLock(dir, async () => "again", { log: (m) => logs2.push(m) })).toBe("again");
+      expect(logs2).toEqual([]);
+      expect(existsSync(lockOf(dir))).toBe(false);
+    } finally {
+      __lockIo.rmSync = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("owner.json cannot be written (ENOSPC): the ownerless lock is taken down and the error surfaces", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-own-w-"));
+    const saved = __lockIo.writeFileSync;
+    try {
+      __lockIo.writeFileSync = (() => {
+        throw Object.assign(new Error("no space"), { code: "ENOSPC" });
+      }) as any;
+      await expect(withInstallationLock(dir, async () => 1, { waitMs: 500 })).rejects.toMatchObject({ code: "ENOSPC" });
+      expect(existsSync(lockOf(dir))).toBe(false);
+    } finally {
+      __lockIo.writeFileSync = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("breaking a stale lock fails with a REAL error (EACCES): surfaced at once, not waited out", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-brk-err-"));
+    const saved = __lockIo.rmSync;
+    try {
+      plant(lockOf(dir), { pid: process.pid, nonce: "stale" });
+      age(lockOf(dir), STALE_MS + 5_000);
+      __lockIo.rmSync = ((p: any, o: any) => {
+        if (String(p) === lockOf(dir)) throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return saved(p, o);
+      }) as any;
+      await expect(withInstallationLock(dir, async () => 1, { waitMs: 800 })).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      __lockIo.rmSync = saved;
       rmSync(dir, { recursive: true, force: true });
     }
   });

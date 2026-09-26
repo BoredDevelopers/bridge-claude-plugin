@@ -1,10 +1,11 @@
-// Child process for the multi-process lock test: wait for a common start instant,
-// take the installation lock, log in/out around a short critical section.
+// Child process for the multi-process lock test: on "go", take the installation
+// lock and log in/out around a short critical section.
 import { appendFileSync } from "fs";
 import { withInstallationLock } from "../../auth/node/lock";
+import { readyThenGo } from "./go-signal";
 
-const [dir, startAt] = [process.argv[2]!, Number(process.argv[3])];
-while (Date.now() < startAt) {}
+const dir = process.argv[2]!;
+await readyThenGo();
 await withInstallationLock(dir, async () => {
   appendFileSync(`${dir}/log`, `in ${process.pid}\n`);
   await Bun.sleep(150);
