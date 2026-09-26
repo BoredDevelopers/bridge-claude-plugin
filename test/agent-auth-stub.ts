@@ -604,6 +604,12 @@ export function createAuthCore(opts: StubOptions = {}) {
       stats.refusals.push(`ws:${p.reason}`);
       return null;
     }
+    // Stricter than the server (which ignores it): a WS proof is bound by iat + jti
+    // alone, so a client that puts the HTTP nonce on it has mixed the two up (C15).
+    if (parseJws(f.dpop)?.claims.nonce !== undefined) {
+      stats.refusals.push("ws:nonce_on_ws");
+      return null;
+    }
     return a;
   }
 

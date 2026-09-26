@@ -452,6 +452,28 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("C15: once the API has handed out a nonce, WS proofs still carry none (auth after a 4009, and an in-band reauth)", async () => {
+    const stub = startAuthStub({ requireNonce: true });
+    await withPlugin(
+      stub,
+      {},
+      async (client) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        stub.rotateNonce();
+        await client.callTool({ name: "list_channels", arguments: {} }); // learns the nonce
+        expect(stub.stats.refusals).toContain("api:use_dpop_nonce");
+        stub.expireAccess(); // the next request mints and reauths the socket in-band
+        await client.callTool({ name: "list_channels", arguments: {} });
+        expect(await until(() => stub.stats.reauthTokens.length >= 1, 5_000)).toBe(true);
+        stub.closeAll(4009, "token expired");
+        expect(await until(() => stub.stats.authTokens.length >= 2, 10_000)).toBe(true);
+        expect(await until(() => stub.liveSockets() === 1, 3_000)).toBe(true);
+        expect(stub.stats.refusals.filter((r) => r.startsWith("ws:"))).toEqual([]);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
   test("/bridge:login on an unconfigured machine: URL returned, approval connects the session", async () => {
     const stub = startAuthStub();
     await withPlugin(stub, {}, async (client, dir, notices) => {
