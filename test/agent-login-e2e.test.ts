@@ -618,6 +618,36 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("a stop-class refusal (a pre-RFC-016 server): told once — the credential watch neither reopens the socket nor re-mints; a new installation on disk, or /bridge:connect, tries again", async () => {
+    const stub = startAuthStub({ legacyServer: true });
+    const told = (notices: () => string[]) => notices().filter((n) => n.includes("must be upgraded")).length;
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices) => {
+        expect(await until(() => told(notices) === 1, 10_000)).toBe(true);
+        const opens = stub.stats.wsOpens;
+        await Bun.sleep(11_000); // a negative across one credential-watch tick (10 s)
+        expect(told(notices)).toBe(1);
+        expect(stub.stats.wsOpens).toBe(opens);
+        expect(stub.stats.mintBodies).toHaveLength(0);
+        // A login in ANOTHER session: the refusal was about the old installation — try the new one.
+        await enrolledProfile(stub, dir);
+        expect(await until(() => stub.stats.wsOpens > opens, 12_000)).toBe(true);
+        // The same refusal again: the model already knows.
+        await Bun.sleep(1_000);
+        expect(told(notices)).toBe(1);
+        // The person asks explicitly: tried again, and answered.
+        const opens2 = stub.stats.wsOpens;
+        await client.callTool({ name: "connect", arguments: {} });
+        expect(await until(() => stub.stats.wsOpens > opens2, 5_000)).toBe(true);
+        expect(await until(() => told(notices) === 2, 5_000)).toBe(true);
+        expect(stub.stats.mintBodies).toHaveLength(0);
+      },
+      enrolledIn(stub)
+    );
+  }, 60_000);
+
   test("a named profile with no credentials refuses to connect and says so", async () => {
     const stub = startAuthStub();
     await withPlugin(

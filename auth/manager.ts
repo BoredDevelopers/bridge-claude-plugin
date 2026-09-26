@@ -327,18 +327,20 @@ export class CredentialManager {
     if (this.sessionBlocked) this.reconnectNext = true;
   }
 
-  /** The stop-class refusal that halted minting, or null (see `stopped`). */
+  /**
+   * The stop-class refusal that halts minting, or null (see `stopped`). A stop is about
+   * ONE installation: once the profile holds another (a /bridge:login in another
+   * session) it no longer stands, and is dropped here — so server.ts's watch can ask.
+   */
   stopReason(): CredentialError | null {
+    if (this.stopped && (this.installation()?.installationId ?? null) !== this.stopped.installationId) this.stopped = null;
     return this.stopped?.err ?? null;
   }
 
   /** Mint now. Single-flight across callers in this process. */
   renew(reason: string): Promise<Access> {
-    if (this.stopped) {
-      // Stale when the profile now holds another installation (logged in elsewhere).
-      if ((this.installation()?.installationId ?? null) !== this.stopped.installationId) this.stopped = null;
-      else return Promise.reject(this.stopped.err);
-    }
+    const stop = this.stopReason();
+    if (stop) return Promise.reject(stop);
     if (!this.inflight) {
       // A live socket rides the current token — or the one just dropped by a 401: either
       // way it must get the new one in-band.

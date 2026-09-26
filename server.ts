@@ -373,6 +373,7 @@ const creds = new CredentialManager({
     }
   },
   onLoggedIn: () => {
+    notifiedCredentialStop = null;
     wantConnected = true;
     intentExplicitlySet = true;
     writeConnectState(STATE_DIR, SESSION_KEY, true);
@@ -1141,8 +1142,19 @@ function credentialFailure(sock: WebSocket, err: unknown): void {
   } else {
     lastClose = { cls: "revoked", reason: msg };
     lastServerError = msg;
-    awaitingCredentials = true;
-    notifyModel(`⚠️ Bridge: ${msg}`, "error");
+    const kind = (err as CredentialError).kind;
+    // "No usable sign-in on disk" waits for the files to appear (a login in another session).
+    awaitingCredentials = kind === "not_logged_in" || kind === "profile" || kind === "api_url" || kind === "logged_out";
+    // A stop-class refusal (clock, corrupt state, update required, a server too old,
+    // session_limit, …) leaves the files in place, so the watch above would reconnect
+    // every 10 s straight into it. It waits for the STOP to lift instead. A revoked
+    // session (E9) is lifted by /bridge:connect alone — nothing to watch for.
+    awaitingStopLift = creds.stopReason() !== null;
+    // Each distinct refusal once: the model already knows, and `status` shows it.
+    if (msg !== notifiedCredentialStop) {
+      notifiedCredentialStop = msg;
+      notifyModel(`⚠️ Bridge: ${msg}`, "error");
+    }
   }
   scheduleReconnect();
 }
@@ -1154,10 +1166,22 @@ function credentialFailure(sock: WebSocket, err: unknown): void {
  * a 4008 "session revoked" — that stop is deliberate.
  */
 let awaitingCredentials = false;
+/**
+ * Set while minting is STOPPED by a refusal retrying will not fix (creds.stopReason()).
+ * Lifted — and the connection retried — only when that stop no longer stands: the
+ * profile holds a different installation (a login in another session). /bridge:connect
+ * and a login in THIS session clear the stop themselves.
+ */
+let awaitingStopLift = false;
+/** The terminal credential refusal last told to the model (re-armed by an auth, /bridge:connect, a login). */
+let notifiedCredentialStop: string | null = null;
 const credentialWatch = setInterval(() => {
-  if (!awaitingCredentials || !wantConnected || shuttingDown || creds.configError()) return;
+  if (!wantConnected || shuttingDown || creds.configError()) return;
+  const lifted = awaitingStopLift && creds.stopReason() === null;
+  if (!awaitingCredentials && !lifted) return;
   awaitingCredentials = false;
-  process.stderr.write("bridge channel: credentials appeared — connecting\n");
+  awaitingStopLift = false;
+  process.stderr.write(`bridge channel: ${lifted ? "a new sign-in on disk" : "credentials appeared"} — connecting\n`);
   restartConnection();
 }, 10_000);
 credentialWatch.unref?.();
@@ -1302,6 +1326,9 @@ function handleWsMessage(data: any): void {
       lastClose = { cls: "transient" };
       notifiedCloseClass = null;
       remintedAfter4001 = false;
+      awaitingCredentials = false;
+      awaitingStopLift = false;
+      notifiedCredentialStop = null;
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
       // delivered (the flush triggers are one-shot per gate)
@@ -3139,6 +3166,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // the next mint says so (reconnect=true) and the server opens a new session.
         // (0.24 behaviour: connect after a session revoke starts a new session.)
         creds.requestSessionReconnect();
+        // The person asked: a refusal that repeats is answered again.
+        notifiedCredentialStop = null;
         // Already open: re-persisting the intent above is enough. Tearing
         // down a healthy socket to "reconnect" would restart a connection
         // that does not need it — the no-op half of idempotent.

@@ -150,6 +150,8 @@ export function createAuthCore(opts: StubOptions = {}) {
     mintBodies: [] as Record<string, string>[],
     authTokens: [] as string[],
     reauths: 0,
+    /** WebSocket upgrades accepted — a socket opened, whatever its auth frame then carried. */
+    wsOpens: 0,
     /** The token of every ACCEPTED `reauth` frame. */
     reauthTokens: [] as string[],
     discoveryHits: 0,
@@ -680,6 +682,7 @@ export function startAuthStub(opts: StubOptions = {}) {
     },
     websocket: {
       open(ws: any) {
+        core.stats.wsOpens++;
         core.sockets.add(ws);
       },
       close(ws: any) {
