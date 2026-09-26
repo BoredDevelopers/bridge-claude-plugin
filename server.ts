@@ -365,6 +365,10 @@ const creds = new CredentialManager({
     if (ws && wsConnected && authenticated) {
       try {
         ws.send(JSON.stringify({ type: "reauth", token, dpop }));
+        // The socket now rides THIS token (the server's reauth swaps its credential): a
+        // later 4008 / 4009 must be judged against its session and installation, not
+        // the ones the socket first authenticated with.
+        reauthedWith.get(ws)?.(token);
       } catch {}
     }
   },
@@ -613,6 +617,8 @@ process.on("uncaughtException", (err) => {
 // ── WebSocket ───────────────────────────────────────────────────────────────
 
 let ws: WebSocket | null = null;
+/** Per socket: re-point what it authenticated with after an in-band `reauth` (onAccessRotated). */
+const reauthedWith = new WeakMap<WebSocket, (token: string) => void>();
 let wsConnected = false;
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -926,6 +932,10 @@ function connectWs(): void {
   // whatever credential the process holds by then.
   let sockBearer: string | undefined;
   let sockGrant: { installationId: string; sessionId: string } | null = null;
+  reauthedWith.set(sock, (token) => {
+    sockBearer = token;
+    sockGrant = creds.grant();
+  });
   sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;

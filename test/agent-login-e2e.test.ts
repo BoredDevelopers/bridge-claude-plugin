@@ -316,6 +316,29 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("after an in-band reauth onto a NEW session, a 4008 'session revoked' for that session blocks it (the socket's grant followed the reauth)", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        const fresh = await enrolledProfile(stub, dir); // a new installation ⇒ a new session
+        stub.expireAccess();
+        await client.callTool({ name: "list_channels", arguments: {} });
+        expect(await until(() => stub.stats.reauthTokens.length >= 1, 5_000)).toBe(true);
+        const session = stub.sessionsFor(fresh)[0]!;
+        stub.revokeSession(session.id); // closes this socket 4008 "session revoked"
+        expect(await until(() => notices().some((n) => n.includes("/bridge:connect starts a new session")), 5_000)).toBe(true);
+        const mints = stub.stats.mintBodies.length;
+        // Blocked HERE, without asking the server: a tool call sends no mint.
+        await client.callTool({ name: "list_channels", arguments: {} });
+        expect(stub.stats.mintBodies.length).toBe(mints);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
   test("a persistent 401 mints exactly once, then reports the error (no loop)", async () => {
     const stub = startAuthStub({ always401: true });
     await withPlugin(
