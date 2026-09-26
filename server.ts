@@ -621,6 +621,10 @@ let ws: WebSocket | null = null;
 const reauthedWith = new WeakMap<WebSocket, (token: string) => void>();
 let wsConnected = false;
 let reconnectAttempt = 0;
+// RFC-016 C14: a 4001 gets ONE immediate re-mint + reconnect; a second 4001 before an
+// `authenticated` frame takes the slow credential backoff (and tells the model once).
+// Re-armed by a completed auth.
+let remintedAfter4001 = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 // Why the last socket closed — drives the reconnect schedule (reconnect-policy.ts)
 // and the reason `status` reports. Cleared by a completed auth.
@@ -1026,8 +1030,12 @@ function connectWs(): void {
     lastClose = { cls, code, reason };
     process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
     // RFC-016 §3.4: 4009 = the access token ran out before a reauth — drop it so the
-    // reconnect's auth frame carries a fresh one.
-    if (cls === "expired") creds.invalidateAccess(sockBearer);
+    // reconnect's auth frame carries a fresh one. C14: 4001 = the token (or its proof)
+    // was refused — a DPoP token dies with its installation or session, so the next
+    // attempt must MINT (the mint then reports the real reason, §3.3), where
+    // re-presenting the dead token would only loop on 4001. sockBearer follows an
+    // in-band reauth (reauthedWith), so it is the token the server just refused.
+    if (cls === "expired" || code === 4001) creds.invalidateAccess(sockBearer);
     if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);
     if (cls === "revoked" && reason === "installation revoked") {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
@@ -1046,8 +1054,11 @@ function connectWs(): void {
         });
       return;
     }
-    notifyConnectionRefused(cls, code, reason);
-    scheduleReconnect();
+    const immediate = code === 4001 && !remintedAfter4001;
+    if (immediate) remintedAfter4001 = true;
+    // The first 4001 is handled here and now; only a repeat is the person's business.
+    if (!immediate) notifyConnectionRefused(cls, code, reason);
+    scheduleReconnect(immediate);
   });
 
   sock.addEventListener("error", (err) => {
@@ -1076,7 +1087,7 @@ function connectWs(): void {
   livenessTimer = liveness;
 }
 
-function scheduleReconnect(): void {
+function scheduleReconnect(immediate = false): void {
   // The `disconnect` tool (and a persisted "0" at startup) sets this false —
   // a single guard here covers every caller (WebSocket creation failure, the
   // close handler, the liveness watchdog) rather than needing one at each
@@ -1084,7 +1095,7 @@ function scheduleReconnect(): void {
   if (!wantConnected) return;
   if (reconnectTimer) return;
   reconnectAttempt++;
-  const delay = reconnectDelay(reconnectAttempt, lastClose.cls);
+  const delay = immediate ? 0 : reconnectDelay(reconnectAttempt, lastClose.cls);
   if (delay === null) {
     // Revoked: this token will never work again. Only /bridge:connect (after
     // /bridge:configure) tries again.
@@ -1203,14 +1214,17 @@ function stopConnection(): void {
  * Tell the MODEL when a close means "a person must act", once per refusal
  * episode (re-armed by a completed auth).
  *
- * ⚠️ ONLY 4003 AND 4008. 4001 and 4007 arrive with a server `error` frame
- * first ("Invalid token" / "Too many sessions"), which the error-frame path
- * already surfaces — a second notice here would say the same thing twice.
- * 4003 carries no frame (the server just closes), and 4008 may not either.
+ * ⚠️ ONLY 4003, 4008 AND A REPEATED 4001. 4007 arrives with a server `error`
+ * frame first ("Too many sessions"), which the error-frame path already
+ * surfaces — a second notice here would say the same thing twice. 4003 carries
+ * no frame (the server just closes), and 4008 may not either. A 4001 carries
+ * "Invalid token" — but a SECOND in a row (after C14's immediate re-mint) means a
+ * freshly minted token was refused too, which that frame does not say: this adds
+ * what to do (/bridge:login).
  */
 let notifiedCloseClass: CloseClass | null = null;
 function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined): void {
-  if (code !== 4003 && code !== 4008) return;
+  if (code !== 4003 && code !== 4008 && code !== 4001) return;
   if (notifiedCloseClass === cls) return;
   notifiedCloseClass = cls;
   mcp
@@ -1283,6 +1297,7 @@ function handleWsMessage(data: any): void {
       reconnectAttempt = 0;
       lastClose = { cls: "transient" };
       notifiedCloseClass = null;
+      remintedAfter4001 = false;
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
       // delivered (the flush triggers are one-shot per gate)

@@ -127,6 +127,87 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test('1011 "grant check failed" (a server DB hiccup): reconnects soon with the SAME token — no mint', async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        stub.closeAll(1011, "grant check failed");
+        // Transient curve: the first retry is ≤ 1 s away (never the ≥ 30 s credential step).
+        expect(await until(() => stub.stats.authTokens.length >= 2, 3_000)).toBe(true);
+        expect(stub.stats.authTokens[1]).toBe(stub.stats.authTokens[0]);
+        expect(stub.stats.mints).toBe(1);
+        expect(await until(() => stub.liveSockets() === 1, 3_000)).toBe(true);
+        expect((await status(client)).websocket).toBe("connected");
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("C14: 4001 drops the token and re-mints ONCE immediately; a second 4001 in a row takes the slow backoff and says /bridge:login once", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, _dir, notices) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        stub.rejectNextWsAuths(1); // the immediate retry is refused too
+        stub.closeAll(4001, "Invalid token");
+        // Immediate: well inside the credential class's ≥ 30 s first step (the transient ≥ 0.5 s is not used either).
+        expect(await until(() => stub.stats.authTokens.length >= 2, 2_000)).toBe(true);
+        expect(stub.stats.authTokens[1]).not.toBe(stub.stats.authTokens[0]);
+        expect(stub.stats.mints).toBe(2);
+        // The second 4001 (before any `authenticated`): slow — nothing for the next 5 s, and
+        // the model is told what to do, once.
+        expect(await until(() => notices().some((n) => n.includes("Bridge refused this session's access token")), 3_000)).toBe(true);
+        await Bun.sleep(5_000);
+        expect(stub.stats.authTokens).toHaveLength(2);
+        expect(String((await status(client)).websocket)).toContain("4001");
+        expect(notices().filter((n) => n.includes("Bridge refused this session's access token"))).toHaveLength(1);
+        expect(notices().find((n) => n.includes("Bridge refused this session's access token"))).toContain("/bridge:login");
+        // A successful auth re-arms the one immediate re-mint.
+        await client.callTool({ name: "connect", arguments: {} });
+        expect(await until(() => stub.stats.authTokens.length >= 3, 10_000)).toBe(true);
+        let connected = false;
+        for (let i = 0; i < 50 && !connected; i++) {
+          connected = (await status(client)).websocket === "connected";
+          if (!connected) await Bun.sleep(100);
+        }
+        expect(connected).toBe(true);
+        stub.closeAll(4001, "Invalid token");
+        expect(await until(() => stub.stats.authTokens.length >= 4, 2_000)).toBe(true);
+        expect(stub.stats.authTokens[3]).not.toBe(stub.stats.authTokens[2]);
+      },
+      enrolledIn(stub)
+    );
+  }, 40_000);
+
+  test("C14 after an in-band reauth: a 4001 drops the REAUTHED token and mints — it never re-presents it", async () => {
+    // 65 s tokens sit inside the 60 s expiry slack after 5 s, so a tool call then mints
+    // and reauths in-band. The reauthed token is itself fresh for 5 s: a reconnect that
+    // re-presented it would be ACCEPTED here, so only the mint count can tell.
+    const stub = startAuthStub({ accessTtlS: 65 });
+    await withPlugin(
+      stub,
+      {},
+      async (client) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        await Bun.sleep(5_300); // time itself is the precondition: the token must enter the expiry slack
+        await client.callTool({ name: "list_channels", arguments: {} });
+        expect(await until(() => stub.stats.reauthTokens.length >= 1, 3_000)).toBe(true);
+        const reauthed = stub.stats.reauthTokens[0]!;
+        const mints = stub.stats.mints;
+        stub.closeAll(4001, "Invalid token");
+        expect(await until(() => stub.stats.authTokens.length >= 2, 3_000)).toBe(true);
+        expect(stub.stats.authTokens[1]).not.toBe(reauthed);
+        expect(stub.stats.mints).toBe(mints + 1);
+      },
+      enrolledIn(stub)
+    );
+  }, 40_000);
+
   test("a scheduled mint hands the live socket the new token in-band (reauth + proof), no reconnect", async () => {
     const stub = startAuthStub({ accessTtlS: 8 });
     await withPlugin(
