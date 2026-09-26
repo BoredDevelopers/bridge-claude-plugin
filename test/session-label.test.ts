@@ -3,9 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { mintAgentToken } from "./agent-auth-stub";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 
 function startStub() {
   let authFrame: any = null;

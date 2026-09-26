@@ -18,10 +18,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { connectStateFileFor, writeConnectState } from "../connect-store";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
-import { writeInstallation } from "../auth/store";
+import { mintAgentToken } from "./agent-auth-stub";
+import { writeInstallation } from "../auth/node/store";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 
 describe("connect-on-demand: unconfigured startup", () => {
   test("stays alive and answers tools/list when unconfigured", async () => {
@@ -458,7 +460,7 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
     // own closed-port URL) — it still contends for the same lock as the
     // loser below, which uses the shared default profile against `stub`.
     const holderDir = join(dir, "profiles", "holder");
-    writeInstallation(holderDir, { apiUrl: "http://127.0.0.1:1", installationId: crypto.randomUUID(), installationToken: "brg_it_test" });
+    writeInstallation(holderDir, { apiUrl: "http://127.0.0.1:1", installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
     const holder = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,

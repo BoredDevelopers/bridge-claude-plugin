@@ -23,10 +23,12 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { mintAgentToken } from "./agent-auth-stub";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
 const SESSION_KEY = "11111111-2222-3333-4444-555555555555";
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 
 function labelFilePath(dir: string, key: string): string {
   return join(dir, `.session-label-${key}`);

@@ -45,11 +45,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { mintAgentToken } from "./agent-auth-stub";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
 const CHANNEL = "aio-tasks"; // deliberately NOT in the filter below
 const FILTER = "general,proj-micronomy"; // the operator's real value on 2026-07-30
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 
 type Stub = {
   port: number;

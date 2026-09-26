@@ -9,11 +9,12 @@
  * Config lives in ~/.claude/channels/bridge/.env:
  *   BRIDGE_API_URL=https://bridge-api.example.com
  *   BRIDGE_CHANNELS=general,dev (optional, empty = all)
- * Credentials come from /bridge:login (RFC-014): a per-machine installation in
- * <state>/credentials.json (or <state>/profiles/<BRIDGE_PROFILE>/), and a
- * rotating session grant per Claude session. The static BRIDGE_TOKEN is
- * retired — the server rejects it, so a leftover one is worth nothing but is
- * still surfaced as a hint (see CredentialManager.staleStaticTokenPresent).
+ * Credentials come from /bridge:login (RFC-016): a per-machine P-256 key and
+ * join state in <state>/{key.json,state,installation.json} (or
+ * <state>/profiles/<BRIDGE_PROFILE>/). Every Claude session mints its own 1 h
+ * DPoP-bound access token from them; every HTTP request and WS auth/reauth
+ * frame carries a fresh DPoP proof. The static BRIDGE_TOKEN is retired — a
+ * leftover one is surfaced as a hint only (CredentialManager.staleStaticTokenPresent).
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -342,9 +343,9 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 // slug, an env override) does not satisfy.
 let SESSION_KEY: string = FALLBACK_SESSION_KEY;
 
-// ── Credentials (RFC-014) ───────────────────────────────────────────────────
-// The bearer for this session: an access token from its own session grant under
-// the profile's installation. See auth/manager.ts.
+// ── Credentials (RFC-016) ───────────────────────────────────────────────────
+// This session's DPoP-bound access token, minted from the profile's installation
+// key + join state. See auth/manager.ts.
 const creds = new CredentialManager({
   profile: PROFILE,
   envApiUrl: ENV_API_URL,
@@ -357,12 +358,13 @@ const creds = new CredentialManager({
   platform: `${process.platform}-${process.arch}`,
   clientVersion: PLUGIN_VERSION,
   env: process.env,
-  onAccessRotated: (accessToken) => {
+  onAccessRotated: ({ token, dpop }) => {
     // The live socket authenticated with the previous token; hand it the new one
     // in-band (RFC-014 D9) so the server's expiry timer re-arms — no reconnect.
+    // RFC-016 E11: with its own proof (htm GET, htu <apiUrl origin>/ws, ath).
     if (ws && wsConnected && authenticated) {
       try {
-        ws.send(JSON.stringify({ type: "reauth", token: accessToken }));
+        ws.send(JSON.stringify({ type: "reauth", token, dpop }));
       } catch {}
     }
   },
@@ -927,15 +929,15 @@ function connectWs(): void {
   sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;
-    let bearer: string;
+    let cred: { token: string; dpop: string };
     try {
-      bearer = await creds.bearer();
+      cred = await creds.wsAuth();
     } catch (err) {
       credentialFailure(sock, err);
       return;
     }
     if (ws !== sock) return;
-    sockBearer = bearer;
+    sockBearer = cred.token;
     sockGrant = creds.grant();
     // reconnectAttempt is NOT reset here: the handshake succeeding proves
     // nothing. A server that accepts the socket and then rejects auth (revoked
@@ -945,7 +947,9 @@ function connectWs(): void {
       sock.send(
         JSON.stringify({
           type: "auth",
-          token: bearer,
+          token: cred.token,
+          // RFC-016 E11: proof of the token's key for GET <apiUrl origin>/ws.
+          dpop: cred.dpop,
           since: sinceParam(),
           sessionInfo: await getSessionInfoForAuth(),
           // Re-present our credential to prove we are the SAME session
@@ -1014,7 +1018,7 @@ function connectWs(): void {
     // RFC-014 D9. 4009: the access token ran out before a reauth — drop it so the
     // reconnect's auth frame carries a fresh one.
     if (cls === "expired") creds.invalidateAccess(sockBearer);
-    if (cls === "revoked" && reason === "session revoked") void creds.sessionRevoked(sockGrant?.sessionId ?? null);
+    if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);
     if (cls === "revoked" && reason === "installation revoked") {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
       // profile already holds the new one, this is a switch, not a sign-out.
@@ -1645,9 +1649,11 @@ async function apiFetch(
   opts: RequestInit = {},
   retried = false
 ): Promise<Response> {
-  let bearer: string;
+  let auth: { token: string; headers: { Authorization: string; DPoP: string } };
   try {
-    bearer = await creds.bearer();
+    // RFC-016 §3.4 / C16: `Authorization: DPoP …` + a fresh proof per request, for
+    // THIS method and the API origin + this path (the query is never signed).
+    auth = await creds.httpAuth(opts.method ?? "GET", path);
   } catch (err) {
     throw new Error(err instanceof Error ? err.message : String(err));
   }
@@ -1657,7 +1663,7 @@ async function apiFetch(
       ...opts,
       signal: opts.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
       headers: {
-        Authorization: `Bearer ${bearer}`,
+        ...auth.headers,
         "Content-Type": "application/json",
         // Which SESSION is calling. The bearer token above is shared by every
         // session of this agent and so cannot answer that; this can. Sent on
@@ -1687,10 +1693,22 @@ async function apiFetch(
   // again. THROWN, so every tool reports it the same way through its own
   // "X failed:" path; the two background callers (`loadChannelMap`,
   // `markReadUpTo`) already catch.
-  // An access token can die before its expiry (session revoked, server restarted
-  // its clock view): renew once and retry. Legacy tokens have nothing to renew.
+  // A 401 gets ONE retry, then is reported (no loop). What it retries with depends on
+  // the challenge (RFC 9449 §7.1 `WWW-Authenticate: DPoP error=…`):
+  //   - use_dpop_nonce (+ DPoP-Nonce): same token, the proof carries the nonce (§9);
+  //   - invalid_dpop_proof: same token, a fresh proof — after learning the server's
+  //     clock from this answer's Date (E12);
+  //   - invalid_token, or no DPoP challenge: the token died before its expiry (session
+  //     revoked, installation locked) — mint once (C-list: 401 → one re-mint).
   if (res.status === 401 && !retried && creds.source() === "installation") {
-    creds.invalidateAccess(bearer);
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    if (/error="?use_dpop_nonce/.test(challenge) && res.headers.get("dpop-nonce")) {
+      creds.noteResourceNonce(res.headers.get("dpop-nonce"));
+    } else if (/error="?invalid_dpop_proof/.test(challenge)) {
+      creds.observeServerDate(res.headers.get("date"));
+    } else {
+      creds.invalidateAccess(auth.token);
+    }
     return apiFetch(path, opts, true);
   }
   if (res.status === 429) {
@@ -2150,7 +2168,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "login",
       description:
-        "Sign this machine in to Bridge (RFC-014): opens the browser for one-click approval, or — on a headless/SSH machine — returns a short code to enter at the Bridge site. Returns immediately; completion is reported as a channel notification. Re-running replaces this profile's sign-in (the old one is revoked only after the new one succeeds).",
+        "Sign this machine in to Bridge (RFC-016 key credentials): opens the browser for one-click approval, or — on a headless/SSH machine — returns a short code to enter at the Bridge site. Returns immediately; completion is reported as a channel notification. Re-running replaces this profile's sign-in (the old one is revoked only after the new one succeeds).",
       inputSchema: {
         type: "object",
         properties: {
@@ -3088,6 +3106,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const problem = creds.configError();
         if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
+        // RFC-016 E9: after a session revoke, THIS is the explicit user reconnect —
+        // the next mint says so (reconnect=true) and the server opens a new session.
+        // (0.24 behaviour: connect after a session revoke starts a new session.)
+        creds.requestSessionReconnect();
         // Already open: re-persisting the intent above is enough. Tearing
         // down a healthy socket to "reconnect" would restart a connection
         // that does not need it — the no-op half of idempotent.
@@ -3373,8 +3395,9 @@ function shutdown(): void {
   try {
     ws?.close();
   } catch {}
-  // A refresh in flight has already rotated the token on the server; exiting before
-  // it is written leaves a consumed token on disk (reuse ⇒ the grant is revoked).
+  // A mint in flight has already advanced the join state on the server; exiting
+  // before the new state is written leaves the old one + its attempt on disk. That
+  // still converges (E6b replay) — draining just saves the extra round trip.
   void Promise.all([creds.drain(8_000), Bun.sleep(1000)]).finally(() => {
     creds.stop();
     process.exit(0);
@@ -3437,5 +3460,4 @@ if (startupProblem) {
   process.stderr.write(`bridge channel: ${startupProblem}\n`);
   awaitingCredentials = true;
 }
-creds.sweep();
 if (!shuttingDown && wantConnected && !startupProblem) connectUnlessDuplicate();

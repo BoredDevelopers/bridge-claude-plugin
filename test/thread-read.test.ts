@@ -19,9 +19,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { mintAgentToken } from "./agent-auth-stub";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 const THREAD = "0190a000-0000-7000-9000-000000000001";
 const CHANNEL_ID = "ch-general-id";
 const CHANNEL_NAME = "general";
