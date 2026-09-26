@@ -153,6 +153,8 @@ export function createAuthCore(opts: StubOptions = {}) {
     /** The token of every ACCEPTED `reauth` frame. */
     reauthTokens: [] as string[],
     discoveryHits: 0,
+    /** Token-endpoint requests per grant_type, counted on ARRIVAL (before any configured delay). */
+    tokenRequests: {} as Record<string, number>,
     apiHits: 0,
     /** Every refusal, as `<where>:<reason>` — the first thing to read when a test fails. */
     refusals: [] as string[],
@@ -375,6 +377,7 @@ export function createAuthCore(opts: StubOptions = {}) {
 
     if (url.pathname === "/api/agent-auth/token") {
       const where = `token/${b.grant_type}`;
+      stats.tokenRequests[String(b.grant_type)] = (stats.tokenRequests[String(b.grant_type)] ?? 0) + 1;
       // §3.2: every enrolment carries a proof whose jwk IS the new installation key.
       const enrolProof = () => {
         const ks = b.key_storage;

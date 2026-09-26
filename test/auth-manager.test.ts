@@ -128,8 +128,9 @@ describe("mint (§3.3, §5.2)", () => {
     await enrolledProfile(stub, dir);
     const { m } = manager(dir, stub.url);
     void m.accessToken();
-    await Bun.sleep(50);
-    expect(seq(dir)).toBe(0); // really in flight
+    // Really in flight: the attempt is written before the POST leaves.
+    expect(await until(() => readAttempt(dir) !== null)).toBe(true);
+    expect(seq(dir)).toBe(0);
     await m.drain(5_000);
     expect(seq(dir)).toBe(1);
   });
@@ -352,8 +353,7 @@ describe("mint (§3.3, §5.2)", () => {
     await enrolledProfile(stub, dir);
     const { m, events } = manager(dir, stub.url, { tickMs: 50, random: () => 0 });
     const first = await m.accessToken();
-    await Bun.sleep(5_400);
-    expect(events.rotated.length).toBeGreaterThanOrEqual(1);
+    expect(await until(() => events.rotated.length >= 1, 10_000)).toBe(true);
     const f = events.rotated[0]!;
     expect(f.token).not.toBe(first);
     const p = parseJws(f.dpop)!;
@@ -698,8 +698,7 @@ describe("login", () => {
     const done = await drive(url);
     expect(done.status).toBe(302);
     expect(done.headers.get("location")).toBe(`${stub.url}/connect/done?result=connected`);
-    await Bun.sleep(100);
-    const inst = readInstallation(dir)!;
+    const inst = readInstallation(dir)!; // the browser is answered only after completeLogin
     expect(inst.installationId).not.toBe(old);
     expect(inst.jkt).toBe(jkt!);
     expect(inst.jkt).not.toBe(oldJkt); // E1: never reused
@@ -717,7 +716,7 @@ describe("login", () => {
     const { m, events } = manager(dir, stub.url);
     const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
     await drive(url);
-    for (let i = 0; i < 40 && !events.notices.some((n) => n.includes("PREVIOUS")); i++) await Bun.sleep(50);
+    await until(() => events.notices.some((n) => n.includes("PREVIOUS")));
     expect(readInstallation(dir)!.installationId).not.toBe(old);
     expect(events.notices.join("\n")).toMatch(/PREVIOUS sign-in .* could not be revoked .* Settings → Agents → Machines/);
   });
@@ -761,7 +760,7 @@ describe("login", () => {
     const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
     const done = await drive(url);
     expect(done.headers.get("location")).toBe(`${stub.url}/connect/done?result=denied`);
-    await Bun.sleep(50);
+    expect(await until(() => events.notices.some((n) => n.includes("denied")))).toBe(true);
     expect(readInstallation(dir)!.installationId).toBe(old);
     expect(stub.isRevoked(old)).toBeNull();
     expect(events.notices.join()).toMatch(/denied/);
@@ -789,7 +788,7 @@ describe("login", () => {
     const redirect = url.searchParams.get("redirect_uri")!;
     const res = await fetch(`${redirect}?code=x&state=${url.searchParams.get("state")}&iss=https://evil.example`, { redirect: "manual" });
     expect(res.headers.get("location")).toBe(`${stub.url}/connect/done?result=error`);
-    await Bun.sleep(50);
+    expect(await until(() => events.notices.some((n) => n.includes("issuer_mismatch")))).toBe(true);
     expect(readInstallation(dir)).toBeNull();
     expect(events.notices.join()).toMatch(/issuer_mismatch/);
   });
@@ -806,7 +805,7 @@ describe("login", () => {
     const text = await m.login("device");
     expect(text).toContain("BCDF-GHJK");
     expect(text).toContain(`${stub.url}/connect`);
-    for (let i = 0; i < 40 && !readInstallation(dir); i++) await Bun.sleep(100);
+    await until(() => readInstallation(dir) !== null);
     expect(readInstallation(dir)).not.toBeNull();
     expect(readKey(dir)).not.toBeNull();
     expect(seq(dir)).toBe(0);
@@ -830,7 +829,7 @@ describe("login", () => {
     const cb = (await fetch(url, { redirect: "manual" })).headers.get("location")!;
     // Another session holds the lock for 12 s (past Bun's 10 s default idle timeout).
     const busy = withInstallationLock(dir, () => Bun.sleep(12_000));
-    await Bun.sleep(50);
+    expect(await until(() => existsSync(join(dir, LOCK_DIR_NAME)))).toBe(true);
     const done = await fetch(cb, { redirect: "manual" });
     await busy;
     expect(done.headers.get("location")).toBe(`${stub.url}/connect/done?result=connected`);
@@ -842,10 +841,11 @@ describe("login", () => {
     const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
     const cb = (await fetch(url, { redirect: "manual" })).headers.get("location")!;
     const done = fetch(cb, { redirect: "manual" });
-    await Bun.sleep(100);
+    // The code exchange has reached the server (it answers after codeDelayMs).
+    expect(await until(() => (stub.stats.tokenRequests["authorization_code"] ?? 0) >= 1)).toBe(true);
     await m.logout(true);
     expect((await done).headers.get("location")).toBe(`${stub.url}/connect/done?result=error`);
-    await Bun.sleep(900);
+    expect(await until(() => stub.stats.revokes.length === 1)).toBe(true); // the late exchange's installation
     expect(readInstallation(dir)).toBeNull();
     expect(events.loggedIn).toBe(0);
     expect(stub.stats.revokes).toHaveLength(1);
@@ -870,7 +870,7 @@ describe("login", () => {
     const text = await m.login("device");
     expect(text).not.toContain("BCDF-GHJK");
     expect(p.seen.shown.join()).toContain("BCDF-GHJK");
-    for (let i = 0; i < 40 && !readInstallation(dir); i++) await Bun.sleep(100);
+    await until(() => readInstallation(dir) !== null);
     expect(readInstallation(dir)).not.toBeNull();
     expect(p.seen.asked[0]).toContain('@agent-one (Agent One) in workspace "Acme"');
   }, 10_000);
@@ -881,8 +881,8 @@ describe("login", () => {
     const p = prompting(false);
     const { m, events } = manager(dir, stub.url, { prompt: p.prompt });
     await m.login("device");
-    for (let i = 0; i < 40 && p.seen.asked.length === 0; i++) await Bun.sleep(100);
-    await Bun.sleep(200);
+    expect(await until(() => p.seen.asked.length > 0)).toBe(true);
+    expect(await until(() => events.notices.some((n) => n.includes("declined")))).toBe(true);
     expect(p.seen.asked[0]).toContain("replaces this machine's current Bridge sign-in");
     expect(readInstallation(dir)!.installationId).toBe(old);
     expect(stub.isRevoked(old)).toBeNull();
@@ -898,10 +898,11 @@ describe("login", () => {
     const { stub, dir } = setup({ devicePollDelayMs: 600, deviceIntervalS: 1 });
     const { m, events } = manager(dir, stub.url);
     await m.login("device");
-    await Bun.sleep(1_200);
+    // The (approving) poll has reached the server and is held there for 600 ms.
+    expect(await until(() => (stub.stats.tokenRequests["urn:ietf:params:oauth:grant-type:device_code"] ?? 0) >= 1)).toBe(true);
     expect(stub.stats.enrols).toBe(0); // the poll is really in flight
     await m.logout(true);
-    for (let i = 0; i < 40 && stub.stats.revokes.length === 0; i++) await Bun.sleep(50);
+    await until(() => stub.stats.revokes.length > 0);
     expect(stub.stats.enrols).toBe(1);
     expect(stub.stats.revokes).toHaveLength(1);
     expect(stub.isRevoked(stub.stats.revokes[0]!.id)).toBe("installation_revoked");
@@ -1045,7 +1046,7 @@ describe("logout and enrolment keys", () => {
     const { stub, dir } = setup({ keyAlreadyEnrolled: 1, deviceIntervalS: 1 });
     const { m } = manager(dir, stub.url);
     await m.login("device");
-    for (let i = 0; i < 40 && !readInstallation(dir); i++) await Bun.sleep(100);
+    await until(() => readInstallation(dir) !== null);
     expect(readInstallation(dir)).not.toBeNull();
     expect(stub.installation(readInstallation(dir)!.installationId)!.jkt).toBe(readInstallation(dir)!.jkt);
   }, 10_000);
@@ -1127,8 +1128,7 @@ describe("RFC-014 (0.23 / 0.24) → 0.25", () => {
     await m.retireLegacyCredentials();
     const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
     await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!, { redirect: "manual" });
-    await Bun.sleep(100);
-    expect(m.configError()).toBeNull();
+    expect(await until(() => m.configError() === null)).toBe(true);
     expect(existsSync(join(dir, "upgrade-required.json"))).toBe(false);
   });
 });
