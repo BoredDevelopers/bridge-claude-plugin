@@ -1,15 +1,32 @@
 /**
- * Credential files for one profile (RFC-016 §5.1). 0600 files written tmp+rename,
- * ONE FILE PER ITEM — never a shared blob (Claude Code #93537: a read-modify-write
- * of one blob by concurrent processes zeroes siblings).
+ * Credential files for one profile (RFC-016 §5.1). ONE FILE PER ITEM — never a shared
+ * blob (Claude Code #93537: a read-modify-write of one blob by concurrent processes
+ * zeroes siblings). All 0600.
  *
- *   <profile>/key.json            the installation's P-256 private JWK
- *   <profile>/state               the current join state `brg_js_<seq>_…`
- *   <profile>/attempt             write-ahead attempt, only while a mint is in flight (E5)
+ *   <profile>/key.json            the installation's P-256 private JWK        (tmp + rename)
+ *   <profile>/state               the current join state `brg_js_<seq>_…`     (tmp + rename)
  *   <profile>/installation.json   {apiUrl, installationId, jkt, …} — written LAST: its
- *                                 presence means "enrolled"
+ *                                 presence means "enrolled"                    (tmp + rename)
+ *   <profile>/attempt             write-ahead attempt, only while a mint is in flight (E5):
+ *                                 EXCLUSIVE CREATE in place (O_EXCL), never tmp + rename
+ *   <profile>/logged-out          marker, plain write (content is only a timestamp)
  *
  * The access token is never written: it lives in memory, 1 h.
+ *
+ * ⚠️ E5 ORDER + DURABILITY (a power loss must not self-lock the machine). A mint is:
+ * create `attempt` (fsync file + directory) → POST → write the new `state` (tmp, fsync,
+ * rename, fsync directory) → delete `attempt`. Every step is durable before the next, so
+ * after a crash the disk holds either (old state + attempt) — the retry is a replay,
+ * E6(b) — or (new state), never (old state, attempt gone) after the server advanced,
+ * which would present a stale state without its attempt: a LOCK (E6d). Without the
+ * fsyncs a crash can reorder exactly that.
+ *
+ * Orphan temp files (a crash between write and rename) can hold the PRIVATE KEY:
+ * `sweepOrphanTemps` removes them — call it once when a process opens the profile, and
+ * deleteInstallationFiles removes them too.
+ *
+ * Windows: the 0600 / 0700 modes are ignored there; the files are as private as the
+ * profile directory's ACL (by default the user's profile, owner-only).
  *
  * ⚠️ CROSS-VERSION: A STALE 0.24 PROCESS MAY SHARE THIS DIRECTORY. 0.24 (RFC-014) reads
  * and deletes only `credentials.json` and `sessions/` (recursively), sweeps `sessions/*`
@@ -21,7 +38,8 @@
  *
  * Node `fs` only (works on Bun and Node) — the SDK's node adapter, not `core/`.
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, statSync, readdirSync, rmdirSync, existsSync } from "fs";
+import * as fs from "fs";
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync, readdirSync, rmdirSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { isP256PrivateJwk, type EcPrivateJwk } from "../core/jwk";
 import { isJoinState, joinStateSeq } from "../core/join-state";
@@ -63,11 +81,86 @@ function readJson<T>(path: string): T | null {
   }
 }
 
+/**
+ * The syscalls whose ORDER is the durability guarantee — one object so the tests can
+ * record the sequence (ESM namespace imports cannot be spied on). Production never
+ * replaces them.
+ */
+export const __io = {
+  openSync: fs.openSync,
+  writeSync: fs.writeSync,
+  fsyncSync: fs.fsyncSync,
+  closeSync: fs.closeSync,
+  renameSync: fs.renameSync,
+};
+
+/** Synchronous sleep (the writers are synchronous): Atomics.wait on a private buffer. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Write + fsync + close a file descriptor's full content. */
+function writeAllAndSync(fd: number, content: string): void {
+  const buf = Buffer.from(content, "utf8");
+  let off = 0;
+  while (off < buf.length) off += __io.writeSync(fd, buf, off, buf.length - off);
+  __io.fsyncSync(fd);
+}
+
+/** fsync a DIRECTORY, so a create / rename / unlink in it survives a crash. Unsupported (Windows: EPERM/EISDIR) is not an error. */
+function fsyncDir(dir: string): void {
+  let fd: number;
+  try {
+    fd = __io.openSync(dir, "r");
+  } catch {
+    return;
+  }
+  try {
+    __io.fsyncSync(fd);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code !== "EPERM" && code !== "EISDIR" && code !== "EINVAL" && code !== "ENOTSUP") throw e;
+  } finally {
+    __io.closeSync(fd);
+  }
+}
+
+const RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * rename, retried on EPERM / EACCES / EBUSY with backoff (~1 s in all): on Windows an
+ * antivirus or indexer briefly holding the target makes a rename fail transiently.
+ */
+function renameWithRetry(from: string, to: string): void {
+  for (let delay = 10; ; delay *= 2) {
+    try {
+      __io.renameSync(from, to);
+      return;
+    } catch (e) {
+      if (!RENAME_RETRY_CODES.has((e as NodeJS.ErrnoException)?.code ?? "") || delay > 640) throw e;
+      sleepSync(delay);
+    }
+  }
+}
+
+/** tmp (0600) → write → fsync → rename → fsync the directory. A failure leaves no temp file behind. */
 function writeAtomic(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}.${Date.now()}.${randomB64url(4)}.tmp`;
-  writeFileSync(tmp, content, { mode: 0o600 });
-  renameSync(tmp, path);
+  const fd = __io.openSync(tmp, "wx", 0o600);
+  try {
+    try {
+      writeAllAndSync(fd, content);
+    } finally {
+      __io.closeSync(fd);
+    }
+    renameWithRetry(tmp, path);
+  } catch (e) {
+    remove(tmp);
+    throw e;
+  }
+  fsyncDir(dir);
 }
 
 function remove(path: string): void {
@@ -113,7 +206,10 @@ export function readState(dir: string): string | null {
   return isJoinState(t) ? t : null;
 }
 
-/** A fresh enrolment's seq-0 state (the profile's files were just cleared). */
+/**
+ * An UNCONDITIONAL write — only for an enrolment, which stores the server's fresh state
+ * after clearing the profile. Every mint writes through writeStateIfNotOlder.
+ */
 export function writeState(dir: string, state: string): void {
   if (!isJoinState(state)) throw new Error("refusing to write a malformed join state");
   writeAtomic(stateFile(dir), state + "\n");
@@ -138,26 +234,67 @@ export function writeStateIfNotOlder(dir: string, state: string): boolean {
 /** RFC-016 C4: 32 random bytes, base64url. */
 const ATTEMPT = /^[A-Za-z0-9_-]{43}$/;
 
+/** The attempt file exists but cannot be read (EACCES, EISDIR, …): never spin on it, never replace it. */
+export class AttemptUnreadableError extends Error {
+  override readonly name = "AttemptUnreadableError";
+}
+
+/** The attempt's text; null only when it does not exist (ENOENT). Anything else throws. */
+function readAttemptRaw(dir: string): string | null {
+  try {
+    return readFileSync(attemptFile(dir), "utf8").trim();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+    throw new AttemptUnreadableError(`${attemptFile(dir)} exists but cannot be read (${(e as NodeJS.ErrnoException)?.code ?? e}) — fix its permissions or delete it`, { cause: e });
+  }
+}
+
+/** Make a value another process wrote durable before we send it (its writer may not have fsynced yet). */
+function syncExisting(dir: string): void {
+  const fd = __io.openSync(attemptFile(dir), "r");
+  try {
+    __io.fsyncSync(fd);
+  } finally {
+    __io.closeSync(fd);
+  }
+  fsyncDir(dir);
+}
+
 /**
  * E5: the write-ahead attempt. EXCLUSIVE create (`wx` = O_CREAT|O_EXCL); on EEXIST
  * read and reuse the existing value, so two racers past a broken lock send the SAME
  * attempt and converge through E6(b). A just-created file can be read empty for a
  * moment (create and write are two syscalls): wait for its content rather than
  * replace it — replacing would give the two racers different attempts (a false lock).
+ *
+ * DURABLE ON RETURN: the file and its directory entry are fsynced before this resolves,
+ * i.e. before the POST that uses the value can go out (see the header).
  */
 export async function createOrReadAttempt(dir: string, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))): Promise<string> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   for (let i = 0; ; i++) {
     const fresh = randomB64url(32);
+    let fd: number | null = null;
     try {
-      writeFileSync(attemptFile(dir), fresh, { flag: "wx", mode: 0o600 });
-      return fresh;
+      fd = __io.openSync(attemptFile(dir), "wx", 0o600);
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
     }
-    const existing = readText(attemptFile(dir))?.trim() ?? null;
-    if (existing !== null && ATTEMPT.test(existing)) return existing;
-    if (existing === null) continue; // deleted between our create and read: try again
+    if (fd !== null) {
+      try {
+        writeAllAndSync(fd, fresh);
+      } finally {
+        __io.closeSync(fd);
+      }
+      fsyncDir(dir);
+      return fresh;
+    }
+    const existing = readAttemptRaw(dir);
+    if (existing !== null && ATTEMPT.test(existing)) {
+      syncExisting(dir);
+      return existing;
+    }
+    if (existing === null) continue; // deleted between our create and read (ENOENT only): try again
     if (i >= 20) {
       // Empty/garbage for over a second: its writer died between the two syscalls.
       remove(attemptFile(dir));
@@ -177,12 +314,39 @@ export function deleteAttempt(dir: string): void {
   remove(attemptFile(dir));
 }
 
-/** Logout / terminal refusal / re-enrolment. installation.json FIRST: others then read "signed out". */
+/** Logout / terminal refusal / re-enrolment. installation.json FIRST: others then read "signed out". Orphan temps too (any age). */
 export function deleteInstallationFiles(dir: string): void {
   remove(installationFile(dir));
   remove(keyFile(dir));
   remove(stateFile(dir));
   remove(attemptFile(dir));
+  sweepOrphanTemps(dir, 0);
+  fsyncDir(dir);
+}
+
+/** writeAtomic's temp names for THIS store's files: `<file>.<pid>.<ms>.<rand>.tmp`. Never a 0.24 or hook temp. */
+const OWN_TMP = /^(key\.json|state|installation\.json|upgrade-required\.json)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
+/** Older than this, a temp file is no writer's in-flight write (a write is milliseconds). */
+export const ORPHAN_TMP_AGE_MS = 60_000;
+
+/**
+ * Remove this store's temp files a crash left behind — they can hold the PRIVATE KEY.
+ * Call once when a process opens the profile (default age: a concurrent writer's
+ * in-flight temp is never touched). Returns how many it removed.
+ */
+export function sweepOrphanTemps(dir: string, minAgeMs = ORPHAN_TMP_AGE_MS): number {
+  let n = 0;
+  const cutoff = Date.now() - minAgeMs;
+  for (const name of names(dir)) {
+    if (!OWN_TMP.test(name)) continue;
+    const p = join(dir, name);
+    try {
+      if (minAgeMs > 0 && statSync(p).mtimeMs > cutoff) continue;
+      unlinkSync(p);
+      n++;
+    } catch {}
+  }
+  return n;
 }
 
 // ── markers ────────────────────────────────────────────────────────────────
