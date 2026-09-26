@@ -631,10 +631,7 @@ let reconnectAttempt = 0;
 // survived that long was usable, and a flap costs at most one mint per 30 s.
 let remintedAfter4001 = false;
 /** TEST-ONLY override (ms) of the re-arm window; default 30 s. */
-const REMINT_REARM_MS = (() => {
-  const n = Number(process.env.BRIDGE_TEST_REMINT_REARM_MS);
-  return Number.isInteger(n) && n > 0 ? n : 30_000;
-})();
+const REMINT_REARM_MS = testKnob("BRIDGE_TEST_REMINT_REARM_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
 /** When the current socket completed its auth (null while it has not). */
 let authenticatedAt: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -646,7 +643,18 @@ let nextReconnectAt: number | null = null;
 // healthy socket is never silent this long; a half-open one (laptop sleep,
 // NAT/tunnel timeout) is silent forever and never fires `close`.
 let livenessTimer: ReturnType<typeof setInterval> | null = null;
-const LIVENESS_TIMEOUT_MS = 90000;
+/** TEST-ONLY override (ms); default 90 s. The check runs every third of it (30 s by default). */
+const LIVENESS_TIMEOUT_MS = testKnob("BRIDGE_TEST_LIVENESS_MS", (n) => Number.isInteger(n) && n >= 300) ?? 90000;
+
+/**
+ * A TEST-ONLY timing knob: honoured only when BRIDGE_TEST=1, so a stray variable in a
+ * real environment can never change production timing. undefined = use the default.
+ */
+function testKnob(name: string, valid: (n: number) => boolean): number | undefined {
+  if (process.env.BRIDGE_TEST !== "1") return undefined;
+  const n = Number(process.env[name]);
+  return process.env[name] && valid(n) ? n : undefined;
+}
 let agentId = "";
 let agentName = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
@@ -935,6 +943,11 @@ function channelDecision(channelId: string): ChannelDecision {
 }
 
 function connectWs(): void {
+  // No socket is authenticated from here until this one says so. A predecessor that
+  // never reached the close handler (the liveness watchdog, credentialFailure and
+  // restartConnection all detach it first) must not leave its auth time behind: a
+  // later pre-auth 4001 would read that socket's uptime as this one's and re-arm C14.
+  authenticatedAt = null;
   if (livenessTimer) {
     clearInterval(livenessTimer);
     livenessTimer = null;
@@ -1120,7 +1133,7 @@ function connectWs(): void {
       authenticated = false;
       scheduleReconnect();
     }
-  }, 30000);
+  }, LIVENESS_TIMEOUT_MS / 3);
   livenessTimer = liveness;
 }
 
@@ -1128,10 +1141,7 @@ function connectWs(): void {
  * TEST-ONLY: scales every reconnect delay (default 1). Lets an e2e test reach the slow
  * credential schedule's first retry in about a second; the schedule's SHAPE is unchanged.
  */
-const BACKOFF_SCALE = (() => {
-  const n = Number(process.env.BRIDGE_TEST_BACKOFF_SCALE);
-  return n > 0 && n <= 1 ? n : 1;
-})();
+const BACKOFF_SCALE = testKnob("BRIDGE_TEST_BACKOFF_SCALE", (n) => n > 0 && n <= 1) ?? 1;
 
 function scheduleReconnect(immediate = false): void {
   // The `disconnect` tool (and a persisted "0" at startup) sets this false —
@@ -1246,7 +1256,7 @@ function waitFor(err: CredentialError): typeof waitingFor {
  * TEST-ONLY override of the watch period (ms). Default 10 s. A lower value only makes
  * the watch notice files sooner; it cannot make a stopped session mint.
  */
-const CREDENTIAL_WATCH_MS = positiveInt(process.env.BRIDGE_CREDENTIAL_WATCH_MS) ?? 10_000;
+const CREDENTIAL_WATCH_MS = testKnob("BRIDGE_TEST_CREDENTIAL_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 10_000;
 const credentialWatch = setInterval(() => {
   if (waitingFor === null || !wantConnected || shuttingDown || creds.configError()) return;
   if (waitingFor === "stop-lift" && creds.refreshStop() !== null) return;
@@ -1254,11 +1264,6 @@ const credentialWatch = setInterval(() => {
   restartConnection();
 }, CREDENTIAL_WATCH_MS);
 credentialWatch.unref?.();
-
-function positiveInt(v: string | undefined): number | undefined {
-  const n = Number(v);
-  return Number.isInteger(n) && n > 0 ? n : undefined;
-}
 
 function notifyModel(content: string, type: "error" | "status"): void {
   mcp
@@ -1347,7 +1352,7 @@ function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reas
 function connectionState(): string {
   if (wsConnected && authenticated) return "connected";
   if (wsConnected) return "connected, not authenticated";
-  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, lastClose)}`;
+  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, { keyDeleted: lastClose.keyDeleted })}`;
   if (reconnectTimer) {
     const inS = nextReconnectAt ? Math.max(0, Math.round((nextReconnectAt - Date.now()) / 1000)) : 0;
     return `disconnected (reconnect attempt ${reconnectAttempt}, in ${inS}s)${why}`;

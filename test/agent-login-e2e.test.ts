@@ -49,6 +49,9 @@ async function withPlugin<T>(
       BRIDGE_BROWSER: "none",
       CLAUDE_CODE_SESSION_ID: SESSION,
       CLAUDE_CODE_SSE_PORT: "",
+      // Enables the BRIDGE_TEST_* timing knobs (server.ts testKnob); a test that proves
+      // they are ignored in production overrides it.
+      BRIDGE_TEST: "1",
       ...env,
     } as Record<string, string>,
     stderr: "pipe",
@@ -264,6 +267,51 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("C14 re-arm is per socket: a long-lived socket the liveness watchdog detached does not lend its uptime to the next socket's pre-auth 4001", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      { BRIDGE_TEST_REMINT_REARM_MS: "1500", BRIDGE_TEST_LIVENESS_MS: "3000" },
+      async (client) => {
+        const connected = async () => (await status(client)).websocket === "connected";
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(4001, "Invalid token"); // spends the one immediate re-mint
+        expect(await until(() => stub.stats.authTokens.length >= 2, 2_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
+        const opens = stub.stats.wsOpens;
+        // The stub sends nothing after `authenticated`: the watchdog detaches this socket
+        // (> 1.5 s up) after ~3 s of silence and reconnects. That reconnect's auth is refused 4001.
+        stub.rejectNextWsAuths(1);
+        expect(await until(() => stub.stats.wsOpens > opens, 8_000)).toBe(true);
+        expect(await until(() => stub.stats.authTokens.length >= 3, 5_000)).toBe(true);
+        // Not re-armed (this socket was never authenticated): the slow step, not an immediate re-mint.
+        await Bun.sleep(1_000); // a negative
+        expect(stub.stats.authTokens).toHaveLength(3);
+        expect(String((await status(client)).websocket)).toContain("4001");
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("a 4008 on the AUTH path (the server's grant re-check): its error frame is not told as a server error; the lock notice is told exactly once", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices) => {
+        expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
+        stub.rejectNextWsAuths(1, 4008, "installation locked");
+        stub.closeAll(1011, "grant check failed"); // the reconnect's auth meets the lock
+        expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
+        expect(await until(() => readInstallation(dir) === null, 5_000)).toBe(true);
+        await Bun.sleep(500); // a negative: nothing else arrives
+        expect(notices().filter((n) => n.includes("credential copy detected"))).toHaveLength(1);
+        expect(notices().filter((n) => n.includes("server error"))).toEqual([]);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
   test("C14 after an in-band reauth: a 4001 drops the REAUTHED token and mints — it never re-presents it", async () => {
     // 62 s tokens sit inside the 60 s expiry slack after 2 s, so a tool call then mints
     // and reauths in-band. The reauthed token is itself fresh for 2 s — the immediate
@@ -443,7 +491,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     try {
       await withPlugin(
         stub,
-        { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
+        { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
           cpSync(dir, loot, { recursive: true });
@@ -679,7 +727,7 @@ describe("plugin on key credentials (RFC-016)", () => {
 
   test("a login done in ANOTHER session is picked up without /bridge:connect here", async () => {
     const stub = startAuthStub();
-    await withPlugin(stub, { BRIDGE_CREDENTIAL_WATCH_MS: "200" }, async (client, dir, _n, _p, stderr) => {
+    await withPlugin(stub, { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" }, async (client, dir, _n, _p, stderr) => {
       expect((await status(client)).configured).toBe(false);
       // Past startup (session-key resolution, then the boot's own connect decision): from
       // here only the credential watch can notice the new files.
@@ -731,7 +779,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const told = (notices: () => string[]) => notices().filter((n) => n.includes("must be upgraded")).length;
     await withPlugin(
       stub,
-      { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
+      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
         expect(await until(() => told(notices) === 1, 5_000)).toBe(true);
         const opens = stub.stats.wsOpens;
@@ -827,7 +875,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub(opts);
     await withPlugin(
       stub,
-      { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
+      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
         expect(await until(() => notices().some((n) => n.includes("check the system clock")), 10_000)).toBe(true);
         expect(existsSync(join(dir, "key.json"))).toBe(true);
@@ -849,7 +897,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub(opts);
     await withPlugin(
       stub,
-      { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
+      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, _dir, notices, _p, stderr) => {
         expect(await until(() => notices().some((n) => n.includes("check the system clock")), 5_000)).toBe(true);
         opts.rejectAssertions = false;
@@ -895,6 +943,23 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(await until(connected, 5_000)).toBe(true); // the retry authenticated
         stub.closeAll(4003, "deregistered");
         expect(await until(() => told() === 2, 5_000)).toBe(true);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("the BRIDGE_TEST_* timing knobs are ignored unless BRIDGE_TEST=1: production timing stays", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      { BRIDGE_TEST: "", BRIDGE_TEST_BACKOFF_SCALE: "0.02", BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      async (client) => {
+        expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
+        stub.closeAll(4003, "deregistered");
+        await Bun.sleep(1_500); // a negative: the scaled retry would be ~1 s; the real one is ≥ 30 s
+        expect(stub.stats.authTokens).toHaveLength(1);
+        const inS = Number(/in (\d+)s/.exec(String((await status(client)).websocket))?.[1]);
+        expect(inS).toBeGreaterThanOrEqual(25);
       },
       enrolledIn(stub)
     );

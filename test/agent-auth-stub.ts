@@ -194,11 +194,16 @@ export function createAuthCore(opts: StubOptions = {}) {
   }
 
   /**
-   * Close like the server (ws.ts closeDeadGrant / runAuthenticateWs / the 4009 timer):
-   * 4001, 1011 and 4009 are preceded by an `error` frame; a revoke's 4008 is not.
+   * Close a socket from its AUTH / REAUTH path (or the 4009 timer) like the server does
+   * (ws.ts runAuthenticateWs / reauthenticateWs → closeDeadGrant, the expiry timer):
+   * EVERY such close is preceded by an `error` frame — 4001 "Invalid token", 1011
+   * "grant check failed", 4009 "Access token expired", and a 4008 carries its reason
+   * ("session revoked" / "session evicted" / "installation locked" / "installation
+   * revoked") as the message. A revoke's broadcast (disconnectGrantSockets →
+   * closeWhere above) sends NO frame.
    */
   function closeLikeServer(ws: any, code: number, reason: string) {
-    const frame: Record<number, string> = { 4001: "Invalid token", 1011: "grant check failed", 4009: "Access token expired" };
+    const frame: Record<number, string> = { 4001: "Invalid token", 1011: "grant check failed", 4009: "Access token expired", 4008: reason };
     if (frame[code]) {
       try {
         ws.send(JSON.stringify({ type: "error", data: { message: frame[code] } }));
