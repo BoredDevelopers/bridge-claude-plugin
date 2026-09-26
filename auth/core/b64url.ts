@@ -14,7 +14,18 @@ export function b64urlJson(value: unknown): string {
   return b64url(new TextEncoder().encode(JSON.stringify(value)));
 }
 
+/** Input that is not unpadded base64url (wrong alphabet, padding, or an impossible length). */
+export class B64urlError extends Error {
+  override readonly name = "B64urlError";
+}
+
+const B64URL = /^[A-Za-z0-9_-]*$/;
+
 export function b64urlDecode(s: string): Uint8Array<ArrayBuffer> {
+  // `atob` would silently accept the standard alphabet, padding and whitespace; a length
+  // of 4n+1 cannot encode whole bytes.
+  if (!B64URL.test(s)) throw new B64urlError("not base64url: characters outside [A-Za-z0-9_-]");
+  if (s.length % 4 === 1) throw new B64urlError(`not base64url: impossible length ${s.length}`);
   const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);

@@ -22,11 +22,24 @@ describe("DPoP proofs (RFC 9449, RFC-016 §3.4 / E11)", () => {
       expect(normalizeHtu(u)).toBe(normHtu(u));
     }
     expect(normalizeHtu("HTTPS://Bridge-API.Example.com:443/api/x?q=1#f")).toBe("https://bridge-api.example.com/api/x");
+    // Only http(s) names a Bridge endpoint (the server's normaliser refuses the rest).
+    for (const u of ["ws://h.example/ws", "ftp://h.example/x", "file:///etc/passwd"]) expect(() => normalizeHtu(u)).toThrow();
   });
 
   test("the WS htu is the apiUrl ORIGIN + /ws, in http(s) form", () => {
     expect(wsHtu("https://Bridge-API.example.com")).toBe("https://bridge-api.example.com/ws");
     expect(wsHtu("http://127.0.0.1:4000/")).toBe("http://127.0.0.1:4000/ws");
+    // A ws(s) URL maps to its http(s) form (default ports dropped on the way).
+    expect(wsHtu("wss://Bridge-API.example.com/ws")).toBe("https://bridge-api.example.com/ws");
+    expect(wsHtu("wss://h.example:443")).toBe("https://h.example/ws");
+    expect(wsHtu("ws://127.0.0.1:4000/ws")).toBe("http://127.0.0.1:4000/ws");
+    expect(() => wsHtu("ftp://h.example")).toThrow();
+  });
+
+  test("an empty access token or nonce is refused, never signed into a proof", async () => {
+    const { signer } = await generateSoftwareKey();
+    await expect(dpopProof(signer, new Clock(), { htm: "GET", htu: "http://h.example/ws", accessToken: "" })).rejects.toThrow();
+    await expect(dpopProof(signer, new Clock(), { htm: "GET", htu: "http://h.example/ws", nonce: "" })).rejects.toThrow();
   });
 
   test("a resource proof: typ dpop+jwt, public jwk, htm, htu, iat, fresh jti, ath = SHA-256(token), nonce when given", async () => {
@@ -55,9 +68,60 @@ describe("client assertion (E2)", () => {
     expect(a.claims.exp - a.claims.iat).toBe(ASSERTION_TTL_S);
     expect(ASSERTION_TTL_S).toBeLessThanOrEqual(300);
   });
+
+  test("every assertion carries a fresh jti (single-use server-side, E12)", async () => {
+    const { signer } = await generateSoftwareKey();
+    const jtis = new Set<string>();
+    for (let i = 0; i < 20; i++) {
+      const jti = parseJws(await clientAssertion(signer, new Clock(), "inst-1", "https://x.example/api/agent-auth"))!.claims.jti;
+      expect(typeof jti).toBe("string");
+      expect(jti.length).toBeGreaterThanOrEqual(16);
+      jtis.add(jti);
+    }
+    expect(jtis.size).toBe(20);
+  });
 });
 
 describe("clock (E12)", () => {
+  test("the observed server clock flows into assertion iat/exp and proof iat", async () => {
+    const local = Date.parse("2020-01-01T00:00:00Z"); // far from the real clock: Date.now() cannot pass this
+    const c = new Clock(() => local);
+    c.observe("Wed, 01 Jan 2020 00:07:00 GMT");
+    const want = local / 1000 + 420;
+    const { signer } = await generateSoftwareKey();
+    const a = parseJws(await clientAssertion(signer, c, "inst-1", "https://x.example/api/agent-auth"))!.claims;
+    expect(a.iat).toBe(want);
+    expect(a.exp).toBe(want + ASSERTION_TTL_S);
+    const p = parseJws(await dpopProof(signer, c, { htm: "POST", htu: "https://x.example/api/agent-auth/token" }))!.claims;
+    expect(p.iat).toBe(want);
+  });
+
+  test("a server BEHIND the local clock gives a negative offset", () => {
+    const local = Date.parse("2026-09-25T10:00:00Z");
+    const c = new Clock(() => local);
+    c.observe("Fri, 25 Sep 2026 09:57:00 GMT");
+    expect(c.offset()).toBe(-180_000);
+    expect(c.nowS()).toBe(local / 1000 - 180);
+  });
+
+  test("only an IMF-fixdate within 24 h is learnt; anything else keeps the last offset", () => {
+    const local = Date.parse("2026-09-25T10:00:00Z");
+    const c = new Clock(() => local);
+    c.observe("Fri, 25 Sep 2026 10:01:00 GMT");
+    expect(c.offset()).toBe(60_000);
+    for (const junk of [
+      "1", // Date.parse("1") is a finite year-2001 date
+      "2026-09-25T10:05:00Z", // ISO, not IMF-fixdate
+      "Friday, 25-Sep-26 10:05:00 GMT", // obsolete RFC 850
+      "Fri, 25 Sep 2026 10:05:00 +0000",
+      "Sun, 27 Sep 2026 10:05:00 GMT", // 2 days off: a broken proxy, not a clock
+      "Wed, 23 Sep 2026 10:05:00 GMT",
+    ]) {
+      c.observe(junk);
+      expect(c.offset()).toBe(60_000);
+    }
+  });
+
   test("iat follows the server's Date, not the local clock", () => {
     let local = Date.parse("2026-09-25T10:00:00Z");
     const c = new Clock(() => local);

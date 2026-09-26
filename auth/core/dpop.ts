@@ -10,12 +10,15 @@ import type { Signer } from "./signer";
 /**
  * §3.4: lowercase scheme and host, no default port, no query or fragment. The
  * WHATWG URL parser already lowercases scheme + host and drops a default port;
- * we drop search + hash.
+ * we drop search + hash. Only http(s) — the server's normaliser refuses anything else.
  */
 export function normalizeHtu(url: string): string {
   const u = new URL(url);
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error(`DPoP htu must be http(s), got ${u.protocol}`);
   return `${u.protocol}//${u.host}${u.pathname}`;
 }
+
+const HTTP_FORM: Record<string, string> = { "ws:": "http:", "wss:": "https:", "http:": "http:", "https:": "https:" };
 
 /**
  * E11: the WebSocket `htu` is the normalised apiUrl ORIGIN + `/ws`, in its
@@ -23,7 +26,11 @@ export function normalizeHtu(url: string): string {
  * Never a nonce on WS (C15): WS proofs are bound by `iat` + `jti` only.
  */
 export function wsHtu(apiUrl: string): string {
-  return `${new URL(apiUrl).origin}/ws`;
+  const u = new URL(apiUrl);
+  const scheme = HTTP_FORM[u.protocol];
+  if (!scheme) throw new Error(`the API URL must be http(s) or ws(s), got ${u.protocol}`);
+  // Re-parse in the http(s) form so the default port of THAT scheme is dropped.
+  return normalizeHtu(`${scheme}//${u.host}/ws`);
 }
 
 /** `ath`: base64url SHA-256 of the ASCII access token (RFC 9449 §4.2). */
@@ -39,6 +46,9 @@ export interface ProofInput {
 }
 
 export async function dpopProof(signer: Signer, clock: Clock, p: ProofInput): Promise<string> {
+  // An empty token would still hash to an `ath`; an empty nonce is no nonce. Both are caller bugs.
+  if (p.accessToken === "") throw new Error("DPoP proof: empty access token");
+  if (p.nonce === "") throw new Error("DPoP proof: empty nonce");
   return signJwt(
     signer,
     { typ: "dpop+jwt", jwk: signer.publicJwk },
@@ -48,7 +58,7 @@ export async function dpopProof(signer: Signer, clock: Clock, p: ProofInput): Pr
       htu: normalizeHtu(p.htu),
       iat: clock.nowS(),
       ...(p.accessToken !== undefined ? { ath: await accessTokenHash(p.accessToken) } : {}),
-      ...(p.nonce ? { nonce: p.nonce } : {}),
+      ...(p.nonce !== undefined ? { nonce: p.nonce } : {}),
     }
   );
 }

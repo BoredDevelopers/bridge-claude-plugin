@@ -15,7 +15,7 @@ export interface Signer {
   /** RFC 7638 thumbprint of `publicJwk` — the server's `jkt`. */
   readonly jkt: string;
   /** ES256 over `data`: raw IEEE P1363 r‖s, exactly 64 bytes (never DER). */
-  sign(data: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>>;
+  sign(data: Uint8Array): Promise<Uint8Array>;
 }
 
 const KEY_ALG = { name: "ECDSA", namedCurve: "P-256" } as const;
@@ -32,7 +32,9 @@ export async function softwareSigner(jwk: EcPrivateJwk): Promise<Signer> {
     publicJwk,
     jkt: await jwkThumbprint(publicJwk),
     async sign(data) {
-      const sig = new Uint8Array(await crypto.subtle.sign(SIGN_ALG, key, data));
+      // WebCrypto takes an ArrayBuffer-backed view; copying narrows any Uint8Array
+      // (SharedArrayBuffer-backed or an offset view) to exactly the bytes asked for.
+      const sig = new Uint8Array(await crypto.subtle.sign(SIGN_ALG, key, new Uint8Array(data)));
       if (sig.length !== 64) throw new Error(`ES256 signature must be 64 bytes r||s, got ${sig.length}`);
       return sig;
     },
