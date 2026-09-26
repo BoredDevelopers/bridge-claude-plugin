@@ -360,7 +360,7 @@ const creds = new CredentialManager({
   env: process.env,
   onAccessRotated: ({ token, dpop }) => {
     // The live socket authenticated with the previous token; hand it the new one
-    // in-band (RFC-014 D9) so the server's expiry timer re-arms — no reconnect.
+    // in-band (`reauth`, RFC-016 §3.4) so the server's expiry timer re-arms — no reconnect.
     // RFC-016 E11: with its own proof (htm GET, htu <apiUrl origin>/ws, ath).
     if (ws && wsConnected && authenticated) {
       try {
@@ -1015,7 +1015,7 @@ function connectWs(): void {
     if (cls !== lastClose.cls) reconnectAttempt = 0;
     lastClose = { cls, code, reason };
     process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
-    // RFC-014 D9. 4009: the access token ran out before a reauth — drop it so the
+    // RFC-016 §3.4: 4009 = the access token ran out before a reauth — drop it so the
     // reconnect's auth frame carries a fresh one.
     if (cls === "expired") creds.invalidateAccess(sockBearer);
     if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);

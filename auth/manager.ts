@@ -257,7 +257,10 @@ export class CredentialManager {
     return this.renew("expiring");
   }
 
-  /** The current access token (minting if needed) — for status and tests; requests use httpAuth / wsAuth. */
+  /**
+   * The current access token alone (minting if needed). Requests never use it bare —
+   * httpAuth / wsAuth add the DPoP proof every use needs (E3); this is for tests and diagnostics.
+   */
   async accessToken(): Promise<string> {
     return (await this.current()).token;
   }
