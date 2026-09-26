@@ -629,7 +629,7 @@ let remintedAfter4001 = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 // Why the last socket closed — drives the reconnect schedule (reconnect-policy.ts)
 // and the reason `status` reports. Cleared by a completed auth.
-let lastClose: { cls: CloseClass; code?: number; reason?: string } = { cls: "transient" };
+let lastClose: { cls: CloseClass; code?: number; reason?: string; keyDeleted?: boolean } = { cls: "transient" };
 let nextReconnectAt: number | null = null;
 // Liveness watchdog for the current socket. The server pings every 30s, so a
 // healthy socket is never silent this long; a half-open one (laptop sleep,
@@ -1057,16 +1057,21 @@ function connectWs(): void {
       // CURRENT grant: sockGrant follows an in-band reauth (reauthedWith).
       void creds
         .installationRevoked(sockGrant?.installationId ?? null)
-        .catch(() => "logged_out" as const)
+        .catch((err) => {
+          process.stderr.write(`bridge channel: could not clear the revoked installation: ${err instanceof Error ? err.message : String(err)}\n`);
+          return "absent" as const;
+        })
         .then((r) => {
           if (ws !== null && ws !== sock) return;
           if (r === "switched") lastClose = { cls: "transient", code, reason };
           else {
             waitingFor = "files";
-            notifyConnectionRefused(cls, code, reason);
+            lastClose = { cls, code, reason, keyDeleted: r === "deleted" };
+            notifyConnectionRefused(cls, code, reason, r === "deleted");
           }
           scheduleReconnect();
-        });
+        })
+        .catch((err) => process.stderr.write(`bridge channel: 4008 handling failed: ${err}\n`));
       return;
     }
     const immediate = code === 4001 && !remintedAfter4001;
@@ -1301,7 +1306,7 @@ function stopConnection(): void {
  * freshly minted token was refused too, which that frame does not say: this adds
  * what to do (/bridge:login).
  */
-function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined): void {
+function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined, keyDeleted = false): void {
   if (code !== 4003 && code !== 4008 && code !== 4001) return;
   const key = `${code}:${reason ?? ""}`;
   if (notifiedRefusal === key) return;
@@ -1310,7 +1315,7 @@ function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reas
     .notification({
       method: "notifications/claude/channel",
       params: {
-        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason)}`,
+        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason, { keyDeleted })}`,
         meta: { type: "error", sender: "bridge" },
       },
     })
@@ -1322,7 +1327,7 @@ function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reas
 function connectionState(): string {
   if (wsConnected && authenticated) return "connected";
   if (wsConnected) return "connected, not authenticated";
-  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason)}`;
+  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, lastClose)}`;
   if (reconnectTimer) {
     const inS = nextReconnectAt ? Math.max(0, Math.round((nextReconnectAt - Date.now()) / 1000)) : 0;
     return `disconnected (reconnect attempt ${reconnectAttempt}, in ${inS}s)${why}`;

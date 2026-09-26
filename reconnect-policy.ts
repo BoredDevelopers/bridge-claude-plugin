@@ -73,15 +73,26 @@ export function reconnectDelay(attempt: number, cls: CloseClass, rand: () => num
 }
 
 /** A human-readable reason for `status` and notifications. */
-export function describeClose(cls: CloseClass, code: number | undefined, reason: string | undefined): string {
+export function describeClose(
+  cls: CloseClass,
+  code: number | undefined,
+  reason: string | undefined,
+  /** Whether THIS close made the plugin delete the installation's files (4008 revoked / locked). */
+  opts: { keyDeleted?: boolean } = {}
+): string {
   const tail = `${code ?? "?"}${reason ? ` "${reason}"` : ""}`;
   switch (cls) {
     case "session-cap":
       return `too many live sessions for this agent (${tail}) — close another session, or wait for a slot`;
     case "credential":
-      if (code === 4001)
-        return `Bridge refused this session's access token (${tail}) — a new one is minted; if this keeps happening, run /bridge:login`;
-      return `agent deactivated or workspace archived (${tail}) — retrying slowly; an admin can reactivate it, otherwise run /bridge:login`;
+      switch (code) {
+        case 4001:
+          return `Bridge refused this session's access token (${tail}) — a new one is minted; if this keeps happening, run /bridge:login`;
+        case 4003:
+          return `agent deactivated or workspace archived (${tail}) — retrying slowly; an admin can reactivate it, otherwise run /bridge:login`;
+        default:
+          return `Bridge refused this session's credential (${tail}) — retrying slowly; if this keeps happening, run /bridge:login`;
+      }
     case "expired":
       return `access token expired (${tail}) — refreshing`;
     case "revoked":
@@ -89,7 +100,7 @@ export function describeClose(cls: CloseClass, code: number | undefined, reason:
       if (reason === "installation revoked")
         return `this machine was signed out of Bridge (${tail}) — run /bridge:login to connect it again`;
       if (reason === "installation locked")
-        return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail}); its key was deleted here — check this machine, then run /bridge:login to re-enrol`;
+        return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail})${opts.keyDeleted ? "; its key was deleted here" : ""} — check this machine, then run /bridge:login to re-enrol`;
       return `token revoked (${tail}) — run /bridge:login, then /bridge:connect`;
     default:
       return `connection closed (${tail})`;

@@ -562,20 +562,21 @@ export class CredentialManager {
    * 4008 "installation revoked" / "installation locked" for the installation the socket
    * authenticated with. If the profile now holds a DIFFERENT installation (re-login
    * elsewhere revokes the old one), switch to it quietly. Unknown which one the socket
-   * used: try again — a dead installation is refused at the next mint.
+   * used: try again — a dead installation is refused at the next mint. "deleted": this
+   * call deleted the files; "absent": there were none left to delete.
    */
-  async installationRevoked(revokedId: string | null): Promise<"switched" | "logged_out"> {
+  async installationRevoked(revokedId: string | null): Promise<"switched" | "deleted" | "absent"> {
     if (revokedId === null || this.access?.installationId === revokedId) this.access = null;
     const p = this.profile;
-    if (!p) return "logged_out";
+    if (!p) return "absent";
     return withInstallationLock(
       p.dir,
       async () => {
         const inst = store.readInstallation(p.dir);
-        if (!inst) return "logged_out" as const;
+        if (!inst) return "absent" as const;
         if (inst.installationId !== revokedId) return "switched" as const; // includes "unknown" (null)
         store.deleteInstallationFiles(p.dir);
-        return "logged_out" as const;
+        return "deleted" as const;
       },
       this.lockOpts()
     );

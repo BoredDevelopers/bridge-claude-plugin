@@ -690,9 +690,11 @@ describe("revocation", () => {
     expect(await a.installationRevoked(null)).toBe("switched");
     expect(readInstallation(dir)).not.toBeNull();
     await a.accessToken();
-    expect(await a.installationRevoked(a.grant()!.installationId)).toBe("logged_out");
+    expect(await a.installationRevoked(a.grant()!.installationId)).toBe("deleted");
     expect(readInstallation(dir)).toBeNull();
     expect(readKey(dir)).toBeNull();
+    // Nothing left to delete (a mint's refusal, or a sibling, got there first): said so.
+    expect(await a.installationRevoked(first)).toBe("absent");
   });
 });
 

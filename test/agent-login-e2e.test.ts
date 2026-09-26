@@ -333,6 +333,9 @@ describe("plugin on key credentials (RFC-016)", () => {
           stub.expireAccess(); // the plugin's next request must mint — with its now-stale state
           await client.callTool({ name: "list_channels", arguments: {} });
           expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
+          // The mint's refusal deleted the key (the tool call said so); the 4008 that
+          // followed found nothing left, so its notice does not claim a deletion.
+          expect(notices().find((n) => n.includes("credential copy detected"))).not.toContain("deleted here");
           expect(stub.stats.locks).toBe(1);
           expect(existsSync(join(dir, "key.json"))).toBe(false);
           expect(existsSync(join(dir, "state"))).toBe(false);
@@ -365,6 +368,7 @@ describe("plugin on key credentials (RFC-016)", () => {
           thief.stop();
           expect(stub.stats.locks).toBe(1);
           expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
+          expect(notices().find((n) => n.includes("credential copy detected"))).toContain("its key was deleted here");
           expect(await until(() => !existsSync(join(dir, "key.json")), 5_000)).toBe(true);
           expect(readInstallation(dir)).toBeNull();
           expect(existsSync(join(dir, "state"))).toBe(false);

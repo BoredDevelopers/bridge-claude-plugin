@@ -59,6 +59,11 @@ describe("reconnectDelay", () => {
     expect(locked).toContain("LOCKED");
     expect(locked).toContain("check this machine");
     expect(locked).toContain("/bridge:login");
+    // S4: "deleted here" only when this process deleted it.
+    expect(locked).not.toContain("deleted");
+    const deleted = describeClose("revoked", 4008, "installation locked", { keyDeleted: true });
+    expect(deleted).toContain("its key was deleted here");
+    expect(deleted).toContain("/bridge:login");
   });
 
   test("4001 points at /bridge:login — never the retired /bridge:configure token", () => {
