@@ -29,7 +29,7 @@ const SESSION = "11111111-2222-3333-4444-555555555555";
 async function withPlugin<T>(
   stub: ReturnType<typeof startAuthStub>,
   env: Record<string, string>,
-  fn: (client: Client, dir: string, notices: () => string[], prompts: string[]) => Promise<T>,
+  fn: (client: Client, dir: string, notices: () => string[], prompts: string[], stderr: () => string) => Promise<T>,
   preset?: (dir: string) => void | Promise<void>,
   /** When set, the client supports elicitation and answers every prompt this way. */
   answer?: "accept" | "decline"
@@ -51,6 +51,11 @@ async function withPlugin<T>(
       CLAUDE_CODE_SSE_PORT: "",
       ...env,
     } as Record<string, string>,
+    stderr: "pipe",
+  });
+  let log = "";
+  transport.stderr?.on("data", (b: Buffer) => {
+    log += b.toString();
   });
   const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: answer ? { elicitation: {} } : {} });
   const prompts: string[] = [];
@@ -66,7 +71,7 @@ async function withPlugin<T>(
   };
   try {
     await client.connect(transport);
-    return await fn(client, dir, () => seen, prompts);
+    return await fn(client, dir, () => seen, prompts, () => log);
   } finally {
     await client.close().catch(() => {});
     stub.stop();
@@ -104,10 +109,10 @@ async function status(client: Client): Promise<any> {
   return JSON.parse(r.content[0].text);
 }
 
-async function until(pred: () => boolean, ms: number): Promise<boolean> {
+async function until(pred: () => boolean | Promise<boolean>, ms: number): Promise<boolean> {
   const end = Date.now() + ms;
   while (Date.now() < end) {
-    if (pred()) return true;
+    if (await pred()) return true;
     await Bun.sleep(25);
   }
   return pred();
@@ -645,30 +650,33 @@ describe("plugin on key credentials (RFC-016)", () => {
     const told = (notices: () => string[]) => notices().filter((n) => n.includes("must be upgraded")).length;
     await withPlugin(
       stub,
-      {},
+      { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
-        expect(await until(() => told(notices) === 1, 10_000)).toBe(true);
+        expect(await until(() => told(notices) === 1, 5_000)).toBe(true);
         const opens = stub.stats.wsOpens;
-        await Bun.sleep(11_000); // a negative across one credential-watch tick (10 s)
+        await Bun.sleep(1_000); // a negative across five credential-watch ticks
         expect(told(notices)).toBe(1);
         expect(stub.stats.wsOpens).toBe(opens);
         expect(stub.stats.mintBodies).toHaveLength(0);
-        // A login in ANOTHER session: the refusal was about the old installation — try the new one.
+        // A login in ANOTHER session: the refusal was about the old installation — the
+        // new one is tried (a new episode: refused again, so told again).
         await enrolledProfile(stub, dir);
-        expect(await until(() => stub.stats.wsOpens > opens, 12_000)).toBe(true);
-        // The same refusal again: the model already knows.
-        await Bun.sleep(1_000);
-        expect(told(notices)).toBe(1);
-        // The person asks explicitly: tried again, and answered.
+        expect(await until(() => stub.stats.wsOpens > opens, 5_000)).toBe(true);
+        expect(await until(() => told(notices) === 2, 5_000)).toBe(true);
+        // …and then it stops again: no retry loop on the new installation either.
         const opens2 = stub.stats.wsOpens;
+        await Bun.sleep(1_000);
+        expect(stub.stats.wsOpens).toBe(opens2);
+        expect(told(notices)).toBe(2);
+        // The person asks explicitly: tried again, and answered.
         await client.callTool({ name: "connect", arguments: {} });
         expect(await until(() => stub.stats.wsOpens > opens2, 5_000)).toBe(true);
-        expect(await until(() => told(notices) === 2, 5_000)).toBe(true);
+        expect(await until(() => told(notices) === 3, 5_000)).toBe(true);
         expect(stub.stats.mintBodies).toHaveLength(0);
       },
       enrolledIn(stub)
     );
-  }, 60_000);
+  }, 30_000);
 
   test("upgrading from 0.23: the old files are retired at startup and status says to run /bridge:login", async () => {
     const stub = startAuthStub();
@@ -754,6 +762,43 @@ describe("plugin on key credentials (RFC-016)", () => {
       enrolledIn(stub)
     );
   }, 45_000);
+
+  test("/bridge:connect out of a stop starts a new episode: a pending credential watch does not ALSO reconnect over it (exactly one socket)", async () => {
+    const opts: StubOptions = { rejectAssertions: true };
+    const stub = startAuthStub(opts);
+    await withPlugin(
+      stub,
+      { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
+      async (client, _dir, notices, _p, stderr) => {
+        expect(await until(() => notices().some((n) => n.includes("check the system clock")), 5_000)).toBe(true);
+        opts.rejectAssertions = false;
+        opts.mintDelayMs = 1_500; // the connect's mint spans several watch ticks
+        const opens = stub.stats.wsOpens;
+        await client.callTool({ name: "connect", arguments: {} });
+        expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
+        expect(stub.stats.wsOpens).toBe(opens + 1);
+        expect(stderr()).not.toContain("a new sign-in on disk");
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
+  test("a 4003 after a 4001 notice is still told (notices are keyed by code + reason, not by class)", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      { BRIDGE_TEST_BACKOFF_SCALE: "0.02" }, // the slow credential retry in ~1 s
+      async (_client, _dir, notices) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 5_000)).toBe(true);
+        stub.rejectNextWsAuths(1); // the immediate re-mint's auth: 4001 again → told
+        stub.rejectNextWsAuths(1, 4003, "deregistered"); // the slow retry's auth: 4003 → told too
+        stub.closeAll(4001, "Invalid token");
+        expect(await until(() => notices().some((n) => n.includes("Bridge refused this session's access token")), 5_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("agent deactivated")), 5_000)).toBe(true);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
 
   test("a named profile with no credentials refuses to connect and says so", async () => {
     const stub = startAuthStub();

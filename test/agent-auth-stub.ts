@@ -163,7 +163,8 @@ export function createAuthCore(opts: StubOptions = {}) {
   };
   const mint = mintAgentToken;
   const sockets = new Set<any>();
-  let rejectWsAuths = 0;
+  /** Forced closes for the next `auth` frames, in order (rejectNextWsAuths). */
+  const forcedAuthCloses: { code: number; reason: string }[] = [];
   const nowS = () => Math.floor(Date.now() / 1000) + (opts.clockSkewS ?? 0);
   const dateHeader = () => new Date(nowS() * 1000).toUTCString();
 
@@ -190,6 +191,20 @@ export function createAuthCore(opts: StubOptions = {}) {
       const s = sessions.get(ws.data.session);
       if (s && pred(s)) ws.close(4008, reason);
     }
+  }
+
+  /**
+   * Close like the server (ws.ts closeDeadGrant / runAuthenticateWs / the 4009 timer):
+   * 4001, 1011 and 4009 are preceded by an `error` frame; a revoke's 4008 is not.
+   */
+  function closeLikeServer(ws: any, code: number, reason: string) {
+    const frame: Record<number, string> = { 4001: "Invalid token", 1011: "grant check failed", 4009: "Access token expired" };
+    if (frame[code]) {
+      try {
+        ws.send(JSON.stringify({ type: "error", data: { message: frame[code] } }));
+      } catch {}
+    }
+    ws.close(code, reason);
   }
 
   function newInstallation(jwk: any, keyStorage: string | null = null) {
@@ -515,6 +530,8 @@ export function createAuthCore(opts: StubOptions = {}) {
               const socketless = live.filter((s) => ![...sockets].some((w) => w.data.session === s.id)).sort((a, c) => a.lastUsed - c.lastUsed)[0];
               if (!socketless) return refuse(where, "invalid_grant", "session_limit");
               socketless.revoked = "evicted";
+              // bridge#209: a socket that registered meanwhile is closed as EVICTED, not revoked.
+              closeWhere((s) => s.id === socketless.id, "session evicted");
             }
             sess = { id: crypto.randomUUID(), instId: inst.id, key: b.session_key, revoked: null, lastUsed: Date.now() };
             sessions.set(sess.id, sess);
@@ -591,11 +608,6 @@ export function createAuthCore(opts: StubOptions = {}) {
 
   /** WS `auth` / `reauth` frames (E11): `{token, dpop}`, htm GET, htu = origin + /ws. */
   function wsCheck(origin: string, f: any) {
-    if (f.type === "auth" && rejectWsAuths > 0) {
-      rejectWsAuths--;
-      stats.refusals.push("ws:forced");
-      return null;
-    }
     const a = liveAccess(typeof f.token === "string" ? f.token : null);
     if (!a) return null;
     // RFC-016 C15: nonces are token-endpoint/HTTP only — never on WS frames.
@@ -655,15 +667,23 @@ export function createAuthCore(opts: StubOptions = {}) {
       sessions.get(sid)!.revoked = "manual";
       closeWhere((s) => s.id === sid, "session revoked");
     },
-    /** The next N WS `auth` frames are refused 4001, whatever they carry. */
-    rejectNextWsAuths(n: number) {
-      rejectWsAuths = n;
+    /** The next N WS `auth` frames are closed `code` (default 4001 "Invalid token"), whatever they carry. Queued. */
+    rejectNextWsAuths(n: number, code = 4001, reason = "Invalid token") {
+      for (let i = 0; i < n; i++) forcedAuthCloses.push({ code, reason });
+    },
+    /** The forced close for this `auth` frame, if one is queued. */
+    takeForcedAuthClose: () => forcedAuthCloses.shift() ?? null,
+    closeLikeServer,
+    /** bridge#209: the session was evicted at the live-session cap — its sockets close 4008 "session evicted". */
+    evictSession(sid: string) {
+      sessions.get(sid)!.revoked = "evicted";
+      closeWhere((s) => s.id === sid, "session evicted");
     },
     rotateNonce() {
       nonce = `n-${randomBase62(16)}`;
     },
     closeAll(code: number, reason: string) {
-      for (const ws of sockets) ws.close(code, reason);
+      for (const ws of sockets) closeLikeServer(ws, code, reason);
     },
     expireAccess: () => access.clear(),
     sessionsFor: (instId: string) => [...sessions.values()].filter((s) => s.instId === instId),
@@ -704,14 +724,19 @@ export function startAuthStub(opts: StubOptions = {}) {
         const origin = `http://127.0.0.1:${server.port}`;
         if (f.type === "auth") {
           core.stats.authTokens.push(f.token);
+          const forced = core.takeForcedAuthClose();
+          if (forced) {
+            core.stats.refusals.push(`ws:forced ${forced.code}`);
+            return core.closeLikeServer(ws, forced.code, forced.reason);
+          }
           const a = core.wsCheck(origin, f);
-          if (!a) return ws.close(4001, "Invalid token");
+          if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
           ws.data.session = a.session;
           const s = core.sessions.get(a.session)!;
           ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "agent-1", agentName: "Agent", contextId: s.key } }));
         } else if (f.type === "reauth") {
           const a = core.wsCheck(origin, f);
-          if (!a) return ws.close(4001, "Invalid token");
+          if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
           core.stats.reauths++;
           core.stats.reauthTokens.push(f.token);
           ws.data.session = a.session;

@@ -160,7 +160,7 @@ export class CredentialManager {
    * stands, nothing mints — not the ticker, not an on-demand use. It is cleared by the
    * person acting in THIS process (/bridge:connect → requestSessionReconnect, a login, an
    * enrolment, a logout) — or by a different installation on disk (a /bridge:login in
-   * ANOTHER session: the refusal was about the old one). stopReason() exposes it; its
+   * ANOTHER session: the refusal was about the old one). refreshStop() exposes it; its
    * intended consumer is server.ts's awaiting-credentials watch (Task 8 W5), which must
    * not re-mint into the same refusal either.
    */
@@ -328,18 +328,19 @@ export class CredentialManager {
   }
 
   /**
-   * The stop-class refusal that halts minting, or null (see `stopped`). A stop is about
-   * ONE installation: once the profile holds another (a /bridge:login in another
-   * session) it no longer stands, and is dropped here — so server.ts's watch can ask.
+   * Re-check the stop against the disk, then return it: the stop-class refusal that
+   * halts minting, or null (see `stopped`). NOT a pure getter — a stop is about ONE
+   * installation, so once the profile holds another (a /bridge:login in another
+   * session) it no longer stands and is CLEARED here. server.ts's watch polls this.
    */
-  stopReason(): CredentialError | null {
+  refreshStop(): CredentialError | null {
     if (this.stopped && (this.installation()?.installationId ?? null) !== this.stopped.installationId) this.stopped = null;
     return this.stopped?.err ?? null;
   }
 
   /** Mint now. Single-flight across callers in this process. */
   renew(reason: string): Promise<Access> {
-    const stop = this.stopReason();
+    const stop = this.refreshStop();
     if (stop) return Promise.reject(stop);
     if (!this.inflight) {
       // A live socket rides the current token — or the one just dropped by a 401: either

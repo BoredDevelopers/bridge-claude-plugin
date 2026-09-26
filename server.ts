@@ -45,6 +45,7 @@ import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectS
 import { classifyClose, describeClose, reconnectDelay, type CloseClass } from "./reconnect-policy";
 import { resolveProfile } from "./auth/profile";
 import { CredentialManager, CredentialError } from "./auth/manager";
+import { assertNever } from "./auth/core";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -373,7 +374,6 @@ const creds = new CredentialManager({
     }
   },
   onLoggedIn: () => {
-    notifiedCredentialStop = null;
     wantConnected = true;
     intentExplicitlySet = true;
     writeConnectState(STATE_DIR, SESSION_KEY, true);
@@ -1052,7 +1052,7 @@ function connectWs(): void {
           if (ws !== null && ws !== sock) return;
           if (r === "switched") lastClose = { cls: "transient", code, reason };
           else {
-            awaitingCredentials = true;
+            waitingFor = "files";
             notifyConnectionRefused(cls, code, reason);
           }
           scheduleReconnect();
@@ -1092,6 +1092,15 @@ function connectWs(): void {
   livenessTimer = liveness;
 }
 
+/**
+ * TEST-ONLY: scales every reconnect delay (default 1). Lets an e2e test reach the slow
+ * credential schedule's first retry in about a second; the schedule's SHAPE is unchanged.
+ */
+const BACKOFF_SCALE = (() => {
+  const n = Number(process.env.BRIDGE_TEST_BACKOFF_SCALE);
+  return n > 0 && n <= 1 ? n : 1;
+})();
+
 function scheduleReconnect(immediate = false): void {
   // The `disconnect` tool (and a persisted "0" at startup) sets this false —
   // a single guard here covers every caller (WebSocket creation failure, the
@@ -1100,7 +1109,8 @@ function scheduleReconnect(immediate = false): void {
   if (!wantConnected) return;
   if (reconnectTimer) return;
   reconnectAttempt++;
-  const delay = immediate ? 0 : reconnectDelay(reconnectAttempt, lastClose.cls);
+  const base = immediate ? 0 : reconnectDelay(reconnectAttempt, lastClose.cls);
+  const delay = base === null ? null : Math.round(base * BACKOFF_SCALE);
   if (delay === null) {
     // Revoked: this token will never work again. Only /bridge:connect (after
     // /bridge:configure) tries again.
@@ -1142,49 +1152,80 @@ function credentialFailure(sock: WebSocket, err: unknown): void {
   } else {
     lastClose = { cls: "revoked", reason: msg };
     lastServerError = msg;
-    const kind = (err as CredentialError).kind;
-    // "No usable sign-in on disk" waits for the files to appear (a login in another session).
-    awaitingCredentials = kind === "not_logged_in" || kind === "profile" || kind === "api_url" || kind === "logged_out";
-    // A stop-class refusal (clock, corrupt state, update required, a server too old,
-    // session_limit, …) leaves the files in place, so the watch above would reconnect
-    // every 10 s straight into it. It waits for the STOP to lift instead. A revoked
-    // session (E9) is lifted by /bridge:connect alone — nothing to watch for.
-    awaitingStopLift = creds.stopReason() !== null;
-    // Each distinct refusal once: the model already knows, and `status` shows it.
-    if (msg !== notifiedCredentialStop) {
-      notifiedCredentialStop = msg;
+    waitingFor = waitFor(err as CredentialError);
+    // Each distinct refusal once per episode: the model already knows, and `status` shows it.
+    if (notifiedRefusal !== msg) {
+      notifiedRefusal = msg;
       notifyModel(`⚠️ Bridge: ${msg}`, "error");
     }
   }
   scheduleReconnect();
 }
 
+// ── Refusal episode ──────────────────────────────────────────────────────────
+// One episode runs from a refusal to the next thing that can end it: a completed
+// auth, or the person acting (/bridge:connect, a login — both via restartConnection
+// or the connect tool). resetRefusalEpisode() is the one place it ends.
+
 /**
- * Set while this session wants to connect but has no usable credential (never
- * signed in, or signed out). A login in ANOTHER session on this machine writes the
- * profile's files; this picks them up without a /bridge:connect here. Never set by
- * a 4008 "session revoked" — that stop is deliberate.
+ * What a STOPPED session waits for before the credential watch reconnects it:
+ * - "files": no usable sign-in on disk (never signed in, signed out, revoked,
+ *   locked) — a login in ANOTHER session writes the files; picked up without a
+ *   /bridge:connect here.
+ * - "stop-lift": minting is stopped by a refusal retrying will not fix
+ *   (creds.refreshStop()); the files are still there, so it waits for the stop to
+ *   lift (the profile holds a different installation) instead of reconnecting into it.
+ * - null: nothing the watch can see ends it (a revoked session, E9: /bridge:connect).
  */
-let awaitingCredentials = false;
+let waitingFor: null | "files" | "stop-lift" = null;
 /**
- * Set while minting is STOPPED by a refusal retrying will not fix (creds.stopReason()).
- * Lifted — and the connection retried — only when that stop no longer stands: the
- * profile holds a different installation (a login in another session). /bridge:connect
- * and a login in THIS session clear the stop themselves.
+ * The refusal last told to the model (`<code>:<reason>` for a close, the message for a
+ * credential failure) — each distinct one once per episode.
  */
-let awaitingStopLift = false;
-/** The terminal credential refusal last told to the model (re-armed by an auth, /bridge:connect, a login). */
-let notifiedCredentialStop: string | null = null;
+let notifiedRefusal: string | null = null;
+
+function resetRefusalEpisode(): void {
+  waitingFor = null;
+  notifiedRefusal = null;
+}
+
+/** Exhaustive: a new CredentialError kind must decide here, or it would stop silently. */
+function waitFor(err: CredentialError): typeof waitingFor {
+  switch (err.kind) {
+    case "not_logged_in":
+    case "profile":
+    case "api_url":
+    case "logged_out":
+      return "files";
+    case "refused":
+    case "session_limit":
+      return "stop-lift";
+    case "session_revoked":
+      return null;
+    case "network":
+      return null; // not terminal — retried by the reconnect schedule, never waits
+    default:
+      return assertNever(err.kind);
+  }
+}
+
+/**
+ * TEST-ONLY override of the watch period (ms). Default 10 s. A lower value only makes
+ * the watch notice files sooner; it cannot make a stopped session mint.
+ */
+const CREDENTIAL_WATCH_MS = positiveInt(process.env.BRIDGE_CREDENTIAL_WATCH_MS) ?? 10_000;
 const credentialWatch = setInterval(() => {
-  if (!wantConnected || shuttingDown || creds.configError()) return;
-  const lifted = awaitingStopLift && creds.stopReason() === null;
-  if (!awaitingCredentials && !lifted) return;
-  awaitingCredentials = false;
-  awaitingStopLift = false;
-  process.stderr.write(`bridge channel: ${lifted ? "a new sign-in on disk" : "credentials appeared"} — connecting\n`);
+  if (waitingFor === null || !wantConnected || shuttingDown || creds.configError()) return;
+  if (waitingFor === "stop-lift" && creds.refreshStop() !== null) return;
+  process.stderr.write(`bridge channel: ${waitingFor === "stop-lift" ? "a new sign-in on disk" : "credentials appeared"} — connecting\n`);
   restartConnection();
-}, 10_000);
+}, CREDENTIAL_WATCH_MS);
 credentialWatch.unref?.();
+
+function positiveInt(v: string | undefined): number | undefined {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
 
 function notifyModel(content: string, type: "error" | "status"): void {
   mcp
@@ -1204,7 +1245,7 @@ function restartConnection(): void {
   }
   reconnectAttempt = 0;
   lastClose = { cls: "transient" };
-  notifiedCloseClass = null;
+  resetRefusalEpisode();
   const old = ws;
   ws = null;
   wsConnected = false;
@@ -1239,8 +1280,8 @@ function stopConnection(): void {
 }
 
 /**
- * Tell the MODEL when a close means "a person must act", once per refusal
- * episode (re-armed by a completed auth).
+ * Tell the MODEL when a close means "a person must act", once per distinct
+ * `code:reason` per refusal episode (resetRefusalEpisode).
  *
  * ⚠️ ONLY 4003, 4008 AND A REPEATED 4001. 4007 arrives with a server `error`
  * frame first ("Too many sessions"), which the error-frame path already
@@ -1250,11 +1291,11 @@ function stopConnection(): void {
  * freshly minted token was refused too, which that frame does not say: this adds
  * what to do (/bridge:login).
  */
-let notifiedCloseClass: CloseClass | null = null;
 function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined): void {
   if (code !== 4003 && code !== 4008 && code !== 4001) return;
-  if (notifiedCloseClass === cls) return;
-  notifiedCloseClass = cls;
+  const key = `${code}:${reason ?? ""}`;
+  if (notifiedRefusal === key) return;
+  notifiedRefusal = key;
   mcp
     .notification({
       method: "notifications/claude/channel",
@@ -1324,11 +1365,8 @@ function handleWsMessage(data: any): void {
       // proof the connection is actually usable.
       reconnectAttempt = 0;
       lastClose = { cls: "transient" };
-      notifiedCloseClass = null;
       remintedAfter4001 = false;
-      awaitingCredentials = false;
-      awaitingStopLift = false;
-      notifiedCredentialStop = null;
+      resetRefusalEpisode();
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
       // delivered (the flush triggers are one-shot per gate)
@@ -3166,8 +3204,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // the next mint says so (reconnect=true) and the server opens a new session.
         // (0.24 behaviour: connect after a session revoke starts a new session.)
         creds.requestSessionReconnect();
-        // The person asked: a refusal that repeats is answered again.
-        notifiedCredentialStop = null;
         // Already open: re-persisting the intent above is enough. Tearing
         // down a healthy socket to "reconnect" would restart a connection
         // that does not need it — the no-op half of idempotent.
@@ -3182,6 +3218,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             nextReconnectAt = null;
           }
           reconnectAttempt = 0;
+          // The person asked: a new episode — a refusal that repeats is answered again,
+          // and a pending watch must not ALSO reconnect over this attempt.
+          resetRefusalEpisode();
           connectUnlessDuplicate();
         }
         return {
@@ -3528,6 +3567,6 @@ await creds.enrolFromKeyIfNeeded();
 const startupProblem = creds.configError();
 if (startupProblem) {
   process.stderr.write(`bridge channel: ${startupProblem}\n`);
-  awaitingCredentials = true;
+  waitingFor = "files";
 }
 if (!shuttingDown && wantConnected && !startupProblem) connectUnlessDuplicate();

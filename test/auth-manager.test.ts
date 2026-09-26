@@ -384,7 +384,7 @@ describe("stop-class refusals and the ticker", () => {
     for (const s of stub.sessionsFor(inst)) s.revoked = "evicted";
     opts.sessionCap = 0;
     expect(await until(() => stub.stats.mintBodies.length >= 2)).toBe(true);
-    expect(m.stopReason()?.kind).toBe("session_limit");
+    expect(m.refreshStop()?.kind).toBe("session_limit");
     const after = stub.stats.mintBodies.length;
     const logged = logs.length;
     await Bun.sleep(1_000); // 20 ticks, each of which would have minted
@@ -396,7 +396,7 @@ describe("stop-class refusals and the ticker", () => {
     // /bridge:connect is the person acting: it clears the stop.
     opts.sessionCap = 64;
     m.requestSessionReconnect();
-    expect(m.stopReason()).toBeNull();
+    expect(m.refreshStop()).toBeNull();
     expect(await m.accessToken()).toStartWith("brg_at_");
   }, 20_000);
 
@@ -409,11 +409,11 @@ describe("stop-class refusals and the ticker", () => {
     const a = manager(dir, stub.url, { key: "a" }).m;
     const b = manager(dir, stub.url, { key: "b" }).m;
     for (const m of [a, b]) expect((await m.accessToken().catch((x) => x)).message).toMatch(/corrupt_state/);
-    expect(b.stopReason()?.kind).toBe("refused");
+    expect(b.refreshStop()?.kind).toBe("refused");
     const url = (await a.login("browser")).match(/https?:\/\/\S+/)![0]; // session A re-enrols
     await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!, { redirect: "manual" });
     expect(await b.accessToken()).toStartWith("brg_at_"); // B follows the new installation
-    expect(b.stopReason()).toBeNull();
+    expect(b.refreshStop()).toBeNull();
   });
 
   test("a LATE tick (the laptop woke past the refresh point) mints ONCE, not once per tick while its random delay runs", async () => {
