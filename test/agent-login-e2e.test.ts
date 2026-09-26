@@ -10,7 +10,7 @@
  * "installation locked", 0.23 retirement at boot, …).
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, cpSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -647,6 +647,69 @@ describe("plugin on key credentials (RFC-016)", () => {
       enrolledIn(stub)
     );
   }, 60_000);
+
+  test("upgrading from 0.23: the old files are retired at startup and status says to run /bridge:login", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir) => {
+        const s = await status(client);
+        expect(s.configured).toBe(false);
+        expect(s.auth.problem).toMatch(/plugin 0\.25 .* run \/bridge:login/);
+        // Retired once startup settles the session key.
+        expect(await until(() => !existsSync(join(dir, "credentials.json")), 10_000)).toBe(true);
+        expect((await status(client)).auth.problem).toMatch(/plugin 0\.25 .* run \/bridge:login/);
+        expect(existsSync(join(dir, "sessions", `${SESSION}.json`))).toBe(false);
+        // hooks/session-map.ts's file in the same directory is not an RFC-014 credential: kept.
+        expect(readFileSync(join(dir, "sessions", "pid-4242.json"), "utf8")).toBe("{}");
+        expect(stub.stats.mintBodies).toHaveLength(0);
+      },
+      (dir) => {
+        writeFileSync(join(dir, "credentials.json"), JSON.stringify({ apiUrl: stub.url, installationId: "old", installationToken: "brg_it_old" }));
+        mkdirSync(join(dir, "sessions"), { recursive: true });
+        writeFileSync(join(dir, "sessions", `${SESSION}.json`), JSON.stringify({ sessionId: "s", refreshToken: "brg_rt_old", installationId: "old" }));
+        writeFileSync(join(dir, "sessions", "pid-4242.json"), "{}");
+      }
+    );
+  }, 30_000);
+
+  test("startup retirement never touches a 0.25 sign-in: an enrolled profile next to a stray 0.23 file keeps its key and connects", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (_client, dir) => {
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        expect(existsSync(join(dir, "credentials.json"))).toBe(false); // the 0.23 file retired…
+        expect(readInstallation(dir)).not.toBeNull(); // …the 0.25 one untouched
+        expect(existsSync(join(dir, "key.json"))).toBe(true);
+        expect(stub.stats.refusals).toEqual([]);
+      },
+      async (dir) => {
+        await enrolledProfile(stub, dir);
+        writeFileSync(join(dir, "credentials.json"), JSON.stringify({ apiUrl: stub.url, installationId: "old", installationToken: "brg_it_old" }));
+      }
+    );
+  }, 30_000);
+
+  test("a 0.23 retirement that throws (any fs error) does not abort startup: the session still connects", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (_client, dir) => {
+        // The rest of the boot sequence (enrolment key, connect) still ran.
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        expect(existsSync(join(dir, "credentials.json"))).toBe(true); // it really could not retire
+      },
+      async (dir) => {
+        await enrolledProfile(stub, dir);
+        writeFileSync(join(dir, "credentials.json"), JSON.stringify({ apiUrl: stub.url, installationId: "old", installationToken: "brg_it_old" }));
+        mkdirSync(join(dir, "upgrade-required.json")); // the marker cannot be written: retireLegacy throws
+      }
+    );
+  }, 30_000);
 
   test("a named profile with no credentials refuses to connect and says so", async () => {
     const stub = startAuthStub();

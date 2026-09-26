@@ -3511,7 +3511,19 @@ process.stderr.write(
 );
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-// Headless machines enrol once from BRIDGE_ENROLMENT_KEY (never through chat).
+// A 0.23 / 0.24 profile (RFC-014 files) is retired first, so it reads "run
+// /bridge:login", not "not signed in" — store.retireLegacy touches RFC-014 files
+// only, never a 0.25 installation. Headless machines enrol once from
+// BRIDGE_ENROLMENT_KEY (never through chat) — which also re-enrols a retired
+// headless machine.
+try {
+  await creds.retireLegacyCredentials();
+} catch (err) {
+  // Never fatal. A rejected top-level await here would skip the rest of the boot
+  // (enrolment key, connect) — the unhandledRejection hook only logs it. configError()
+  // still reports the old files ("run /bridge:login"); the next start retries.
+  process.stderr.write(`bridge channel: could not retire the plugin-0.24 credentials: ${err instanceof Error ? err.message : String(err)}\n`);
+}
 await creds.enrolFromKeyIfNeeded();
 const startupProblem = creds.configError();
 if (startupProblem) {
