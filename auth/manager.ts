@@ -147,6 +147,15 @@ export class CredentialManager {
   private mintNotBefore = 0;
   /** RFC 9449 §9: the resource server's last `DPoP-Nonce`. */
   private resourceNonce: string | undefined;
+  /**
+   * A stop-class refusal (§3.3 — retrying will not fix it: clock, corrupt_state,
+   * update_required, an unlisted refusal such as attempt_invalid, session_limit, a
+   * server too old, an incomplete sign-in). While set, nothing mints — not the ticker,
+   * not an on-demand use; only the person acting clears it (/bridge:connect →
+   * requestSessionReconnect, a login, an enrolment, a logout). server.ts reads it
+   * through stopReason() (its awaiting-credentials watch must not re-mint either).
+   */
+  private stopped: CredentialError | null = null;
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly clock: Clock;
@@ -289,11 +298,18 @@ export class CredentialManager {
    * again, and it says so (`reconnect=true`). Called by the `connect` tool. One-shot.
    */
   requestSessionReconnect(): void {
+    this.stopped = null;
     if (this.sessionBlocked) this.reconnectNext = true;
+  }
+
+  /** The stop-class refusal that halted minting, or null (see `stopped`). */
+  stopReason(): CredentialError | null {
+    return this.stopped;
   }
 
   /** Mint now. Single-flight across callers in this process. */
   renew(reason: string): Promise<Access> {
+    if (this.stopped) return Promise.reject(this.stopped);
     if (!this.inflight) {
       const hadAccess = this.access !== null;
       this.inflight = this.renewUnderLock(reason)
@@ -322,7 +338,9 @@ export class CredentialManager {
     } catch (e) {
       // Everything that is not a known terminal state is retryable: discovery 5xx
       // during a deploy, the lock wait cap, a timeout, a failed state write.
-      throw this.networkError(e);
+      const err = this.networkError(e);
+      if (err instanceof CredentialError && (err.kind === "refused" || err.kind === "session_limit")) this.stopped = err;
+      throw err;
     }
   }
 
@@ -470,15 +488,23 @@ export class CredentialManager {
    */
   private armTicker(): void {
     if (this.ticker) return;
-    this.ticker = setInterval(() => {
+    // Due = a token, no mint in flight, past its refresh point. RE-CHECKED when a late
+    // tick's random delay ends: every tick inside that delay schedules a `go` too, and
+    // only the first may mint — the rest find a fresh token (or one in flight). A stop
+    // (stopped) is enforced by renew() itself, for the ticker and every other caller.
+    const due = () => {
       const a = this.access;
-      if (!a || this.inflight) return;
-      const now = this.now();
-      if (now < a.refreshAt) return;
-      const late = now - a.refreshAt > 60_000;
-      const go = () => this.renew("scheduled").catch((e) => this.d.log(`bridge auth: scheduled mint failed: ${e.message}`));
+      return a !== null && !this.inflight && this.now() >= a.refreshAt;
+    };
+    const go = () => {
+      if (!due()) return;
+      this.renew("scheduled").catch((e) => this.d.log(`bridge auth: scheduled mint failed: ${e.message}`));
+    };
+    this.ticker = setInterval(() => {
+      if (!due()) return;
+      const late = this.now() - this.access!.refreshAt > 60_000;
       if (late) setTimeout(go, this.random() * 30_000).unref?.();
-      else void go();
+      else go();
     }, this.d.tickMs ?? 15_000);
     this.ticker.unref?.();
   }
@@ -752,6 +778,8 @@ export class CredentialManager {
     });
     store.clearLoggedOutMarker(dir);
     store.clearUpgradeMarker(dir);
+    // A new installation: whatever stopped minting on the old one does not apply.
+    this.stopped = null;
   }
 
   /**
@@ -870,6 +898,7 @@ export class CredentialManager {
       this.lockOpts()
     );
     this.access = null;
+    this.stopped = null;
     this.d.onLoggedOut();
     const { inst, revoke } = r;
     if (!inst) return `Profile ${profileLabel(p)} was not signed in.`;

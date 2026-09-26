@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { spawnRacers } from "./fixtures/go-signal";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startAuthStub } from "./agent-auth-stub";
+import { startAuthStub, type StubOptions } from "./agent-auth-stub";
 import { enrolledProfile } from "./key-fixtures";
 import { parseJws, sha256b64u } from "./dpop-verify";
 import { CredentialManager, CredentialError, LOCK_HOLD_BUDGET_MS, type ManagerDeps } from "../auth/manager";
@@ -82,6 +82,16 @@ function manager(
 }
 
 const seq = (dir: string) => joinStateSeq(readState(dir)!);
+
+/** Poll a condition instead of guessing a delay; false if it never came true. */
+async function until(pred: () => boolean, ms = 10_000): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (pred()) return true;
+    await Bun.sleep(20);
+  }
+  return pred();
+}
 
 describe("mint (§3.3, §5.2)", () => {
   test("everything a lock holder sends shares ONE deadline, inside the 120 s stale break with ≥ 20 s to spare (§5.2)", () => {
@@ -309,6 +319,44 @@ describe("mint (§3.3, §5.2)", () => {
     m.noteResourceNonce("rn-1");
     expect(parseJws((await m.httpAuth("GET", "/api/x")).headers.DPoP)!.claims.nonce).toBe("rn-1");
   });
+});
+
+describe("stop-class refusals and the ticker", () => {
+  test("a stop-class refusal (session_limit) on a SCHEDULED mint stops the ticker: no further mints until /bridge:connect", async () => {
+    const opts: StubOptions = { accessTtlS: 6 };
+    const { stub, dir } = setup(opts);
+    const inst = await enrolledProfile(stub, dir);
+    const { m } = manager(dir, stub.url, { tickMs: 50, random: () => 0 });
+    await m.accessToken();
+    // The session is evicted and the cap is full: the ticker's next mint is refused session_limit.
+    for (const s of stub.sessionsFor(inst)) s.revoked = "evicted";
+    opts.sessionCap = 0;
+    expect(await until(() => stub.stats.mintBodies.length >= 2)).toBe(true);
+    expect(m.stopReason()?.kind).toBe("session_limit");
+    const after = stub.stats.mintBodies.length;
+    await Bun.sleep(1_000); // 20 ticks, each of which would have minted
+    expect(stub.stats.mintBodies.length).toBe(after);
+    // On demand too: fail fast, nothing sent.
+    expect((await m.accessToken().catch((x) => x)).kind).toBe("session_limit");
+    expect(stub.stats.mintBodies.length).toBe(after);
+    // /bridge:connect is the person acting: it clears the stop.
+    opts.sessionCap = 64;
+    m.requestSessionReconnect();
+    expect(m.stopReason()).toBeNull();
+    expect(await m.accessToken()).toStartWith("brg_at_");
+  }, 20_000);
+
+  test("a LATE tick (the laptop woke past the refresh point) mints ONCE, not once per tick while its random delay runs", async () => {
+    const { stub, dir } = setup();
+    await enrolledProfile(stub, dir);
+    let skew = 0;
+    const { m } = manager(dir, stub.url, { tickMs: 50, random: () => 0.02, now: () => Date.now() + skew });
+    await m.accessToken();
+    skew = 2 * 3_600_000; // woke 2 h later: a 600 ms random delay (0.02 × 30 s) holds ~12 ticks
+    expect(await until(() => stub.stats.mints >= 2, 5_000)).toBe(true);
+    await Bun.sleep(1_500);
+    expect(stub.stats.mints).toBe(2);
+  }, 15_000);
 });
 
 describe("terminal answers (§3.3 table, §5.4)", () => {
