@@ -12,22 +12,27 @@
  * policy.
  *
  * Classes, by what fixes the refusal:
- * - transient   (1000/1001/1006/4006/anything unknown): the network or a
- *               restart; retry soon.
+ * - transient   (1000/1001/1006/1011/4006/anything unknown): the network or a
+ *               restart; retry soon. 1011 "grant check failed" (RFC-016) is the
+ *               server's grant re-check hitting a database error — its fault, not
+ *               the token's: same token, retry soon.
  * - session-cap (4007): this agent already has the server's maximum live
  *               sockets. A slot frees when a sibling session closes or a dead
  *               socket is swept — not within a second — and every refused
  *               retry spends the machine's per-IP upgrade budget that its
  *               HEALTHY sessions need. So: slow.
- * - credential  (4001 invalid token, 4003 deregistered/workspace archived):
- *               today both are undone by someone else with the SAME token
- *               (reactivate; workspace restore), so keep retrying — slowly — and
- *               the session recovers without anyone touching the terminal.
+ * - credential  (4001 token or proof refused, 4003 deregistered/workspace
+ *               archived): a 4001 gets ONE immediate re-mint (RFC-016 C14, in
+ *               server.ts); after that, and for 4003 (undone by someone else:
+ *               reactivate, workspace restore), keep retrying — slowly — so the
+ *               session recovers without anyone touching the terminal.
  * - expired     (4009, RFC-014 D9): the access token ran out before a reauth. The
  *               credential manager refreshes on the way back in, so retry soon.
  * - revoked     (4008): the session or the machine's installation was revoked
- *               ("session revoked" / "installation revoked") and will never work
- *               again. Retrying is pointless; stop and tell the user.
+ *               ("session revoked" / "installation revoked") or LOCKED because a
+ *               copy of its credential was used ("installation locked", RFC-016 E8)
+ *               and will never work again. Retrying is pointless; stop and tell the
+ *               user.
  */
 
 export type CloseClass = "transient" | "expired" | "session-cap" | "credential" | "revoked";
@@ -74,13 +79,17 @@ export function describeClose(cls: CloseClass, code: number | undefined, reason:
     case "session-cap":
       return `too many live sessions for this agent (${tail}) — close another session, or wait for a slot`;
     case "credential":
-      return `token rejected or agent deactivated (${tail}) — an admin can reactivate it; otherwise fix the token with /bridge:configure`;
+      if (code === 4001)
+        return `Bridge refused this session's access token (${tail}) — a new one is minted; if this keeps happening, run /bridge:login`;
+      return `agent deactivated or workspace archived (${tail}) — retrying slowly; an admin can reactivate it, otherwise run /bridge:login`;
     case "expired":
       return `access token expired (${tail}) — refreshing`;
     case "revoked":
       if (reason === "session revoked") return `this session was revoked in Bridge (${tail}) — /bridge:connect starts a new session`;
       if (reason === "installation revoked")
         return `this machine was signed out of Bridge (${tail}) — run /bridge:login to connect it again`;
+      if (reason === "installation locked")
+        return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail}); its key was deleted here — check this machine, then run /bridge:login to re-enrol`;
       return `token revoked (${tail}) — run /bridge:login, then /bridge:connect`;
     default:
       return `connection closed (${tail})`;
