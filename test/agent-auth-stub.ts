@@ -460,6 +460,7 @@ export function createAuthCore(opts: StubOptions = {}) {
           const now = nowS();
           if (opts.deviceExpire || d.expiresS <= now) return refuseBare(where, "expired_token", "expired");
           const tooFast = d.lastPolledS !== null && now - d.lastPolledS < deviceIntervalS;
+          const polledBefore = d.lastPolledS;
           d.lastPolledS = now;
           if (tooFast) return refuseBare(where, "slow_down", "slow_down");
           if (d.pendingLeft > 0) {
@@ -467,7 +468,13 @@ export function createAuthCore(opts: StubOptions = {}) {
             return refuseBare(where, "authorization_pending", "pending");
           }
           const taken = keyTaken(jwk);
-          if (taken) return taken;
+          if (taken) {
+            // The server's registration fails INSIDE the poll's transaction (pollDeviceCode →
+            // issueInstallation, unique jkt): the whole poll rolls back — its poll stamp too,
+            // so the C6 fresh-key retry right after it is not "too fast".
+            d.lastPolledS = polledBefore;
+            return taken;
+          }
           d.consumed = true;
           return json(newInstallation(jwk, b.key_storage ?? null));
         }
