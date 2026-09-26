@@ -291,7 +291,14 @@ export async function createOrReadAttempt(dir: string, sleep = (ms: number) => n
     }
     const existing = readAttemptRaw(dir);
     if (existing !== null && ATTEMPT.test(existing)) {
-      syncExisting(dir);
+      try {
+        syncExisting(dir);
+      } catch (e) {
+        // Deleted between our read and the fsync (its mint finished): not an error —
+        // start over, exactly as for a deletion before the read.
+        if ((e as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        throw e;
+      }
       return existing;
     }
     if (existing === null) continue; // deleted between our create and read (ENOENT only): try again
@@ -314,18 +321,26 @@ export function deleteAttempt(dir: string): void {
   remove(attemptFile(dir));
 }
 
-/** Logout / terminal refusal / re-enrolment. installation.json FIRST: others then read "signed out". Orphan temps too (any age). */
+/**
+ * Logout / terminal refusal / re-enrolment. installation.json FIRST: others then read
+ * "signed out". The CREDENTIAL files' temps too, at any age: they are only ever written
+ * under the installation lock, which the caller holds, so none is in flight. NOT an
+ * `upgrade-required.json` temp — that marker is no credential, and its writer may be
+ * mid-write (it is left to the age-gated sweep at open).
+ */
 export function deleteInstallationFiles(dir: string): void {
   remove(installationFile(dir));
   remove(keyFile(dir));
   remove(stateFile(dir));
   remove(attemptFile(dir));
-  sweepOrphanTemps(dir, 0);
+  sweep(dir, CREDENTIAL_TMP, 0);
   fsyncDir(dir);
 }
 
 /** writeAtomic's temp names for THIS store's files: `<file>.<pid>.<ms>.<rand>.tmp`. Never a 0.24 or hook temp. */
 const OWN_TMP = /^(key\.json|state|installation\.json|upgrade-required\.json)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
+/** The subset that can hold credential material (the private key, the join state). */
+const CREDENTIAL_TMP = /^(key\.json|state|installation\.json)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
 /** Older than this, a temp file is no writer's in-flight write (a write is milliseconds). */
 export const ORPHAN_TMP_AGE_MS = 60_000;
 
@@ -335,10 +350,14 @@ export const ORPHAN_TMP_AGE_MS = 60_000;
  * in-flight temp is never touched). Returns how many it removed.
  */
 export function sweepOrphanTemps(dir: string, minAgeMs = ORPHAN_TMP_AGE_MS): number {
+  return sweep(dir, OWN_TMP, minAgeMs);
+}
+
+function sweep(dir: string, pattern: RegExp, minAgeMs: number): number {
   let n = 0;
   const cutoff = Date.now() - minAgeMs;
   for (const name of names(dir)) {
-    if (!OWN_TMP.test(name)) continue;
+    if (!pattern.test(name)) continue;
     const p = join(dir, name);
     try {
       if (minAgeMs > 0 && statSync(p).mtimeMs > cutoff) continue;

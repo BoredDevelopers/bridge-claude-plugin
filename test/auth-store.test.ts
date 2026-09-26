@@ -208,6 +208,50 @@ describe("robustness (review fixes)", () => {
     }
   });
 
+  test("an attempt deleted between our read and its fsync (its mint finished) is a restart, not an error", async () => {
+    const dir = tmp();
+    const saved = store.__io.openSync;
+    try {
+      const other = "B".repeat(43);
+      writeFileSync(join(dir, "attempt"), other, { mode: 0o600 });
+      let raced = false;
+      store.__io.openSync = ((p: any, f: any, m: any) => {
+        if (!raced && String(p) === join(dir, "attempt") && f === "r") {
+          raced = true; // the other process wrote its state and deleted the attempt right now
+          rmSync(join(dir, "attempt"));
+          throw Object.assign(new Error("gone"), { code: "ENOENT" });
+        }
+        return saved(p, f, m);
+      }) as any;
+      const got = await store.createOrReadAttempt(dir);
+      expect(raced).toBe(true);
+      expect(got).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(got).not.toBe(other);
+      expect(store.readAttempt(dir)).toBe(got);
+    } finally {
+      store.__io.openSync = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("deleteInstallationFiles never removes an in-flight upgrade-required.json temp (not a credential; left to the age-gated sweep)", () => {
+    const dir = tmp();
+    try {
+      const marker = "upgrade-required.json.4242.1758000000002.QwEr.tmp";
+      const key = "key.json.4242.1758000000003.TyUi.tmp";
+      writeFileSync(join(dir, marker), "{}");
+      writeFileSync(join(dir, key), '{"d":"secret"}');
+      store.deleteInstallationFiles(dir);
+      expect(readdirSync(dir)).toEqual([marker]);
+      const t = new Date(Date.now() - store.ORPHAN_TMP_AGE_MS - 5_000);
+      utimesSync(join(dir, marker), t, t);
+      expect(store.sweepOrphanTemps(dir)).toBe(1);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("orphan temp files (they can hold the private key): swept at open when old, all of them on deleteInstallationFiles — never anyone else's", () => {
     const dir = tmp();
     try {

@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { withInstallationLock, STALE_MS, LOCK_WAIT_MS, HOLD_BUDGET_MS, LOCK_DIR_NAME, __lockIo } from "../auth/node/lock";
+import { withInstallationLock, sweepLockTombstones, STALE_MS, LOCK_WAIT_MS, HOLD_BUDGET_MS, LOCK_DIR_NAME, __lockIo } from "../auth/node/lock";
 import { spawnRacers } from "./fixtures/go-signal";
 import { withProfileLock as withProfileLock024 } from "./fixtures/v024/lock";
 
@@ -181,6 +181,29 @@ describe("installation lock (RFC-016 §5.2: mkdir + 120 s time-based stale break
       expect(JSON.parse(readFileSync(join(lockOf(dir), "owner.json"), "utf8")).nonce).toBe("newer");
     } finally {
       __lockIo.renameSync = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("release tombstones a failed release left behind are swept at open once older than the stale break — never a young one, never anything else", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-tomb-"));
+    try {
+      const old = join(dir, `${LOCK_DIR_NAME}.released-${crypto.randomUUID()}`);
+      const young = join(dir, `${LOCK_DIR_NAME}.released-${crypto.randomUUID()}`);
+      plant(old, { pid: 1, nonce: "old" });
+      plant(young, { pid: 1, nonce: "young" });
+      age(old, STALE_MS + 5_000);
+      plant(lockOf(dir), { pid: 1, nonce: "live" });
+      age(lockOf(dir), STALE_MS + 5_000); // a stale LOCK is the lock's business, not this sweep's
+      mkdirSync(join(dir, ".lock")); // 0.24's
+      age(join(dir, ".lock"), STALE_MS + 5_000);
+      expect(sweepLockTombstones(dir)).toBe(1);
+      expect(existsSync(old)).toBe(false);
+      expect(existsSync(young)).toBe(true);
+      expect(existsSync(lockOf(dir))).toBe(true);
+      expect(existsSync(join(dir, ".lock"))).toBe(true);
+      expect(sweepLockTombstones(join(dir, "missing"))).toBe(0);
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });

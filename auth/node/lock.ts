@@ -124,10 +124,17 @@ async function withFsRetry(op: () => void): Promise<void> {
  * atomically RENAME the directory to a tombstone unique to our nonce, then check what we
  * moved; if it is not ours, put it back.
  *
- * Residual: if, after we moved a newer owner's lock aside, a THIRD process creates a lock
- * before we can put it back, the rename-back fails and that newer owner runs on without a
- * lock file. Its critical section still presents the one current state + attempt from
- * disk, so it converges with the third through E6(b) — the same guarantee as a stale break.
+ * Residual: after we moved a newer owner's lock aside, a THIRD process can mkdir a lock
+ * before we put it back. POSIX rename(2) REPLACES an empty target directory, so:
+ *   - third still EMPTY (between its mkdir and its owner.json write): the rename-back
+ *     succeeds and replaces it; the third then writes its owner.json INTO the restored
+ *     lock (over the newer owner's), and both run inside it;
+ *   - third already has its owner.json: the rename-back fails (ENOTEMPTY / EEXIST) and
+ *     the newer owner runs on without a lock file (its tombstone stays behind until
+ *     sweepLockTombstones);
+ * Either way two holders overlap, and each presents the one current state + attempt from
+ * disk, so they converge through E6(b) — the same guarantee as a stale break. (Windows
+ * never replaces an existing directory: only the second case.)
  */
 async function release(lockDir: string, nonce: string): Promise<void> {
   if (readOwner(lockDir)?.nonce !== nonce) return; // taken over (broken as stale): not ours
@@ -145,6 +152,36 @@ async function release(lockDir: string, nonce: string): Promise<void> {
     return;
   }
   await withFsRetry(() => __lockIo.rmSync(tomb, { recursive: true, force: true }));
+}
+
+const TOMBSTONE = new RegExp(`^${LOCK_DIR_NAME.replace(".", "\\.")}\\.released-[0-9a-f-]+$`);
+
+/**
+ * Remove release tombstones (`.install-lock.released-<nonce>`) a failed release left
+ * behind. Only those older than STALE_MS: a tombstone is a lock directory moved aside, so
+ * its age is its lock's, and a lock that old is breakable anyway — removing its tombstone
+ * is never worse than a stale break. A younger one may be a release in progress. Call once
+ * when a process opens the profile. Returns how many it removed; never throws.
+ */
+export function sweepLockTombstones(profileDir: string): number {
+  let n = 0;
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(profileDir);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    if (!TOMBSTONE.test(name)) continue;
+    const p = join(profileDir, name);
+    const age = ageMs(p);
+    if (age === null || age <= STALE_MS) continue;
+    try {
+      __lockIo.rmSync(p, { recursive: true, force: true });
+      n++;
+    } catch {}
+  }
+  return n;
 }
 
 export interface LockOptions {
