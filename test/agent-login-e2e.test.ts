@@ -265,16 +265,17 @@ describe("plugin on key credentials (RFC-016)", () => {
   }, 30_000);
 
   test("C14 after an in-band reauth: a 4001 drops the REAUTHED token and mints — it never re-presents it", async () => {
-    // 65 s tokens sit inside the 60 s expiry slack after 5 s, so a tool call then mints
-    // and reauths in-band. The reauthed token is itself fresh for 5 s: a reconnect that
-    // re-presented it would be ACCEPTED here, so only the mint count can tell.
-    const stub = startAuthStub({ accessTtlS: 65 });
+    // 62 s tokens sit inside the 60 s expiry slack after 2 s, so a tool call then mints
+    // and reauths in-band. The reauthed token is itself fresh for 2 s — the immediate
+    // reconnect lands well inside that: re-presenting it would be ACCEPTED here, so only
+    // the mint count can tell.
+    const stub = startAuthStub({ accessTtlS: 62 });
     await withPlugin(
       stub,
       {},
       async (client) => {
         expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-        await Bun.sleep(5_300); // time itself is the precondition: the token must enter the expiry slack
+        await Bun.sleep(2_300); // time itself is the precondition: the token must enter the expiry slack
         await client.callTool({ name: "list_channels", arguments: {} });
         expect(await until(() => stub.stats.reauthTokens.length >= 1, 3_000)).toBe(true);
         const reauthed = stub.stats.reauthTokens[0]!;
@@ -312,7 +313,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         const inst = readInstallation(dir)!.installationId;
         stub.revokeSession(stub.sessionsFor(inst)[0]!.id);
         expect(await until(() => notices().some((n) => n.includes("/bridge:connect starts a new session")), 5_000)).toBe(true);
-        await Bun.sleep(1_500);
+        await Bun.sleep(1_000); // a negative
         expect(stub.stats.authTokens).toHaveLength(1);
         // A tool call in between must not sneak a mint through.
         await client.callTool({ name: "list_channels", arguments: {} });
@@ -362,7 +363,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(await until(() => notices().some((n) => n.includes("/bridge:login")), 5_000)).toBe(true);
         expect(readInstallation(dir)).toBeNull();
         expect(existsSync(join(dir, "key.json"))).toBe(false);
-        await Bun.sleep(1_500);
+        await Bun.sleep(1_000); // a negative
         expect(stub.stats.authTokens).toHaveLength(1);
         expect((await status(client)).configured).toBe(false);
       },
@@ -392,7 +393,7 @@ describe("plugin on key credentials (RFC-016)", () => {
           expect(stub.stats.locks).toBe(1);
           expect(existsSync(join(dir, "key.json"))).toBe(false);
           expect(existsSync(join(dir, "state"))).toBe(false);
-          await Bun.sleep(1_500); // a negative: no reconnect may follow
+          await Bun.sleep(1_000); // a negative: no reconnect may follow
           expect(stub.stats.authTokens).toHaveLength(1);
           expect((await status(client)).configured).toBe(false);
         },
@@ -425,7 +426,7 @@ describe("plugin on key credentials (RFC-016)", () => {
           expect(await until(() => !existsSync(join(dir, "key.json")), 5_000)).toBe(true);
           expect(readInstallation(dir)).toBeNull();
           expect(existsSync(join(dir, "state"))).toBe(false);
-          await Bun.sleep(1_500); // a negative: no reconnect may follow
+          await Bun.sleep(1_000); // a negative: no reconnect may follow
           expect(stub.stats.authTokens).toHaveLength(1);
           expect((await status(client)).configured).toBe(false);
         },
@@ -442,7 +443,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     try {
       await withPlugin(
         stub,
-        {},
+        { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
           cpSync(dir, loot, { recursive: true });
@@ -457,7 +458,7 @@ describe("plugin on key credentials (RFC-016)", () => {
           expect((await status(client)).configured).toBe(false);
           // The person re-enrols in another session; this one follows without /bridge:connect.
           await enrolledProfile(stub, dir);
-          expect(await until(() => stub.stats.authTokens.length >= 2, 15_000)).toBe(true);
+          expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
         },
         enrolledIn(stub)
       );
@@ -678,14 +679,14 @@ describe("plugin on key credentials (RFC-016)", () => {
 
   test("a login done in ANOTHER session is picked up without /bridge:connect here", async () => {
     const stub = startAuthStub();
-    await withPlugin(stub, {}, async (client, dir) => {
+    await withPlugin(stub, { BRIDGE_CREDENTIAL_WATCH_MS: "200" }, async (client, dir, _n, _p, stderr) => {
       expect((await status(client)).configured).toBe(false);
-      // Past startup (session-key resolution waits up to 3 s): from here only the
-      // credential watch can notice the new files.
-      await Bun.sleep(4_000);
+      // Past startup (session-key resolution, then the boot's own connect decision): from
+      // here only the credential watch can notice the new files.
+      expect(await until(() => stderr().includes("is not signed in"), 10_000)).toBe(true);
       expect(stub.stats.authTokens).toHaveLength(0);
       await enrolledProfile(stub, dir);
-      expect(await until(() => stub.stats.authTokens.length >= 1, 15_000)).toBe(true);
+      expect(await until(() => stub.stats.authTokens.length >= 1, 5_000)).toBe(true);
     });
   }, 30_000);
 
@@ -826,7 +827,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub(opts);
     await withPlugin(
       stub,
-      {},
+      { BRIDGE_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
         expect(await until(() => notices().some((n) => n.includes("check the system clock")), 10_000)).toBe(true);
         expect(existsSync(join(dir, "key.json"))).toBe(true);
@@ -835,13 +836,13 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
         expect(await until(() => stub.liveSockets() === 1, 3_000)).toBe(true);
         const opens = stub.stats.wsOpens;
-        await Bun.sleep(11_000); // a negative across one credential-watch tick (10 s)
+        await Bun.sleep(1_000); // a negative across five credential-watch ticks
         expect(stub.stats.wsOpens).toBe(opens);
         expect((await status(client)).websocket).toBe("connected");
       },
       enrolledIn(stub)
     );
-  }, 45_000);
+  }, 30_000);
 
   test("/bridge:connect out of a stop starts a new episode: a pending credential watch does not ALSO reconnect over it (exactly one socket)", async () => {
     const opts: StubOptions = { rejectAssertions: true };
