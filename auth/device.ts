@@ -22,7 +22,18 @@ export async function pollDevice(
   auth: DeviceAuthorization,
   opts: { signal?: AbortSignal; sleep?: (ms: number) => Promise<void>; now?: () => number } = {}
 ): Promise<DeviceOutcome> {
-  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // The wait between polls ends early on a cancel. An in-flight POLL is deliberately NOT
+  // aborted: it may be the one carrying the approval — the server then has enrolled the
+  // key, and only the answer lets the caller revoke it (a dropped answer = a live
+  // machine nobody holds).
+  const sleep =
+    opts.sleep ??
+    ((ms: number) =>
+      new Promise<void>((r) => {
+        const done = () => (clearTimeout(t), r());
+        const t = setTimeout(done, ms);
+        opts.signal?.addEventListener("abort", done, { once: true });
+      }));
   const now = opts.now ?? Date.now;
   let intervalS = Math.max(1, auth.interval || 5);
   let extraS = 0;

@@ -63,6 +63,19 @@ describe("device polling (RFC 8628 §3.5)", () => {
   });
 });
 
+describe("device polling — cancel", () => {
+  test("a cancel during the interval wait is prompt: no further poll, answered at once (not after the interval)", async () => {
+    const s = answers(["authorization_pending"]);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+    const t0 = Date.now();
+    const r = await pollDevice(s.poll, auth, { signal: ac.signal }); // the real (default) sleep: 5 s interval
+    expect(r).toEqual({ ok: false, error: "cancelled" });
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(s.polls()).toBe(0);
+  });
+});
+
 describe("headless detection", () => {
   test("SSH and CI are headless everywhere; Linux needs a display; macOS is not", () => {
     expect(isHeadless({ SSH_CONNECTION: "a" }, "darwin")).toBe(true);
