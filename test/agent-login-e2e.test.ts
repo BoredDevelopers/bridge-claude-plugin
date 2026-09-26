@@ -733,6 +733,28 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("a clock refusal (C13) stops, keeping the files; /bridge:connect after the fix connects — and the credential watch then leaves the healthy socket alone", async () => {
+    const opts: StubOptions = { rejectAssertions: true };
+    const stub = startAuthStub(opts);
+    await withPlugin(
+      stub,
+      {},
+      async (client, dir, notices) => {
+        expect(await until(() => notices().some((n) => n.includes("check the system clock")), 10_000)).toBe(true);
+        expect(existsSync(join(dir, "key.json"))).toBe(true);
+        opts.rejectAssertions = false; // the person fixed the clock
+        await client.callTool({ name: "connect", arguments: {} });
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        expect(await until(() => stub.liveSockets() === 1, 3_000)).toBe(true);
+        const opens = stub.stats.wsOpens;
+        await Bun.sleep(11_000); // a negative across one credential-watch tick (10 s)
+        expect(stub.stats.wsOpens).toBe(opens);
+        expect((await status(client)).websocket).toBe("connected");
+      },
+      enrolledIn(stub)
+    );
+  }, 45_000);
+
   test("a named profile with no credentials refuses to connect and says so", async () => {
     const stub = startAuthStub();
     await withPlugin(
