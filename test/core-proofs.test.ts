@@ -41,8 +41,14 @@ describe("DPoP proofs (RFC 9449, RFC-016 §3.4 / E11)", () => {
     expect(httpHtu("https://bridge-api.example.com/", "/api/channels")).toBe("https://bridge-api.example.com/api/channels");
     expect(httpHtu("https://bridge-api.example.com//", "api/channels")).toBe("https://bridge-api.example.com/api/channels");
     expect(httpHtu("https://h.example:443/", "//api/x?since=1#frag")).toBe("https://h.example/api/x");
-    expect(httpHtu("http://127.0.0.1:4000/some/base/", "/api/x")).toBe("http://127.0.0.1:4000/api/x");
     expect(() => httpHtu("ftp://h.example", "/api/x")).toThrow();
+  });
+
+  test("apiUrl must be an ORIGIN: a path, query or credentials are refused with a clear message (the server's htu is origin-based)", () => {
+    for (const bad of ["http://127.0.0.1:4000/some/base/", "https://h.example/bridge", "https://h.example/?x=1", "https://u:p@h.example"]) {
+      expect(() => httpHtu(bad, "/api/x")).toThrow(/must be an origin/);
+    }
+    expect(() => wsHtu("https://h.example/bridge")).toThrow(/must be an origin/);
   });
 
   test("an empty access token or nonce is refused, never signed into a proof", async () => {

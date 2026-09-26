@@ -5,7 +5,7 @@
  */
 export { type Signer, type KeyStorage, softwareSigner, generateSoftwareKey } from "./signer";
 export { type EcPublicJwk, type EcPrivateJwk, isP256PublicJwk, isP256PrivateJwk, jwkThumbprint } from "./jwk";
-export { type ProofInput, dpopProof, wsHtu, httpHtu, normalizeHtu } from "./dpop";
+export { type ProofInput, dpopProof, wsHtu, httpHtu, apiOrigin, normalizeHtu } from "./dpop";
 export { clientAssertion, CLIENT_ASSERTION_TYPE, ASSERTION_TTL_S } from "./assertion";
 export { Clock, MAX_CLOCK_OFFSET_MS } from "./clock";
 export { isJoinState, joinStateSeq } from "./join-state";
@@ -16,6 +16,8 @@ export {
   OAuthError,
   isOAuthError,
   TransportError,
+  DiscoveryError,
+  AbortedError,
   GONE_REASONS,
   classifyTokenError,
   assertNever,
@@ -28,12 +30,12 @@ export {
   type RevokeInput,
   type CallOpts,
   type DeviceAuthorization,
+  type TokenClientOptions,
+  type FetchLike,
   TokenClient,
-  discover,
-  deviceAuthorization,
   supportsKeyCredentials,
   isKeyAlreadyEnrolled,
-  CLIENT_ID,
+  METADATA_TTL_MS,
   MINT_BUDGET_MS,
   MINT_TIMEOUT_MS,
 } from "./protocol";

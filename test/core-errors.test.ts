@@ -1,6 +1,6 @@
 /** RFC-016 §3.3: the token endpoint's error table → what the client does. Pure. */
 import { describe, test, expect } from "bun:test";
-import { assertNever, classifyTokenError, isOAuthError, OAuthError, TransportError, type TokenAction } from "../auth/core/token-errors";
+import { assertNever, classifyTokenError, isOAuthError, OAuthError, TransportError, DiscoveryError, AbortedError, type TokenAction } from "../auth/core/token-errors";
 
 describe("§3.3 error table → client action", () => {
   const e = (error: string, description?: string, status = 400, retryAfterS?: number) => new OAuthError({ error, status, description, retryAfterS });
@@ -49,7 +49,16 @@ describe("§3.3 error table → client action", () => {
     // Only a TRANSPORT failure is transient; any other throw is a bug to show, not to retry forever.
     [new TransportError("socket hang up"), { kind: "transient" }],
     [new DOMException("The operation timed out.", "TimeoutError"), { kind: "transient" }],
-    [new DOMException("The operation was aborted.", "AbortError"), { kind: "transient" }],
+    // A CALLER's cancel is not a network failure: stop, never retry on our own.
+    [new DOMException("The operation was aborted.", "AbortError"), { kind: "aborted" }],
+    [new AbortedError("cancelled by the caller"), { kind: "aborted" }],
+    // Discovery answered with unusable metadata: a wrong URL, not a hiccup.
+    [new DiscoveryError("issuer mismatch"), { kind: "refused" }],
+    // RFC 8628 §3.5 device polling answers.
+    [e("authorization_pending"), { kind: "pending" }],
+    [e("slow_down"), { kind: "slow_down" }],
+    [e("access_denied"), { kind: "refused" }],
+    [e("expired_token"), { kind: "refused" }],
     [new Error("not a P-256 private JWK"), { kind: "refused" }],
     [new RangeError("boom"), { kind: "refused" }],
     ["a string", { kind: "refused" }],
@@ -104,6 +113,9 @@ describe("OAuthError brand (dual-package hazard)", () => {
         case "rate_limited":
         case "refused":
         case "transient":
+        case "aborted":
+        case "pending":
+        case "slow_down":
           return a.kind;
         default:
           return assertNever(a);

@@ -21,27 +21,41 @@ export function normalizeHtu(url: string): string {
 const HTTP_FORM: Record<string, string> = { "ws:": "http:", "wss:": "https:", "http:": "http:", "https:": "https:" };
 
 /**
- * RFC-016 C16: an HTTP request's `htu` is the normalised apiUrl ORIGIN + the request PATH —
- * no query, no fragment, and never a double slash from a trailing-slash apiUrl or a
- * path given with or without its leading "/". Any path in apiUrl itself is ignored (the
- * server's `deployment.apiUrl` is an origin). A ws(s) apiUrl maps to its http(s) form.
+ * The API base as an ORIGIN (`scheme://host[:port]`, no trailing slash, http(s) form).
+ * Bridge's server compares `htu` against `deployment.apiUrl`, which IS an origin, so an
+ * apiUrl carrying a path (`https://h/bridge`), query or fragment would sign proofs no
+ * server accepts — refused here with a clear message rather than as a 401 later. A
+ * trailing "/" (or several) is fine. `allowWsPath` also accepts the `/ws` path of a ws(s) URL.
  */
-export function httpHtu(apiUrl: string, path: string): string {
+export function apiOrigin(apiUrl: string, allowWsPath = false): string {
   const u = new URL(apiUrl);
   const scheme = HTTP_FORM[u.protocol];
-  if (!scheme) throw new Error(`the API URL must be http(s) or ws(s), got ${u.protocol}`);
-  const pathname = "/" + path.split(/[?#]/, 1)[0]!.replace(/^\/+/, "");
+  if (!scheme) throw new Error(`the Bridge API URL must be http(s) or ws(s), got ${u.protocol}`);
+  const pathOk = /^\/*$/.test(u.pathname) || (allowWsPath && u.pathname === "/ws");
+  if (!pathOk || u.search || u.hash || u.username || u.password) {
+    throw new Error(`the Bridge API URL must be an origin like https://bridge-api.example.com — got ${JSON.stringify(apiUrl)}`);
+  }
   // Re-parse in the http(s) form so the default port of THAT scheme is dropped.
-  return normalizeHtu(`${scheme}//${u.host}${pathname}`);
+  return new URL(`${scheme}//${u.host}`).origin;
 }
 
 /**
- * E11: the WebSocket `htu` is the normalised apiUrl ORIGIN + `/ws`, in its
- * http(s) form — never ws(s). Never a nonce on WS (C15): WS proofs are bound by
- * `iat` + `jti` only.
+ * RFC-016 C16: an HTTP request's `htu` is the apiUrl ORIGIN + the request PATH — no
+ * query, no fragment, and never a double slash from a trailing-slash apiUrl or a path
+ * given with or without its leading "/". apiUrl must be an origin (apiOrigin).
+ */
+export function httpHtu(apiUrl: string, path: string): string {
+  const pathname = "/" + path.split(/[?#]/, 1)[0]!.replace(/^\/+/, "");
+  return normalizeHtu(`${apiOrigin(apiUrl)}${pathname}`);
+}
+
+/**
+ * E11: the WebSocket `htu` is the apiUrl ORIGIN + `/ws`, in its http(s) form — never
+ * ws(s). Accepts the socket URL itself (`wss://h/ws`) too. Never a nonce on WS (C15):
+ * WS proofs are bound by `iat` + `jti` only.
  */
 export function wsHtu(apiUrl: string): string {
-  return httpHtu(apiUrl, "/ws");
+  return normalizeHtu(`${apiOrigin(apiUrl, true)}/ws`);
 }
 
 /** `ath`: base64url SHA-256 of the ASCII access token (RFC 9449 §4.2). */

@@ -2,7 +2,7 @@
  * The agent authorization server's client side (RFC-016 §3): discovery, the
  * enrolment grants, the `client_credentials` mint, the Bridge revoke — every
  * token-endpoint request carries a fresh DPoP proof by the installation key.
- * Pure HTTP (global `fetch` + WebCrypto): no files, no locks — the caller owns
+ * Pure HTTP (an injected `fetch`, default the global one, + WebCrypto): no files, no locks — the caller owns
  * those (auth/node/lock.ts: every mint / revoke / enrolment runs inside ONE
  * installation lock and passes its `signal` here), and that split is what lets this
  * move into `@bridge/agent-sdk`.
@@ -17,16 +17,14 @@
  *   - a 2xx whose body is not what the grant promises ⇒ `OAuthError invalid_response`.
  */
 import { clientAssertion, CLIENT_ASSERTION_TYPE } from "./assertion";
-import { dpopProof } from "./dpop";
+import { apiOrigin, dpopProof } from "./dpop";
 import { isJoinState } from "./join-state";
-import { OAuthError, isOAuthError, TransportError } from "./token-errors";
+import { OAuthError, isOAuthError, TransportError, DiscoveryError, AbortedError } from "./token-errors";
 import type { Clock } from "./clock";
 import type { Signer } from "./signer";
 
-export { OAuthError, isOAuthError, TransportError } from "./token-errors";
+export { OAuthError, isOAuthError, TransportError, DiscoveryError, AbortedError } from "./token-errors";
 
-/** The public client that starts every enrolment (RFC-016 §3.2 `AGENT_AUTH_CLIENTS`). */
-export const CLIENT_ID = "bridge-claude-plugin";
 export const GRANT_ENROLMENT_KEY = "urn:bridge:params:oauth:grant-type:enrolment-key";
 export const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 export const GRANT_CLIENT_CREDENTIALS = "client_credentials";
@@ -42,13 +40,21 @@ export const MINT_TIMEOUT_MS = 30_000;
  */
 export const MINT_BUDGET_MS = 90_000;
 const DISCOVERY_TIMEOUT_MS = 10_000;
+/** How long a TokenClient trusts discovered metadata (a deploy can move endpoints). */
+export const METADATA_TTL_MS = 60 * 60_000;
+
+/** A timeout's reason is a `TimeoutError`; anything else a caller's signal carries is the caller cancelling. */
+function callerCancelled(signal: AbortSignal | undefined): boolean {
+  return !!signal?.aborted && (signal.reason as { name?: unknown } | undefined)?.name !== "TimeoutError";
+}
 
 /** Reject when `signal` aborts, without cancelling `p` itself (it may be shared). */
 function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return p;
-  if (signal.aborted) return Promise.reject(signal.reason);
+  const why = () => (callerCancelled(signal) ? new AbortedError("cancelled by the caller", { cause: signal.reason }) : signal.reason);
+  if (signal.aborted) return Promise.reject(why());
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
+    const onAbort = () => reject(why());
     signal.addEventListener("abort", onAbort, { once: true });
     p.then(
       (v) => (signal.removeEventListener("abort", onAbort), resolve(v)),
@@ -60,15 +66,21 @@ function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T
 /**
  * The HTTP exchange, with ONLY the transport wrapped: `fetch` and reading the body. The
  * body is read as text (a cut-off body is a lost answer, not a malformed one) and parsed
- * separately — a non-JSON body is `json: null`, never a throw.
+ * separately — a non-JSON body is `json: null`, never a throw. A failure while the
+ * CALLER's own signal is cancelled is `AbortedError` (never retried); any other is a
+ * `TransportError` (transient), including our own timeouts.
  */
-async function exchange(url: string, init: RequestInit): Promise<{ res: Response; json: unknown }> {
+/** What the TokenClient needs of `fetch` (so a test double or another runtime's fetch fits). */
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+async function exchange(f: FetchLike, url: string, init: RequestInit, callerSignal?: AbortSignal): Promise<{ res: Response; json: unknown }> {
   let res: Response;
   let text: string;
   try {
-    res = await fetch(url, init);
+    res = await f(url, init);
     text = await res.text();
   } catch (e) {
+    if (callerCancelled(callerSignal)) throw new AbortedError("cancelled by the caller", { cause: callerSignal!.reason });
     throw new TransportError(`Bridge agent-auth ${new URL(url).pathname}: no answer (${(e as { message?: unknown })?.message ?? e})`, { cause: e });
   }
   let json: unknown = null;
@@ -78,11 +90,18 @@ async function exchange(url: string, init: RequestInit): Promise<{ res: Response
   return { res, json };
 }
 
+/** RFC 9110 §10.2.3: delay-seconds or an HTTP-date. Undefined when absent or unparseable. */
+function retryAfterS(ra: string | null, now = Date.now()): number | undefined {
+  if (ra === null || ra.trim() === "") return undefined;
+  if (/^\s*\d+(\.\d+)?\s*$/.test(ra)) return Number(ra);
+  const t = Date.parse(ra);
+  return Number.isFinite(t) ? Math.max(0, (t - now) / 1000) : undefined;
+}
+
 /** Any HTTP error answer → OAuthError. A body that is not an RFC 6749 §5.2 object is judged by status alone. */
 function toOAuthError(res: Response, json: unknown): OAuthError {
   const o = json !== null && typeof json === "object" && !Array.isArray(json) ? (json as Record<string, unknown>) : {};
-  const ra = res.headers.get("retry-after");
-  const retry = ra !== null && ra.trim() !== "" && Number.isFinite(Number(ra)) ? Number(ra) : undefined;
+  const retry = retryAfterS(res.headers.get("retry-after"));
   return new OAuthError({
     error: typeof o.error === "string" && o.error !== "" ? o.error : res.status === 429 ? "rate_limited" : `http_${res.status}`,
     status: res.status,
@@ -103,8 +122,6 @@ export interface AuthMetadata {
   bridge_connect_done_uri?: string;
 }
 
-const baseOf = (apiUrl: string) => apiUrl.replace(/\/+$/, "");
-
 /**
  * RFC 8414 §3.3: the metadata's `issuer` MUST equal the issuer the discovery URL was
  * built from. Every endpoint the plugin sends a credential to is pinned to the API's
@@ -112,10 +129,9 @@ const baseOf = (apiUrl: string) => apiUrl.replace(/\/+$/, "");
  * a join state to another host. (`bridge_connect_done_uri` is the WEB origin by design.)
  */
 export function assertSameAuthority(apiUrl: string, m: AuthMetadata): void {
-  const base = baseOf(apiUrl);
-  const origin = new URL(base).origin;
-  if (m.issuer !== `${base}/api/agent-auth`) {
-    throw new Error(`Bridge agent-auth discovery issuer ${JSON.stringify(m.issuer)} does not match ${base} — refusing it`);
+  const origin = apiOrigin(apiUrl);
+  if (m.issuer !== `${origin}/api/agent-auth`) {
+    throw new DiscoveryError(`Bridge agent-auth discovery issuer ${JSON.stringify(m.issuer)} does not match ${origin} — refusing it`);
   }
   for (const k of ["token_endpoint", "revocation_endpoint", "authorization_endpoint", "device_authorization_endpoint"] as const) {
     const v = m[k];
@@ -124,45 +140,15 @@ export function assertSameAuthority(apiUrl: string, m: AuthMetadata): void {
     try {
       o = new URL(v).origin;
     } catch {
-      throw new Error(`Bridge agent-auth discovery ${k} is not a URL — refusing it`);
+      throw new DiscoveryError(`Bridge agent-auth discovery ${k} is not a URL — refusing it`);
     }
-    if (o !== origin) throw new Error(`Bridge agent-auth discovery ${k} points at ${o}, not ${origin} — refusing it`);
+    if (o !== origin) throw new DiscoveryError(`Bridge agent-auth discovery ${k} points at ${o}, not ${origin} — refusing it`);
   }
 }
 
 /** RFC-016 §3.6: a server that can mint for a key advertises `client_credentials`. */
 export function supportsKeyCredentials(m: AuthMetadata): boolean {
   return Array.isArray(m.grant_types_supported) && m.grant_types_supported.includes(GRANT_CLIENT_CREDENTIALS);
-}
-
-const metadataCache = new Map<string, Promise<AuthMetadata>>();
-
-/**
- * RFC 8414 discovery; cached per API URL for the process (a failure is not cached).
- * `signal` bounds only THIS caller's wait — the shared request is never cancelled by it.
- * A 5xx (a deploy in progress) is an OAuthError by status, so it classifies transient.
- */
-export function discover(apiUrl: string, signal?: AbortSignal): Promise<AuthMetadata> {
-  const base = baseOf(apiUrl);
-  let p = metadataCache.get(base);
-  if (!p) {
-    p = (async () => {
-      const { res, json } = await exchange(`${base}/.well-known/oauth-authorization-server/api/agent-auth`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-      });
-      if (!res.ok) throw toOAuthError(res, json);
-      const m = json as AuthMetadata | null;
-      if (!m || typeof m.token_endpoint !== "string" || typeof m.issuer !== "string") {
-        throw new Error(`Bridge agent-auth discovery returned no token endpoint — is ${base} a Bridge API?`);
-      }
-      assertSameAuthority(base, m);
-      return m;
-    })();
-    metadataCache.set(base, p);
-    p.catch(() => metadataCache.delete(base));
-  }
-  return abortable(p, signal);
 }
 
 /** What every enrolment grant returns (RFC-016 §3.2). */
@@ -213,11 +199,85 @@ export interface RevokeInput {
   sessionKey?: string;
 }
 
+export interface TokenClientOptions {
+  /** The server clock estimate (E12); every token-endpoint `Date` teaches it. */
+  clock: Clock;
+  /** This runtime's PUBLIC client id (RFC-016 §3.2 `AGENT_AUTH_CLIENTS`, e.g. `bridge-claude-plugin`) — used by the enrolment flows. */
+  clientId: string;
+  /** Injected transport (tests, proxies, other runtimes). Default: the global `fetch`. */
+  fetch?: FetchLike;
+  /** How long discovered metadata is reused (default METADATA_TTL_MS). */
+  metadataTtlMs?: number;
+}
+
 export class TokenClient {
   /** Last `DPoP-Nonce` per authorization-server origin (RFC 9449 §8). */
   private readonly nonces = new Map<string, string>();
+  /** Discovery, per API origin, for this client only — never a process-global forever cache. */
+  private readonly metadata = new Map<string, { at: number; p: Promise<AuthMetadata> }>();
+  private readonly clock: Clock;
+  private readonly clientId: string;
+  private readonly f: FetchLike;
+  private readonly ttlMs: number;
 
-  constructor(private readonly clock: Clock) {}
+  constructor(o: TokenClientOptions) {
+    if (typeof o.clientId !== "string" || o.clientId === "") throw new Error("TokenClient needs the runtime's public clientId");
+    this.clock = o.clock;
+    this.clientId = o.clientId;
+    this.f = o.fetch ?? ((input, init) => globalThis.fetch(input, init));
+    this.ttlMs = o.metadataTtlMs ?? METADATA_TTL_MS;
+  }
+
+  /**
+   * RFC 8414 discovery for `apiUrl` (an ORIGIN — see apiOrigin), reused for metadataTtlMs;
+   * a failure is not kept. `signal` bounds only THIS caller's wait — a shared request is
+   * never cancelled by it. A 5xx (a deploy in progress) is an OAuthError by status
+   * (transient); unusable metadata is a DiscoveryError (refused).
+   */
+  discover(apiUrl: string, signal?: AbortSignal): Promise<AuthMetadata> {
+    const origin = apiOrigin(apiUrl);
+    const hit = this.metadata.get(origin);
+    if (hit && Date.now() - hit.at < this.ttlMs) return abortable(hit.p, signal);
+    const p = (async () => {
+      const { res, json } = await exchange(this.f, `${origin}/.well-known/oauth-authorization-server/api/agent-auth`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+      });
+      if (!res.ok) throw toOAuthError(res, json);
+      const m = json as AuthMetadata | null;
+      if (!m || typeof m.token_endpoint !== "string" || typeof m.issuer !== "string") {
+        throw new DiscoveryError(`Bridge agent-auth discovery returned no token endpoint — is ${origin} a Bridge API?`);
+      }
+      assertSameAuthority(origin, m);
+      return m;
+    })();
+    this.metadata.set(origin, { at: Date.now(), p });
+    p.catch(() => {
+      if (this.metadata.get(origin)?.p === p) this.metadata.delete(origin);
+    });
+    return abortable(p, signal);
+  }
+
+  /** RFC 8628 §3.1 — public, no DPoP (the proof key is bound at the token request, C8). */
+  async deviceAuthorization(m: AuthMetadata, installationName: string, o: CallOpts = {}): Promise<DeviceAuthorization> {
+    const { res, json } = await exchange(
+      this.f,
+      m.device_authorization_endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ client_id: this.clientId, installation_name: installationName }),
+        signal: o.signal ? AbortSignal.any([AbortSignal.timeout(MINT_TIMEOUT_MS), o.signal]) : AbortSignal.timeout(MINT_TIMEOUT_MS),
+      },
+      o.signal
+    );
+    if (!res.ok) throw toOAuthError(res, json);
+    const d = json as Partial<DeviceAuthorization> | null;
+    if (typeof d?.device_code !== "string" || typeof d?.user_code !== "string" || typeof d?.verification_uri !== "string") {
+      throw new OAuthError({ error: "invalid_response", status: res.status, description: "device authorization answered without device_code + user_code + verification_uri" });
+    }
+    return d as DeviceAuthorization;
+  }
 
   /**
    * POST with a fresh DPoP proof (and, via `build`, a fresh assertion `jti`) per try.
@@ -242,12 +302,17 @@ export class TokenClient {
       const body = await build();
       // C16: dpopProof signs the endpoint's normalised origin + path — never its query.
       const proof = await dpopProof(signer, this.clock, { htm: "POST", htu: url, nonce: this.nonces.get(origin) });
-      const { res, json } = await exchange(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json", DPoP: proof },
-        body: JSON.stringify(body),
-        signal: AbortSignal.any([AbortSignal.timeout(MINT_TIMEOUT_MS), budget]),
-      });
+      const { res, json } = await exchange(
+        this.f,
+        url,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json", DPoP: proof },
+          body: JSON.stringify(body),
+          signal: AbortSignal.any([AbortSignal.timeout(MINT_TIMEOUT_MS), budget]),
+        },
+        signal
+      );
       this.clock.observe(res.headers.get("date"));
       const nonce = res.headers.get("dpop-nonce");
       if (nonce) this.nonces.set(origin, nonce);
@@ -312,7 +377,7 @@ export class TokenClient {
           code: p.code,
           code_verifier: p.verifier,
           redirect_uri: p.redirectUri,
-          client_id: CLIENT_ID,
+          client_id: this.clientId,
           key_storage: signer.keyStorage,
         }),
         false,
@@ -326,7 +391,7 @@ export class TokenClient {
       await this.postDpop(
         m.token_endpoint,
         signer,
-        async () => ({ grant_type: GRANT_DEVICE_CODE, device_code: deviceCode, client_id: CLIENT_ID, key_storage: signer.keyStorage }),
+        async () => ({ grant_type: GRANT_DEVICE_CODE, device_code: deviceCode, client_id: this.clientId, key_storage: signer.keyStorage }),
         false,
         o.signal
       )
@@ -383,20 +448,4 @@ export class TokenClient {
 /** C6: the enrolment was refused because this key is already registered — retry once with a fresh key. */
 export function isKeyAlreadyEnrolled(e: unknown): boolean {
   return isOAuthError(e) && e.error === "invalid_dpop_proof" && e.description === "key_already_enrolled";
-}
-
-/** RFC 8628 §3.1 — public, no DPoP (the proof key is bound at the token request, C8). */
-export async function deviceAuthorization(m: AuthMetadata, installationName: string, o: CallOpts = {}): Promise<DeviceAuthorization> {
-  const { res, json } = await exchange(m.device_authorization_endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ client_id: CLIENT_ID, installation_name: installationName }),
-    signal: o.signal ? AbortSignal.any([AbortSignal.timeout(MINT_TIMEOUT_MS), o.signal]) : AbortSignal.timeout(MINT_TIMEOUT_MS),
-  });
-  if (!res.ok) throw toOAuthError(res, json);
-  const d = json as Partial<DeviceAuthorization> | null;
-  if (typeof d?.device_code !== "string" || typeof d?.user_code !== "string" || typeof d?.verification_uri !== "string") {
-    throw new OAuthError({ error: "invalid_response", status: res.status, description: "device authorization answered without device_code + user_code + verification_uri" });
-  }
-  return d as DeviceAuthorization;
 }

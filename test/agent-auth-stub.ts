@@ -12,7 +12,17 @@
  *     exp ≤ iat + 300, jti shared with the proofs' replay set;
  *   - request validation BEFORE client authentication, in the server's order (§3.1: the
  *     CRC is checked before any database read): corrupt_state, attempt_invalid,
- *     session_key_invalid (mint); corrupt_state, scope_invalid, attempt_invalid (revoke);
+ *     session_key_invalid (mint); scope_invalid, corrupt_state, attempt_invalid,
+ *     session_key_invalid (revoke);
+ *   - every secret (`brg_ek_` / `brg_ac_` / `brg_dc_`) in the server's format with its CRC,
+ *     judged (invalid_grant) BEFORE key_storage and the proof, as agent-credentials.ts does;
+ *     an authorization code is burnt by ANY mismatch; the device grant checks client_id,
+ *     paces polls (`interval`, default the server's 5 s ⇒ `slow_down`), and answers
+ *     access_denied / expired_token;
+ *   - a client's session revoke is `client_revoked`: a later mint with that session_key
+ *     opens a NEW session (E9 blocks only a `manual` revoke without reconnect);
+ *   - every response carries the stub clock's `Date` (skewed when `clockSkewS`), 502s and
+ *     redirects included;
  *   - the join-state chain exactly as E6: current ⇒ advance; previous + SAME attempt ⇒
  *     replay (no time bound); anything else ⇒ LOCK (4008 "installation locked");
  *   - a revoke verifies the state and NEVER advances it;
@@ -26,12 +36,18 @@
  * A client that re-presents a stale state, drops its attempt, reuses a jti or signs
  * with the wrong key fails loudly — and `stats` says which.
  */
-import { parseJws, verifyEs256, isPublicP256, thumbprint, sha256b64u, normHtu, randomBase62, makeJoinState, joinStateCrcOk as crcOk } from "./dpop-verify";
+import { parseJws, verifyEs256, isPublicP256, thumbprint, sha256b64u, normHtu, randomBase62, makeJoinState, joinStateCrcOk as crcOk, crc32, base62 } from "./dpop-verify";
 
 export interface StubOptions {
   accessTtlS?: number;
-  /** Device polls answered `authorization_pending` before success. */
+  /** Device polls answered `authorization_pending` before the request is approved. */
   devicePending?: number;
+  /** RFC 8628 `interval` (s) — a faster poll is `slow_down`. Default the server's DEVICE_POLL_INTERVAL_S = 5. */
+  deviceIntervalS?: number;
+  /** The human denies the device request (`access_denied`). */
+  deviceDeny?: boolean;
+  /** The device request expires before approval (`expired_token`). */
+  deviceExpire?: boolean;
   /** `/authorize` answers with `error=access_denied`. */
   deny?: boolean;
   agentId?: string;
@@ -83,7 +99,7 @@ type Inst = {
   current: string;
   prev: { state: string; attemptHash: string } | null;
 };
-type Sess = { id: string; instId: string; key: string; revoked: null | "manual" | "evicted"; lastUsed: number };
+type Sess = { id: string; instId: string; key: string; revoked: null | "manual" | "evicted" | "client_revoked"; lastUsed: number };
 
 const GRANT_ENROLMENT_KEY = "urn:bridge:params:oauth:grant-type:enrolment-key";
 const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
@@ -95,16 +111,33 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** C4. */
 const ATTEMPT_RE = /^[A-Za-z0-9_-]{22,128}$/;
 const SESSION_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+/** The plugin's public client (AGENT_AUTH_CLIENTS). */
+export const STUB_CLIENT_ID = "bridge-claude-plugin";
+/** RFC 7636 §4.1. */
+const PKCE_VALUE_RE = /^[A-Za-z0-9._~-]{43,128}$/;
+const JKT_RE = /^[A-Za-z0-9_-]{43}$/;
+
+/** The server's secret format (agent-tokens.ts): `brg_<kind>_<43 base62><6 base62 CRC32>`. */
+export function mintAgentToken(kind: "at" | "ek" | "ac" | "dc"): string {
+  const head = `brg_${kind}_${randomBase62(43)}`;
+  return head + base62(crc32(head), 6);
+}
+export function isAgentToken(kind: string, s: unknown): boolean {
+  if (typeof s !== "string") return false;
+  const m = /^(brg_(at|ek|ac|dc)_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
+  return !!m && m[2] === kind && base62(crc32(m[1]!), 6) === m[3];
+}
 
 
 export function createAuthCore(opts: StubOptions = {}) {
   const accessTtlS = opts.accessTtlS ?? 3600;
+  const deviceIntervalS = opts.deviceIntervalS ?? 5;
   const insts = new Map<string, Inst>();
   const byJkt = new Map<string, string>();
   const sessions = new Map<string, Sess>();
   const access = new Map<string, { session: string; instId: string; jkt: string; exp: number }>();
-  const codes = new Map<string, { challenge: string; redirect: string; used: boolean; dpopJkt: string | null; instId?: string }>();
-  const devices = new Map<string, { polls: number }>();
+  const codes = new Map<string, { clientId: string; challenge: string; redirect: string; used: boolean; dpopJkt: string | null; instId?: string }>();
+  const devices = new Map<string, { clientId: string; pendingLeft: number; lastPolledS: number | null; expiresS: number; consumed: boolean }>();
   const enrolmentKeys = new Map<string, number>();
   const usedJti = new Set<string>();
   let nonce = `n-${randomBase62(16)}`;
@@ -124,8 +157,7 @@ export function createAuthCore(opts: StubOptions = {}) {
     /** Every refusal, as `<where>:<reason>` — the first thing to read when a test fails. */
     refusals: [] as string[],
   };
-  let n = 0;
-  const mint = (k: string) => `brg_${k}_${(++n).toString().padStart(6, "0")}${randomBase62(32)}`;
+  const mint = mintAgentToken;
   const sockets = new Set<any>();
   let rejectWsAuths = 0;
   const nowS = () => Math.floor(Date.now() / 1000) + (opts.clockSkewS ?? 0);
@@ -136,6 +168,17 @@ export function createAuthCore(opts: StubOptions = {}) {
   const refuse = (where: string, error: string, description?: string, status = 400, extra: Record<string, string> = {}) => {
     stats.refusals.push(`${where}:${description ?? error}`);
     return json(description ? { error, error_description: description } : { error }, status, extra);
+  };
+  /** A refusal the server answers WITHOUT a description; `why` goes to stats only. */
+  const refuseBare = (where: string, error: string, why: string) => {
+    stats.refusals.push(`${where}:${why}`);
+    return json({ error }, 400);
+  };
+  /** Every answer carries the stub clock's Date — a redirect and a 502 too. */
+  const withDate = (r: Response) => {
+    const headers = new Headers(r.headers);
+    headers.set("Date", dateHeader());
+    return new Response(r.body, { status: r.status, statusText: r.statusText, headers });
   };
 
   function closeWhere(pred: (s: Sess) => boolean, reason: string) {
@@ -293,14 +336,29 @@ export function createAuthCore(opts: StubOptions = {}) {
     }
     if (url.pathname === "/api/agent-auth/authorize") {
       const q = url.searchParams;
-      const redirect = q.get("redirect_uri")!;
+      // The server's createLoopbackRequest: unknown client / non-loopback redirect are answered HERE (never redirected).
+      if (q.get("client_id") !== STUB_CLIENT_ID) return new Response("Bridge could not start this sign-in: unknown client_id.", { status: 400 });
+      const redirect = q.get("redirect_uri") ?? "";
+      if (!/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+\//.test(redirect)) return new Response("Bridge could not start this sign-in: redirect_uri.", { status: 400 });
       const back = new URL(redirect);
+      const jktQ = q.get("dpop_jkt");
+      if (
+        q.get("response_type") !== "code" ||
+        q.get("code_challenge_method") !== "S256" ||
+        !PKCE_VALUE_RE.test(q.get("code_challenge") ?? "") ||
+        !(q.get("state") ?? "") ||
+        (jktQ !== null && !JKT_RE.test(jktQ))
+      ) {
+        back.searchParams.set("error", "invalid_request");
+        if (q.get("state")) back.searchParams.set("state", q.get("state")!);
+        return Response.redirect(back.toString(), 302);
+      }
       back.searchParams.set("state", q.get("state")!);
       back.searchParams.set("iss", issuer);
       if (opts.deny) back.searchParams.set("error", "access_denied");
       else {
         const code = mint("ac");
-        codes.set(code, { challenge: q.get("code_challenge")!, redirect, used: false, dpopJkt: q.get("dpop_jkt") });
+        codes.set(code, { clientId: q.get("client_id")!, challenge: q.get("code_challenge")!, redirect, used: false, dpopJkt: jktQ });
         back.searchParams.set("code", code);
       }
       return Response.redirect(back.toString(), 302);
@@ -309,9 +367,10 @@ export function createAuthCore(opts: StubOptions = {}) {
     const b = req.method === "POST" ? ((await req.json().catch(() => ({}))) as any) : {};
 
     if (url.pathname === "/api/agent-auth/device_authorization") {
+      if (b.client_id !== STUB_CLIENT_ID) return refuse("device_authorization", "invalid_client");
       const dc = mint("dc");
-      devices.set(dc, { polls: 0 });
-      return json({ device_code: dc, user_code: "BCDF-GHJK", verification_uri: `${url.origin}/connect`, expires_in: 600, interval: 1 });
+      devices.set(dc, { clientId: b.client_id, pendingLeft: opts.devicePending ?? 0, lastPolledS: null, expiresS: nowS() + 600, consumed: false });
+      return json({ device_code: dc, user_code: "BCDF-GHJK", verification_uri: `${url.origin}/connect`, expires_in: 600, interval: deviceIntervalS });
     }
 
     if (url.pathname === "/api/agent-auth/token") {
@@ -323,42 +382,66 @@ export function createAuthCore(opts: StubOptions = {}) {
         if (req.headers.get("dpop") === null) return refuse(where, "invalid_dpop_proof", `dpop_proof_required: ${UPDATE_PLUGIN_HINT}`);
         const r = checkProof(req.headers.get("dpop"), "POST", `${url.origin}${url.pathname}`, null, null, where);
         if ("reason" in r) return r.nonce ? refuse(where, "use_dpop_nonce", undefined, 400, nonceHeaders()) : refuse(where, "invalid_dpop_proof", r.reason);
-        // C6: `key_already_enrolled` — the client answers with a FRESH key, once.
+        return r.jwk;
+      };
+      /**
+       * At REGISTRATION (the server's UNIQUE index on jkt, hit after the secret is claimed —
+       * the whole transaction rolls back, so the secret is NOT consumed). C6: the client
+       * answers with a FRESH key, once.
+       */
+      const keyTaken = (jwk: any): Response | null => {
         if ((opts.keyAlreadyEnrolled ?? 0) > 0) {
           opts.keyAlreadyEnrolled!--;
           return refuse(where, "invalid_dpop_proof", "key_already_enrolled");
         }
-        if (byJkt.has(thumbprint(r.jwk))) return refuse(where, "invalid_dpop_proof", "key_already_enrolled");
-        return r.jwk;
+        if (byJkt.has(thumbprint(jwk))) return refuse(where, "invalid_dpop_proof", "key_already_enrolled");
+        return null;
       };
       switch (b.grant_type) {
         case GRANT_ENROLMENT_KEY: {
           if (opts.enrolDelayMs) await Bun.sleep(opts.enrolDelayMs);
+          // The server's order: the secret's format (requireKind) → key_storage → proof → claim → register.
+          if (!isAgentToken("ek", b.enrolment_key)) return refuseBare(where, "invalid_grant", "enrolment_key_format");
           const jwk = enrolProof();
           if (jwk instanceof Response) return jwk;
           const left = enrolmentKeys.get(b.enrolment_key) ?? 0;
-          if (left <= 0) return refuse(where, "invalid_grant");
+          if (left <= 0) return refuseBare(where, "invalid_grant", "enrolment_key_unknown");
+          const taken = keyTaken(jwk);
+          if (taken) return taken;
           enrolmentKeys.set(b.enrolment_key, left - 1);
           return json(newInstallation(jwk, b.key_storage ?? null));
         }
         case "authorization_code": {
           if (opts.codeDelayMs) await Bun.sleep(opts.codeDelayMs);
+          if (!isAgentToken("ac", b.code)) return refuseBare(where, "invalid_grant", "code_format");
           const jwk = enrolProof();
           if (jwk instanceof Response) return jwk;
           const c = codes.get(b.code);
-          if (c?.used) {
+          if (!c) return refuseBare(where, "invalid_grant", "code_unknown");
+          if (c.used) {
             // C9: a replayed code is a copy signal — lock what it enrolled.
             const replayed = c.instId ? insts.get(c.instId) : undefined;
             if (replayed && !replayed.revoked) lock(replayed);
-            return refuse(where, "invalid_grant", "code_replayed");
+            return refuseBare(where, "invalid_grant", "code_replayed");
           }
-          if (!c || c.redirect !== b.redirect_uri || b.client_id !== "bridge-claude-plugin") return refuse(where, "invalid_grant");
-          if (c.dpopJkt !== null && c.dpopJkt !== thumbprint(jwk)) {
-            c.used = true; // C7: burnt
-            return refuse(where, "invalid_grant", "dpop_jkt_mismatch");
+          // The server consumes the code BEFORE any check: ANY mismatch leaves it burnt (one try).
+          const verifier = typeof b.code_verifier === "string" ? b.code_verifier : "";
+          const why =
+            b.client_id !== c.clientId
+              ? "client_id"
+              : b.redirect_uri !== c.redirect
+                ? "redirect_uri"
+                : !PKCE_VALUE_RE.test(verifier) || new Bun.CryptoHasher("sha256").update(verifier).digest("base64url") !== c.challenge
+                  ? "pkce"
+                  : c.dpopJkt !== null && c.dpopJkt !== thumbprint(jwk)
+                    ? "dpop_jkt_mismatch" // C7
+                    : null;
+          if (why) {
+            c.used = true;
+            return refuseBare(where, "invalid_grant", why);
           }
-          const want = new Bun.CryptoHasher("sha256").update(b.code_verifier ?? "").digest("base64url");
-          if (want !== c.challenge) return refuse(where, "invalid_grant");
+          const taken = keyTaken(jwk);
+          if (taken) return taken; // rolled back server-side: the code is NOT consumed
           c.used = true;
           const enrolled = newInstallation(jwk, b.key_storage ?? null);
           c.instId = enrolled.installation_id;
@@ -366,18 +449,27 @@ export function createAuthCore(opts: StubOptions = {}) {
         }
         case GRANT_DEVICE_CODE: {
           if (opts.devicePollDelayMs) await Bun.sleep(opts.devicePollDelayMs);
-          const d = devices.get(b.device_code);
-          if (!d) return refuse(where, "invalid_grant");
-          if (d.polls++ < (opts.devicePending ?? 0)) {
-            // Still a proof per poll (single-use jti): consume it so reuse is caught.
-            const r = checkProof(req.headers.get("dpop"), "POST", `${url.origin}${url.pathname}`, null, null, where);
-            if ("reason" in r) return refuse(where, "invalid_dpop_proof", r.reason);
-            return json({ error: "authorization_pending" }, 400);
-          }
+          if (!isAgentToken("dc", b.device_code)) return refuseBare(where, "invalid_grant", "device_code_format");
+          // Every poll proves the key (and declares key_storage), pending ones too — as the server's.
           const jwk = enrolProof();
           if (jwk instanceof Response) return jwk;
-          devices.delete(b.device_code);
-          return json(newInstallation(jwk, b.key_storage));
+          const d = devices.get(b.device_code);
+          if (!d || d.clientId !== b.client_id) return refuseBare(where, "invalid_grant", "device_code_unknown");
+          if (opts.deviceDeny) return refuseBare(where, "access_denied", "denied");
+          if (d.consumed) return refuseBare(where, "invalid_grant", "device_code_consumed");
+          const now = nowS();
+          if (opts.deviceExpire || d.expiresS <= now) return refuseBare(where, "expired_token", "expired");
+          const tooFast = d.lastPolledS !== null && now - d.lastPolledS < deviceIntervalS;
+          d.lastPolledS = now;
+          if (tooFast) return refuseBare(where, "slow_down", "slow_down");
+          if (d.pendingLeft > 0) {
+            d.pendingLeft--;
+            return refuseBare(where, "authorization_pending", "pending");
+          }
+          const taken = keyTaken(jwk);
+          if (taken) return taken;
+          d.consumed = true;
+          return json(newInstallation(jwk, b.key_storage ?? null));
         }
         case "client_credentials": {
           if (opts.mintDelayMs) await Bun.sleep(opts.mintDelayMs);
@@ -456,7 +548,7 @@ export function createAuthCore(opts: StubOptions = {}) {
       stats.revokes.push({ id: inst.id, scope: b.scope });
       if (b.scope === "session") {
         // An unknown or already-dead session key is a no-op — still `{"ok":true}` (C11).
-        for (const s of sessions.values()) if (s.instId === inst.id && s.key === b.session_key && !s.revoked) s.revoked = "manual";
+        for (const s of sessions.values()) if (s.instId === inst.id && s.key === b.session_key && !s.revoked) s.revoked = "client_revoked";
         closeWhere((s) => s.instId === inst.id && s.key === b.session_key, "session revoked");
       } else {
         inst.revoked = "installation_revoked";
@@ -504,13 +596,29 @@ export function createAuthCore(opts: StubOptions = {}) {
   }
 
   return {
-    handleAuth,
-    checkResource,
+    /** Every answer, a redirect or a 502 included, carries the stub clock's Date. */
+    handleAuth: async (req: Request) => {
+      const r = await handleAuth(req);
+      return r && withDate(r);
+    },
+    checkResource: (req: Request) => {
+      const r = checkResource(req);
+      return r && withDate(r);
+    },
+    withDate,
     wsCheck,
     stats,
     sockets,
     sessions,
+    /** A fresh enrolment key in the server's format, redeemable `uses` times. */
+    mintEnrolmentKey(uses = 1): string {
+      const key = mintAgentToken("ek");
+      enrolmentKeys.set(key, uses);
+      return key;
+    },
+    /** Register a specific key; it must be in the server's format (`brg_ek_…` + CRC) or it could never be redeemed. */
     addEnrolmentKey(key: string, uses = 1) {
+      if (!isAgentToken("ek", key)) throw new Error(`stub: ${key} is not a well-formed enrolment key (use mintEnrolmentKey())`);
       enrolmentKeys.set(key, uses);
     },
     /** Register a key directly, as if a login had happened (the test holds the private half). */
@@ -557,8 +665,8 @@ export function startAuthStub(opts: StubOptions = {}) {
       if (url.pathname === "/ws" && srv.upgrade(req, { data: { session: "" } })) return;
       const auth = await core.handleAuth(req);
       if (auth) return auth;
-      if (url.pathname.startsWith("/api/")) return core.checkResource(req) ?? Response.json([]);
-      return new Response("not found", { status: 404 });
+      if (url.pathname.startsWith("/api/")) return core.checkResource(req) ?? core.withDate(Response.json([]));
+      return core.withDate(new Response("not found", { status: 404 }));
     },
     websocket: {
       open(ws: any) {

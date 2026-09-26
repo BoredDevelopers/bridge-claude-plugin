@@ -45,16 +45,32 @@ export class TransportError extends Error {
   override readonly name = "TransportError";
 }
 
+/** Discovery answered, but not with usable metadata (issuer mismatch, missing / foreign endpoint): a wrong URL, not a hiccup. */
+export class DiscoveryError extends Error {
+  override readonly name = "DiscoveryError";
+}
+
+/** The CALLER cancelled (its signal aborted for a reason other than a timeout): stop, never retry on our own. */
+export class AbortedError extends Error {
+  override readonly name = "AbortedError";
+}
+
 /**
  * Only a failure to get an answer is transient: a TransportError (the TokenClient wraps
- * every `fetch` / body-read failure in one) or an abort / timeout (DOMException
- * `AbortError` / `TimeoutError`). By name, so a DOMException from another realm counts
- * too. NOT a bare TypeError: outside the fetch call that is a programming bug, and
- * retrying it forever would hide it. Anything else thrown is `refused`.
+ * every `fetch` / body-read failure in one) or a timeout (DOMException `TimeoutError`).
+ * By name, so a DOMException from another realm counts too. NOT a bare TypeError:
+ * outside the fetch call that is a programming bug, and retrying it forever would hide
+ * it. NOT an `AbortError`: only a caller's own AbortController produces one (every
+ * internal deadline is a timeout) — that is `aborted`. Anything else thrown is `refused`.
  */
 function isTransportFailure(e: unknown): boolean {
   const name = (e as { name?: unknown } | null)?.name;
-  return name === "AbortError" || name === "TimeoutError" || name === "TransportError";
+  return name === "TimeoutError" || name === "TransportError";
+}
+
+function isCallerAbort(e: unknown): boolean {
+  const name = (e as { name?: unknown } | null)?.name;
+  return name === "AbortedError" || name === "AbortError";
 }
 
 export const GONE_REASONS = ["installation_locked", "installation_revoked", "installation_expired", "installation_unknown", "agent_deactivated"] as const;
@@ -90,7 +106,13 @@ export type TokenAction =
   /** A refusal the table does not name, or a non-transport throw: stop and show it, keep the files. */
   | { kind: "refused" }
   /** 5xx / network / timeout: retry later with the SAME attempt. */
-  | { kind: "transient" };
+  | { kind: "transient" }
+  /** The caller cancelled: stop quietly, keep the files, never retry on our own. */
+  | { kind: "aborted" }
+  /** RFC 8628 §3.5 device polling: not approved yet — poll again after the interval. */
+  | { kind: "pending" }
+  /** RFC 8628 §3.5: polling too fast — add 5 s to the interval, then poll again. */
+  | { kind: "slow_down" };
 
 /** Exhaustiveness check for a `switch` over `TokenAction["kind"]`. */
 export function assertNever(x: never): never {
@@ -104,7 +126,7 @@ function retryAfter(s: number | undefined): number {
 }
 
 export function classifyTokenError(e: unknown): TokenAction {
-  if (!isOAuthError(e)) return isTransportFailure(e) ? { kind: "transient" } : { kind: "refused" };
+  if (!isOAuthError(e)) return isTransportFailure(e) ? { kind: "transient" } : isCallerAbort(e) ? { kind: "aborted" } : { kind: "refused" };
   if (e.status === 429) return { kind: "rate_limited", retryAfterS: retryAfter(e.retryAfterS) };
   if (e.status >= 500) return { kind: "transient" };
   switch (e.error) {
@@ -127,6 +149,10 @@ export function classifyTokenError(e: unknown): TokenAction {
       return { kind: "new_proof" };
     case "unsupported_grant_type":
       return { kind: "update_required" };
+    case "authorization_pending":
+      return { kind: "pending" };
+    case "slow_down":
+      return { kind: "slow_down" };
     default:
       return { kind: "refused" };
   }
