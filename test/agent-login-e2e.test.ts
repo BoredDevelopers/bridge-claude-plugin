@@ -197,43 +197,72 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("C14: 4001 drops the token and re-mints ONCE immediately; a second 4001 in a row takes the slow backoff and says /bridge:login once", async () => {
+  test("C14: 4001 drops the token and re-mints ONCE immediately; a second 4001 in a row takes the slow backoff (from its FIRST step) and says /bridge:login once; /bridge:connect re-arms", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
       {},
       async (client, _dir, notices) => {
-        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        const connected = async () => (await status(client)).websocket === "connected";
+        const refusedNotices = () => notices().filter((n) => n.includes("Bridge refused this session's access token"));
+        expect(await until(connected, 5_000)).toBe(true);
         stub.rejectNextWsAuths(1); // the immediate retry is refused too
         stub.closeAll(4001, "Invalid token");
         // Immediate: well inside the credential class's ≥ 30 s first step (the transient ≥ 0.5 s is not used either).
         expect(await until(() => stub.stats.authTokens.length >= 2, 2_000)).toBe(true);
         expect(stub.stats.authTokens[1]).not.toBe(stub.stats.authTokens[0]);
         expect(stub.stats.mints).toBe(2);
-        // The second 4001 (before any `authenticated`): slow — nothing for the next 5 s, and
-        // the model is told what to do, once.
-        expect(await until(() => notices().some((n) => n.includes("Bridge refused this session's access token")), 3_000)).toBe(true);
-        await Bun.sleep(5_000);
+        // The second 4001 (before any `authenticated`): slow, and the model is told once.
+        expect(await until(() => refusedNotices().length === 1, 5_000)).toBe(true);
+        expect(refusedNotices()[0]).toContain("/bridge:login");
+        // C1: the immediate re-mint did not spend attempt 1 — the slow retry is the 30–60 s step.
+        const ws = String((await status(client)).websocket);
+        expect(ws).toContain("4001");
+        expect(ws).toContain("reconnect attempt 1,");
+        const inS = Number(/in (\d+)s/.exec(ws)?.[1]);
+        expect(inS).toBeGreaterThanOrEqual(25);
+        expect(inS).toBeLessThanOrEqual(60);
+        await Bun.sleep(1_000); // a negative: nothing inside the slow step
         expect(stub.stats.authTokens).toHaveLength(2);
-        expect(String((await status(client)).websocket)).toContain("4001");
-        expect(notices().filter((n) => n.includes("Bridge refused this session's access token"))).toHaveLength(1);
-        expect(notices().find((n) => n.includes("Bridge refused this session's access token"))).toContain("/bridge:login");
-        // A successful auth re-arms the one immediate re-mint.
+        expect(refusedNotices()).toHaveLength(1);
+        // The person acts: /bridge:connect re-arms the one immediate re-mint.
         await client.callTool({ name: "connect", arguments: {} });
-        expect(await until(() => stub.stats.authTokens.length >= 3, 10_000)).toBe(true);
-        let connected = false;
-        for (let i = 0; i < 50 && !connected; i++) {
-          connected = (await status(client)).websocket === "connected";
-          if (!connected) await Bun.sleep(100);
-        }
-        expect(connected).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
         stub.closeAll(4001, "Invalid token");
         expect(await until(() => stub.stats.authTokens.length >= 4, 2_000)).toBe(true);
         expect(stub.stats.authTokens[3]).not.toBe(stub.stats.authTokens[2]);
       },
       enrolledIn(stub)
     );
-  }, 40_000);
+  }, 30_000);
+
+  test("C14 flap guard: a 4001 soon after the immediate re-mint's auth is NOT immediate again; one after the socket stayed up long enough is", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      { BRIDGE_TEST_REMINT_REARM_MS: "1500" },
+      async (client) => {
+        const connected = async () => (await status(client)).websocket === "connected";
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(4001, "Invalid token");
+        expect(await until(() => stub.stats.authTokens.length >= 2, 2_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
+        // Straight away (well under the re-arm window): slow.
+        stub.closeAll(4001, "Invalid token");
+        await Bun.sleep(1_000); // a negative: no immediate reconnect
+        expect(stub.stats.authTokens).toHaveLength(2);
+        await client.callTool({ name: "connect", arguments: {} }); // back up (and re-armed)
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(4001, "Invalid token"); // spends the re-armed immediate re-mint
+        expect(await until(() => stub.stats.authTokens.length >= 4, 2_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
+        await Bun.sleep(1_800); // stable past the (test) re-arm window: re-armed without anyone acting
+        stub.closeAll(4001, "Invalid token");
+        expect(await until(() => stub.stats.authTokens.length >= 5, 2_000)).toBe(true);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
 
   test("C14 after an in-band reauth: a 4001 drops the REAUTHED token and mints — it never re-presents it", async () => {
     // 65 s tokens sit inside the 60 s expiry slack after 5 s, so a tool call then mints

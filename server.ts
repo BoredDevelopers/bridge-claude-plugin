@@ -622,10 +622,21 @@ let ws: WebSocket | null = null;
 const reauthedWith = new WeakMap<WebSocket, (token: string) => void>();
 let wsConnected = false;
 let reconnectAttempt = 0;
-// RFC-016 C14: a 4001 gets ONE immediate re-mint + reconnect; a second 4001 before an
-// `authenticated` frame takes the slow credential backoff (and tells the model once).
-// Re-armed by a completed auth.
+// RFC-016 C14: a 4001 gets ONE immediate re-mint + reconnect; a second 4001 takes the
+// slow credential backoff (and tells the model once). Re-armed by the person acting
+// (/bridge:connect, a login) or by a socket that stayed authenticated for
+// REMINT_REARM_MS — NOT by any `authenticated`: a server that accepts the fresh token
+// and refuses it again moments later would otherwise get a mint + upgrade per cycle,
+// forever (a flap). 30 s: the server's own cadence (its 30 s ping) — a socket that
+// survived that long was usable, and a flap costs at most one mint per 30 s.
 let remintedAfter4001 = false;
+/** TEST-ONLY override (ms) of the re-arm window; default 30 s. */
+const REMINT_REARM_MS = (() => {
+  const n = Number(process.env.BRIDGE_TEST_REMINT_REARM_MS);
+  return Number.isInteger(n) && n > 0 ? n : 30_000;
+})();
+/** When the current socket completed its auth (null while it has not). */
+let authenticatedAt: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 // Why the last socket closed — drives the reconnect schedule (reconnect-policy.ts)
 // and the reason `status` reports. Cleared by a completed auth.
@@ -1032,6 +1043,8 @@ function connectWs(): void {
     }
     wsConnected = false;
     authenticated = false;
+    const upFor = authenticatedAt === null ? 0 : Date.now() - authenticatedAt;
+    authenticatedAt = null;
     const code = (event as CloseEvent).code;
     const reason = (event as CloseEvent).reason || undefined;
     const cls = classifyClose(code);
@@ -1074,6 +1087,7 @@ function connectWs(): void {
         .catch((err) => process.stderr.write(`bridge channel: 4008 handling failed: ${err}\n`));
       return;
     }
+    if (upFor >= REMINT_REARM_MS) remintedAfter4001 = false;
     const immediate = code === 4001 && !remintedAfter4001;
     if (immediate) remintedAfter4001 = true;
     // The first 4001 is handled here and now; only a repeat is the person's business.
@@ -1123,7 +1137,8 @@ function scheduleReconnect(immediate = false): void {
   // call site.
   if (!wantConnected) return;
   if (reconnectTimer) return;
-  reconnectAttempt++;
+  // C14's immediate re-mint is not a backoff step: the next slow retry starts at attempt 1.
+  if (!immediate) reconnectAttempt++;
   const base = immediate ? 0 : reconnectDelay(reconnectAttempt, lastClose.cls);
   const delay = base === null ? null : Math.round(base * BACKOFF_SCALE);
   if (delay === null) {
@@ -1261,6 +1276,7 @@ function restartConnection(): void {
   reconnectAttempt = 0;
   lastClose = { cls: "transient" };
   resetRefusalEpisode();
+  remintedAfter4001 = false;
   const old = ws;
   ws = null;
   wsConnected = false;
@@ -1380,7 +1396,7 @@ function handleWsMessage(data: any): void {
       // proof the connection is actually usable.
       reconnectAttempt = 0;
       lastClose = { cls: "transient" };
-      remintedAfter4001 = false;
+      authenticatedAt = Date.now();
       resetRefusalEpisode();
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
@@ -3240,6 +3256,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           // The person asked: a new episode — a refusal that repeats is answered again,
           // and a pending watch must not ALSO reconnect over this attempt.
           resetRefusalEpisode();
+          remintedAfter4001 = false;
           connectUnlessDuplicate();
         }
         return {
