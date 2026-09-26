@@ -128,7 +128,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
         { id: "me", name: "Me" },
         { id: "other", name: "Other" },
       ]);
-      // RFC-014: agents have NO static token (bridge 0048). Seat both in the
+      // Agents have NO static token (bridge 0048). Seat both in the
       // 'default' workspace and mint each an enrolment key through the API's OWN
       // credential module — `me` (the plugin) enrols from BRIDGE_ENROLMENT_KEY at
       // boot; `other` enrols over HTTP below to post as a second agent.
@@ -209,25 +209,25 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       }
       expect(up, "bridge server did not start").toBe(true);
 
-      // `other` signs in the real way: enrolment key → installation → session → access token.
-      const grant = async (body: Record<string, string>) =>
-        (await fetch(`${URL_}/api/agent-auth/token`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }).then((r) => r.json())) as any;
-      const inst = await grant({
-        grant_type: "urn:bridge:params:oauth:grant-type:enrolment-key",
-        enrolment_key: KEY_OTHER,
-        installation_name: "inbound-routing test",
-      });
+      // `other` signs in the real way (RFC-016): a fresh key, the enrolment-key grant with a
+      // DPoP proof, then a client_credentials mint — through the plugin's OWN auth/core,
+      // which is also what `@bridge/agent-sdk` will ship.
+      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../auth/core");
+      const { randomB64url } = await import("../auth/core/b64url");
+      const clockOther = new Clock();
+      const tc = new TokenClient({ clock: clockOther, clientId: "bridge-claude-plugin" });
+      const meta = await tc.discover(URL_);
+      const { signer: signerOther } = await generateSoftwareKey();
+      const enrolled = await tc.enrolWithKey(meta, signerOther, { enrolmentKey: KEY_OTHER, installationName: "inbound-routing test" });
       const TOK_OTHER = (
-        await grant({
-          grant_type: "urn:bridge:params:oauth:grant-type:session",
-          installation_token: inst.installation_token,
-          session_key: "other-session",
+        await tc.mint(meta, signerOther, {
+          installationId: enrolled.installation_id,
+          joinState: enrolled.join_state,
+          attempt: randomB64url(32),
+          sessionKey: "other-session",
+          reconnect: false,
         })
-      ).access_token as string;
+      ).access_token;
       expect(TOK_OTHER, "other agent could not sign in").toMatch(/^brg_at_/);
 
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
@@ -276,10 +276,14 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       const ctx = ctxRows.rows[0]?.id;
       expect(ctx, "plugin never registered a context").toBeTruthy();
 
-      const post = (channelId: string, content: string, contextId?: string) =>
+      const post = async (channelId: string, content: string, contextId?: string) =>
         fetch(`${URL_}/api/messages`, {
           method: "POST",
-          headers: { Authorization: `Bearer ${TOK_OTHER}`, "Content-Type": "application/json" },
+          headers: {
+            Authorization: `DPoP ${TOK_OTHER}`,
+            DPoP: await dpopProof(signerOther, clockOther, { htm: "POST", htu: httpHtu(URL_, "/api/messages"), accessToken: TOK_OTHER }),
+            "Content-Type": "application/json",
+          },
           body: JSON.stringify({ channelId, content, ...(contextId ? { contextId } : {}) }),
         }).then((r) => r.json());
 

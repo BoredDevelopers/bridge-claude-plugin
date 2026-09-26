@@ -319,7 +319,9 @@ export function createAuthCore(opts: StubOptions = {}) {
     const proof = checkProof(req.headers.get("dpop"), "POST", `${url.origin}${url.pathname}`, null, null, where);
     if ("reason" in proof) {
       if (proof.nonce) return refuse(where, "use_dpop_nonce", undefined, 400, nonceHeaders());
-      return refuse(where, "invalid_dpop_proof", proof.reason);
+      // Bare, like the server (agent-credentials.ts GrantFailure("invalid_dpop_proof")): the
+      // reason is for stats only — measured against the real API (key-credentials-real-api).
+      return refuseBare(where, "invalid_dpop_proof", proof.reason);
     }
     const inst = insts.get(b.client_id);
     if (!inst) {
@@ -331,7 +333,7 @@ export function createAuthCore(opts: StubOptions = {}) {
       stats.refusals.push(`${where}:${bad}`);
       return refuse(where, "invalid_client", "assertion_invalid");
     }
-    if (thumbprint(proof.jwk) !== inst.jkt) return refuse(where, "invalid_dpop_proof", "jkt");
+    if (thumbprint(proof.jwk) !== inst.jkt) return refuseBare(where, "invalid_dpop_proof", "jkt");
     if (inst.revoked) return refuse(where, "invalid_client", inst.revoked);
     return inst;
   }
@@ -406,7 +408,7 @@ export function createAuthCore(opts: StubOptions = {}) {
         if (ks !== undefined && ks !== null && ks !== "" && ks !== "software" && ks !== "hardware") return refuse(where, "invalid_request", "key_storage_invalid");
         if (req.headers.get("dpop") === null) return refuse(where, "invalid_dpop_proof", `dpop_proof_required: ${UPDATE_PLUGIN_HINT}`);
         const r = checkProof(req.headers.get("dpop"), "POST", `${url.origin}${url.pathname}`, null, null, where);
-        if ("reason" in r) return r.nonce ? refuse(where, "use_dpop_nonce", undefined, 400, nonceHeaders()) : refuse(where, "invalid_dpop_proof", r.reason);
+        if ("reason" in r) return r.nonce ? refuse(where, "use_dpop_nonce", undefined, 400, nonceHeaders()) : refuseBare(where, "invalid_dpop_proof", r.reason);
         return r.jwk;
       };
       /**

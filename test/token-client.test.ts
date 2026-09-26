@@ -350,7 +350,9 @@ describe("the stub refuses what a wrong client would send", () => {
       headers: { "Content-Type": "application/json", DPoP: proof },
       body: JSON.stringify({ grant_type: "urn:bridge:params:oauth:grant-type:enrolment-key", enrolment_key: ekNc, installation_name: "x" }),
     });
-    expect(await r.json()).toMatchObject({ error: "invalid_dpop_proof", error_description: "jwk" });
+    // The server answers a bad proof WITHOUT a description (measured, key-credentials-real-api); the stub records why.
+    expect(await r.json()).toEqual({ error: "invalid_dpop_proof" });
+    expect(stub.stats.refusals.at(-1)).toEndWith(":jwk");
   });
 
   test("a valid assertion with a proof by ANOTHER key is refused invalid_dpop_proof (proof jkt = registered key)", async () => {
@@ -363,7 +365,9 @@ describe("the stub refuses what a wrong client would send", () => {
       headers: { "Content-Type": "application/json", DPoP: await dpopProof(other, clock, { htm: "POST", htu: meta.token_endpoint }) },
       body: JSON.stringify({ grant_type: "client_credentials", client_id: inst, client_assertion_type: CLIENT_ASSERTION_TYPE, client_assertion: assertion, join_state: state0, attempt: "a".repeat(43), session_key: "s" }),
     });
-    expect(await r.json()).toMatchObject({ error: "invalid_dpop_proof", error_description: "jkt" });
+    // The server answers a bad proof WITHOUT a description (measured, key-credentials-real-api); the stub records why.
+    expect(await r.json()).toEqual({ error: "invalid_dpop_proof" });
+    expect(stub.stats.refusals.at(-1)).toEndWith(":jkt");
     expect(stub.stats).toMatchObject({ mints: 0, locks: 0 });
   });
 
@@ -377,7 +381,9 @@ describe("the stub refuses what a wrong client would send", () => {
       headers: { "Content-Type": "application/json", DPoP: proof },
       body: JSON.stringify({ grant_type: "client_credentials", client_id: inst, client_assertion_type: CLIENT_ASSERTION_TYPE, client_assertion: assertion, join_state: state0, attempt: "a".repeat(43), session_key: "s" }),
     });
-    expect(await r.json()).toMatchObject({ error: "invalid_dpop_proof", error_description: "crit" });
+    // The server answers a bad proof WITHOUT a description (measured, key-credentials-real-api); the stub records why.
+    expect(await r.json()).toEqual({ error: "invalid_dpop_proof" });
+    expect(stub.stats.refusals.at(-1)).toEndWith(":crit");
     expect(stub.stats.mints).toBe(0);
   });
 
