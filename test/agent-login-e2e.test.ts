@@ -174,6 +174,29 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("the error frame the server sends before a 4001 / 1011 / 4009 is not told to the model — the close handler owns those (a recovered 4001, a 1011 and a 4009 are silent)", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      {},
+      async (client, _dir, notices) => {
+        const connected = async () => (await status(client)).websocket === "connected";
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(4001, "Invalid token");
+        expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(1011, "grant check failed");
+        expect(await until(() => stub.stats.authTokens.length >= 3, 5_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(4009, "token expired");
+        expect(await until(() => stub.stats.authTokens.length >= 4, 5_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true);
+        expect(notices()).toEqual([]);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
   test("C14: 4001 drops the token and re-mints ONCE immediately; a second 4001 in a row takes the slow backoff and says /bridge:login once", async () => {
     const stub = startAuthStub();
     await withPlugin(

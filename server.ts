@@ -654,6 +654,16 @@ let lastServerError = ""; // most recent server error frame, surfaced to tools
 let notifiedServerError = "";
 let notifiedServerErrorAt = 0;
 const SERVER_ERROR_NOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+/** Server `error` frames that only announce the close that follows (see the "error" case). */
+const CLOSE_OWNED_ERRORS = new Set([
+  "Invalid token", // 4001
+  "grant check failed", // 1011
+  "Access token expired", // 4009
+  "session revoked", // 4008 (closeDeadGrant sends the reason as the message)
+  "installation revoked",
+  "installation locked",
+  "session evicted",
+]);
 const loggedUnknownFrameTypes = new Set<string>();
 
 /**
@@ -1467,6 +1477,10 @@ function handleWsMessage(data: any): void {
       );
       lastServerError = detail ?? JSON.stringify(data).slice(0, 500);
       process.stderr.write(`bridge channel: server error: ${lastServerError}\n`);
+      // The frame the server sends right before a close the close handler owns (ws.ts:
+      // runAuthenticateWs / closeDeadGrant / the 4009 timer): that handler decides what
+      // the model hears — a first 4001, a 1011 and a 4009 recover on their own.
+      if (CLOSE_OWNED_ERRORS.has(lastServerError)) break;
       // Notify once per distinct error per window: a rejected token repeats on
       // every reconnect, and the state stays visible via list_channels anyway.
       const now = Date.now();
