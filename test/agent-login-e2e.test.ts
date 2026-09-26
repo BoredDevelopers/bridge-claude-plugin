@@ -881,6 +881,25 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
+  test("a completed auth ends the episode: the same 4003 after a recovery is told again", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      { BRIDGE_TEST_BACKOFF_SCALE: "0.02" }, // the slow 4003 retry in ~1 s
+      async (client, _dir, notices) => {
+        const connected = async () => (await status(client)).websocket === "connected";
+        const told = () => notices().filter((n) => n.includes("agent deactivated")).length;
+        expect(await until(connected, 5_000)).toBe(true);
+        stub.closeAll(4003, "deregistered");
+        expect(await until(() => told() === 1, 5_000)).toBe(true);
+        expect(await until(connected, 5_000)).toBe(true); // the retry authenticated
+        stub.closeAll(4003, "deregistered");
+        expect(await until(() => told() === 2, 5_000)).toBe(true);
+      },
+      enrolledIn(stub)
+    );
+  }, 30_000);
+
   test("a named profile with no credentials refuses to connect and says so", async () => {
     const stub = startAuthStub();
     await withPlugin(
