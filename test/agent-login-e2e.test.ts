@@ -290,7 +290,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("…even when this process already moved its HTTP credential to the new installation before the old one's 4008", async () => {
+  test("…and when this process already minted on the new installation (a 401), the live socket follows it in-band: the old one's revoke does not touch it", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
@@ -302,8 +302,13 @@ describe("plugin on key credentials (RFC-016)", () => {
         stub.expireAccess(); // a 401 makes this process mint — on the NEW installation on disk
         await client.callTool({ name: "list_channels", arguments: {} });
         expect(stub.sessionsFor(fresh)).toHaveLength(1);
-        stub.revokeInstallation(old);
-        expect(await until(() => stub.stats.authTokens.length >= 2, 10_000)).toBe(true);
+        // The re-mint reached the live socket (`reauth` + proof): it now rides the NEW
+        // installation, as the server's reauth swaps the socket's credential.
+        expect(await until(() => stub.stats.reauthTokens.length >= 1, 5_000)).toBe(true);
+        stub.revokeInstallation(old); // closes only sockets still on the old installation: none
+        await Bun.sleep(1_000);
+        expect(stub.stats.authTokens).toHaveLength(1); // no reconnect needed
+        expect((await status(client)).websocket).toBe("connected");
         expect(readInstallation(dir)?.installationId).toBe(fresh);
         expect(notices().some((n) => n.includes("/bridge:login"))).toBe(false);
       },
