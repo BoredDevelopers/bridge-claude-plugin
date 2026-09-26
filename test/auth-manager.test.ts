@@ -801,6 +801,30 @@ describe("login", () => {
     expect(events.loggedIn).toBe(0);
   }, 10_000);
 
+  test("a STALE flow never clears the current one: device A declined after browser B started — a logout still cancels B", async () => {
+    const { stub, dir } = setup({ deviceIntervalS: 1 });
+    let answerA!: (ok: boolean) => void;
+    const asked: string[] = [];
+    const { m, events } = manager(dir, stub.url, {
+      prompt: {
+        available: () => true,
+        show: () => {},
+        confirm: (msg: string) => (asked.push(msg), new Promise<boolean>((r) => (answerA = r))),
+      },
+    });
+    await m.login("device"); // A
+    expect(await until(() => asked.length === 1)).toBe(true); // A is approved, waiting on the person
+    const urlB = (await m.login("browser")).match(/https?:\/\/\S+/)![0]; // B replaces A
+    answerA(false); // A is declined — late, it must not touch B's registration
+    expect(await until(() => stub.stats.revokes.length === 1)).toBe(true); // A's installation revoked
+    await m.logout(true); // must cancel B
+    const cb = (await fetch(urlB, { redirect: "manual" })).headers.get("location")!;
+    await fetch(cb, { redirect: "manual" }).catch(() => null); // B's listener is gone (or answers error)
+    expect(await until(() => stub.stats.enrols >= 2, 1_000)).toBe(false); // B's code never exchanged
+    expect(readInstallation(dir)).toBeNull();
+    expect(events.loggedIn).toBe(0);
+  }, 15_000);
+
   test("without a prompt, device mode is refused on a machine that is already signed in", async () => {
     const { stub, dir } = setup();
     await enrolledProfile(stub, dir);

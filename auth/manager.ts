@@ -139,6 +139,11 @@ export class CredentialManager {
   private access: Access | null = null;
   private inflight: Promise<Access> | null = null;
   private ticker: ReturnType<typeof setInterval> | null = null;
+  /**
+   * The ONE login in progress. Each flow owns its object and only ever clears the slot
+   * while it still holds it (endLogin): a stale flow finishing late — declined, failed,
+   * completed — must never unregister its successor, or a logout could not cancel it.
+   */
   private pendingLogin: { cancel: () => void } | null = null;
   /** E9: this session was revoked; only an explicit /bridge:connect mints again (with reconnect=true). */
   private sessionBlocked = false;
@@ -631,24 +636,25 @@ export class CredentialManager {
         return this.startDevice(meta, apiUrl, name, key);
       }
       let cancelled = false;
-      this.pendingLogin = { cancel: () => ((cancelled = true), lb.close()) };
+      const mine = { cancel: () => ((cancelled = true), lb.close()) };
+      this.pendingLogin = mine;
       void (async () => {
         const a = await lb.answer;
         if (cancelled) return;
         if ("error" in a) {
           lb.finish(a.error === "access_denied" ? "denied" : "error");
-          this.loginFailed(a.error);
+          this.loginFailed(a.error, mine);
           return;
         }
         try {
           // C7: the code is bound to THIS key (dpop_jkt) and burnt on any mismatch, so no
           // fresh-key retry here (C6 applies to the enrolment-key and device flows only).
           const g = await this.tokens.exchangeCode(meta, key.signer, { code: a.code, verifier: lb.verifier, redirectUri: lb.redirectUri });
-          if (!(await this.completeLogin(meta, apiUrl, name, g, key, () => cancelled))) return lb.finish("error");
+          if (!(await this.completeLogin(meta, apiUrl, name, g, key, mine, () => cancelled))) return lb.finish("error");
           lb.finish("connected");
         } catch (e) {
           lb.finish("error");
-          this.loginFailed(isOAuthError(e) ? e.error : String(e));
+          this.loginFailed(isOAuthError(e) ? e.error : String(e), mine);
         }
       })();
       return opened
@@ -675,7 +681,8 @@ export class CredentialManager {
       return `Could not start a device sign-in: ${isOAuthError(e) ? e.error : String(e)}`;
     }
     const ac = new AbortController();
-    this.pendingLogin = { cancel: () => ac.abort() };
+    const mine = { cancel: () => ac.abort() };
+    this.pendingLogin = mine;
     // C6/C8: the key on the poll that collects the approval is registered; if the server
     // says that key is already enrolled, switch to a fresh key ONCE and poll on.
     let freshKeyUsed = false;
@@ -697,17 +704,17 @@ export class CredentialManager {
         if (r.ok) await this.revokeNew(meta, key.signer, r.grant);
         return;
       }
-      if (!r.ok) return this.loginFailed(r.error);
+      if (!r.ok) return this.loginFailed(r.error, mine);
       try {
         if (canPrompt && !(await this.d.prompt.confirm(this.bindQuestion(r.grant)))) {
           await this.revokeNew(meta, key.signer, r.grant);
-          this.pendingLogin = null;
+          this.endLogin(mine);
           this.d.notify("Bridge: machine not connected — the sign-in was declined in the terminal.");
           return;
         }
-        await this.completeLogin(meta, apiUrl, name, r.grant, key, () => ac.signal.aborted);
+        await this.completeLogin(meta, apiUrl, name, r.grant, key, mine, () => ac.signal.aborted);
       } catch (e) {
-        this.loginFailed(String(e));
+        this.loginFailed(String(e), mine);
       }
     })();
     const mins = Math.round(auth.expires_in / 60);
@@ -748,8 +755,13 @@ export class CredentialManager {
     return `Connect this machine to Bridge as ${who}${where}?${replacing} Decline if you did not start this sign-in.`;
   }
 
-  private loginFailed(error: string): void {
-    this.pendingLogin = null;
+  /** Unregister a finished login — only if it is still THE login in progress. */
+  private endLogin(mine: { cancel: () => void }): void {
+    if (this.pendingLogin === mine) this.pendingLogin = null;
+  }
+
+  private loginFailed(error: string, mine: { cancel: () => void }): void {
+    this.endLogin(mine);
     const why =
       error === "access_denied"
         ? "the request was denied in the browser"
@@ -795,6 +807,7 @@ export class CredentialManager {
     name: string,
     g: EnrolGrant,
     key: NewKey,
+    mine: { cancel: () => void },
     cancelled: () => boolean
   ): Promise<boolean> {
     const p = this.profile!;
@@ -808,7 +821,7 @@ export class CredentialManager {
           : null;
         store.deleteInstallationFiles(p.dir);
         this.writeEnrolment(p.dir, apiUrl, name, g, key);
-        this.pendingLogin = null;
+        this.endLogin(mine);
         this.access = null;
         this.sessionBlocked = false;
         this.reconnectNext = false;
