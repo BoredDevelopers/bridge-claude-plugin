@@ -1037,9 +1037,13 @@ function connectWs(): void {
     // in-band reauth (reauthedWith), so it is the token the server just refused.
     if (cls === "expired" || code === 4001) creds.invalidateAccess(sockBearer);
     if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);
-    if (cls === "revoked" && reason === "installation revoked") {
+    if (cls === "revoked" && (reason === "installation revoked" || reason === "installation locked")) {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
       // profile already holds the new one, this is a switch, not a sign-out.
+      // "installation locked" (RFC-016 E8: a copy of the credential was used) is
+      // terminal the same way — §5.4: the key is deleted, the person re-enrols after
+      // checking the machine (describeClose says so). Judged against the socket's
+      // CURRENT grant: sockGrant follows an in-band reauth (reauthedWith).
       void creds
         .installationRevoked(sockGrant?.installationId ?? null)
         .catch(() => "logged_out" as const)

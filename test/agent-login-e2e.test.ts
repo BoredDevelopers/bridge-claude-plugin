@@ -10,7 +10,7 @@
  * "installation locked", 0.23 retirement at boot, …).
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -20,6 +20,8 @@ import { startAuthStub, type StubOptions } from "./agent-auth-stub";
 import { readInstallation, readState } from "../auth/node/store";
 import { joinStateSeq } from "../auth/core/join-state";
 import { enrolledProfile } from "./key-fixtures";
+import { CredentialManager } from "../auth/manager";
+import { resolveProfile } from "../auth/profile";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
 const SESSION = "11111111-2222-3333-4444-555555555555";
@@ -75,6 +77,27 @@ async function withPlugin<T>(
 const enrolledIn = (stub: ReturnType<typeof startAuthStub>) => async (dir: string) => {
   await enrolledProfile(stub, dir);
 };
+
+/** Another holder of a profile directory: a thief's copy, or a sibling session on this machine. */
+function otherManager(stub: ReturnType<typeof startAuthStub>, dir: string, sessionKey: string): CredentialManager {
+  return new CredentialManager({
+    profile: resolveProfile(dir, undefined),
+    envApiUrl: stub.url,
+    staleStaticTokenPresent: false,
+    enrolmentKey: "",
+    sessionKey: () => sessionKey,
+    sessionKeyReady: async () => {},
+    platform: "x",
+    clientVersion: "0.0.0",
+    env: {},
+    onAccessRotated: () => {},
+    onLoggedIn: () => {},
+    onLoggedOut: () => {},
+    notify: () => {},
+    log: () => {},
+    prompt: { available: () => false, show: () => {}, confirm: async () => false },
+  });
+}
 
 async function status(client: Client): Promise<any> {
   const r: any = await client.callTool({ name: "status", arguments: {} });
@@ -265,6 +288,98 @@ describe("plugin on key credentials (RFC-016)", () => {
       enrolledIn(stub)
     );
   }, 30_000);
+
+  test("a COPY of the credential is used elsewhere first: this machine's next mint is locked, its socket closes 4008 'installation locked', the key is deleted, the person told", async () => {
+    const stub = startAuthStub();
+    const loot = mkdtempSync(join(tmpdir(), "loot-"));
+    try {
+      await withPlugin(
+        stub,
+        {},
+        async (client, dir, notices) => {
+          expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+          cpSync(dir, loot, { recursive: true });
+          const thief = otherManager(stub, loot, "thief");
+          await thief.accessToken();
+          thief.stop();
+          stub.expireAccess(); // the plugin's next request must mint — with its now-stale state
+          await client.callTool({ name: "list_channels", arguments: {} });
+          expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
+          expect(stub.stats.locks).toBe(1);
+          expect(existsSync(join(dir, "key.json"))).toBe(false);
+          expect(existsSync(join(dir, "state"))).toBe(false);
+          await Bun.sleep(1_500); // a negative: no reconnect may follow
+          expect(stub.stats.authTokens).toHaveLength(1);
+          expect((await status(client)).configured).toBe(false);
+        },
+        enrolledIn(stub)
+      );
+    } finally {
+      rmSync(loot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a STALE copy minting elsewhere locks the installation: the 4008 'installation locked' alone deletes this machine's files (§5.4) and says so — no reconnect", async () => {
+    const stub = startAuthStub();
+    const loot = mkdtempSync(join(tmpdir(), "loot-"));
+    try {
+      await withPlugin(
+        stub,
+        {},
+        async (client, dir, notices) => {
+          expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+          cpSync(dir, loot, { recursive: true }); // the copy: state at seq 1
+          stub.expireAccess();
+          await client.callTool({ name: "list_channels", arguments: {} }); // this machine moves on to seq 2
+          expect(stub.stats.mints).toBe(2);
+          const thief = otherManager(stub, loot, "thief");
+          await thief.accessToken().catch(() => {}); // seq 1 again, another attempt ⇒ E6d lock
+          thief.stop();
+          expect(stub.stats.locks).toBe(1);
+          expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
+          expect(await until(() => !existsSync(join(dir, "key.json")), 5_000)).toBe(true);
+          expect(readInstallation(dir)).toBeNull();
+          expect(existsSync(join(dir, "state"))).toBe(false);
+          await Bun.sleep(1_500); // a negative: no reconnect may follow
+          expect(stub.stats.authTokens).toHaveLength(1);
+          expect((await status(client)).configured).toBe(false);
+        },
+        enrolledIn(stub)
+      );
+    } finally {
+      rmSync(loot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("locked by ANOTHER process of this machine: the 4008 'installation locked' alone signs this one out, and a later /bridge:login elsewhere is picked up", async () => {
+    const stub = startAuthStub();
+    const loot = mkdtempSync(join(tmpdir(), "loot2-"));
+    try {
+      await withPlugin(
+        stub,
+        {},
+        async (client, dir, notices) => {
+          expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+          cpSync(dir, loot, { recursive: true });
+          const thief = otherManager(stub, loot, "thief");
+          await thief.accessToken();
+          thief.stop();
+          const sibling = otherManager(stub, dir, "sibling"); // another Claude session on this machine
+          await sibling.accessToken().catch(() => {});
+          sibling.stop();
+          expect(stub.stats.locks).toBe(1);
+          expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
+          expect((await status(client)).configured).toBe(false);
+          // The person re-enrols in another session; this one follows without /bridge:connect.
+          await enrolledProfile(stub, dir);
+          expect(await until(() => stub.stats.authTokens.length >= 2, 15_000)).toBe(true);
+        },
+        enrolledIn(stub)
+      );
+    } finally {
+      rmSync(loot, { recursive: true, force: true });
+    }
+  }, 40_000);
 
   test("an HTTP 401 mints once and retries, with a DPoP proof on each request", async () => {
     const stub = startAuthStub();
