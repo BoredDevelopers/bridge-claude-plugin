@@ -20,11 +20,13 @@ import * as realStore from "../auth/node/store";
 import { readInstallation, readState, readAttempt, readKey } from "../auth/node/store";
 import { joinStateSeq } from "../auth/core/join-state";
 
-// A pass-through of the real store whose `writeStateIfNotOlder` can be made to throw
-// (a full disk, EACCES) — the only way to see the §3.3 "write state, THEN delete the
-// attempt" order: a crash between the two is what it protects against.
+// A pass-through of the real store whose `writeStateIfNotOlder` / `writeInstallation` can be made
+// to throw (a full disk, EACCES) — the only way to see the §3.3 "write state, THEN delete
+// the attempt" order (a crash between the two is what it protects against), and what an
+// enrolment does when its files cannot be written.
 const real = { ...realStore };
 let failStateWrites = 0;
+let failInstallationWrites = 0;
 mock.module("../auth/node/store", () => ({
   ...real,
   writeStateIfNotOlder: (dir: string, state: string) => {
@@ -33,6 +35,14 @@ mock.module("../auth/node/store", () => ({
       throw new Error("ENOSPC: no space left on device (injected)");
     }
     return real.writeStateIfNotOlder(dir, state);
+  },
+  // The LAST write of an enrolment (key.json + state are already on disk when it fails).
+  writeInstallation: (dir: string, inst: any) => {
+    if (failInstallationWrites > 0) {
+      failInstallationWrites--;
+      throw new Error("ENOSPC: no space left on device (injected)");
+    }
+    return real.writeInstallation(dir, inst);
   },
 }));
 
@@ -646,6 +656,38 @@ describe("login", () => {
     expect(events.notices.join("\n")).toMatch(/PREVIOUS sign-in .* could not be revoked .* Settings → Agents → Machines/);
   });
 
+  test("login whose new files cannot be written (full disk): BOTH installations revoked — none left live and unusable — and the person told", async () => {
+    const { stub, dir } = setup();
+    const old = await enrolledProfile(stub, dir);
+    const { m, events } = manager(dir, stub.url);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    failInstallationWrites = 1;
+    const done = await drive(url);
+    expect(failInstallationWrites).toBe(0); // the injected failure really fired
+    expect(done.headers.get("location")).toBe(`${stub.url}/connect/done?result=error`);
+    expect(readInstallation(dir)).toBeNull();
+    expect(readKey(dir)).toBeNull();
+    expect(readState(dir)).toBeNull();
+    expect(stub.stats.enrols).toBe(2);
+    expect(stub.stats.revokes).toHaveLength(2);
+    expect(stub.isRevoked(old)).toBe("installation_revoked");
+    expect(stub.isRevoked(stub.stats.revokes.find((r) => r.id !== old)!.id)).toBe("installation_revoked");
+    expect(events.loggedIn).toBe(0);
+    expect(events.notices.join()).toMatch(/could not be saved on this machine .*ENOSPC/);
+    expect(events.notices.join()).not.toMatch(/STAYS ENROLLED/);
+  });
+
+  test("…and when those revokes fail too, the person is told what STAYS ENROLLED and where to revoke it", async () => {
+    const { stub, dir } = setup({ revokeBodyEmpty: true });
+    await enrolledProfile(stub, dir);
+    const { m, events } = manager(dir, stub.url);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    failInstallationWrites = 1;
+    await drive(url);
+    expect(readInstallation(dir)).toBeNull();
+    expect(events.notices.join()).toMatch(/"the new sign-in [0-9a-f-]+" and ".+" STAYS ENROLLED .* Settings → Agents → Machines/);
+  });
+
   test("loopback denied: browser sent to result=denied, credentials untouched, person told", async () => {
     const { stub, dir } = setup({ deny: true });
     const old = await enrolledProfile(stub, dir);
@@ -964,6 +1006,21 @@ describe("logout and enrolment keys", () => {
     await b.m.enrolFromKeyIfNeeded();
     expect(Date.now() - t1).toBeLessThan(1_400);
     expect(b.events.notices.join()).toMatch(/could not enrol/);
+  });
+
+  test("an enrolment whose files cannot be written: the new installation is revoked, nothing is left on disk, the person told", async () => {
+    const { stub, dir } = setup();
+    const { m, events } = manager(dir, stub.url, { enrolmentKey: stub.mintEnrolmentKey(5) });
+    failInstallationWrites = 1;
+    await m.enrolFromKeyIfNeeded();
+    expect(failInstallationWrites).toBe(0);
+    expect(readInstallation(dir)).toBeNull();
+    expect(readKey(dir)).toBeNull();
+    expect(readState(dir)).toBeNull();
+    expect(stub.stats.enrols).toBe(1);
+    expect(stub.stats.revokes).toHaveLength(1);
+    expect(stub.isRevoked(stub.stats.revokes[0]!.id)).toBe("installation_revoked");
+    expect(events.notices.join()).toMatch(/could not enrol .*could not be saved on this machine .*ENOSPC/);
   });
 
   test("a used-up enrolment key tells the person, and nothing is written", async () => {

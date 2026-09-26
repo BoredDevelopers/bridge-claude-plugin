@@ -418,7 +418,7 @@ export class CredentialManager {
   /** §3.3 error table → a CredentialError (and, for a dead installation, its files gone). Runs under the lock. */
   private mintRefused(e: unknown, dir: string): Error {
     const a = classifyTokenError(e);
-    const detail = isOAuthError(e) ? `${e.error}${e.description ? `/${e.description}` : ""}` : e instanceof Error ? e.message : String(e);
+    const detail = errDetail(e);
     switch (a.kind) {
       case "installation_gone":
         // Terminal (§3.3, §5.4, C12): the key can never be used again — delete it.
@@ -742,10 +742,16 @@ export class CredentialManager {
    * never written to disk, so no other process can hold or advance it — the lock guards
    * the profile's on-disk chain, which this call never touches.
    */
-  private async revokeNew(meta: AuthMetadata, signer: Signer, g: EnrolGrant): Promise<void> {
-    await this.tokens
-      .revoke(meta, signer, { installationId: g.installation_id, joinState: g.join_state, attempt: null, scope: "installation" })
-      .catch((e) => this.d.log(`bridge auth: could not revoke the unused installation ${g.installation_id}: ${e}`));
+  private async revokeNew(meta: AuthMetadata, signer: Signer, g: EnrolGrant, signal?: AbortSignal): Promise<boolean> {
+    return this.tokens
+      .revoke(meta, signer, { installationId: g.installation_id, joinState: g.join_state, attempt: null, scope: "installation" }, { signal })
+      .then(
+        () => true,
+        (e) => {
+          this.d.log(`bridge auth: could not revoke the unused installation ${g.installation_id}: ${e}`);
+          return false;
+        }
+      );
   }
 
   private bindQuestion(g: EnrolGrant): string {
@@ -820,7 +826,22 @@ export class CredentialManager {
           ? { inst: prevInst, jwk: store.readKey(p.dir), state: store.readState(p.dir), attempt: store.readAttempt(p.dir) }
           : null;
         store.deleteInstallationFiles(p.dir);
-        this.writeEnrolment(p.dir, apiUrl, name, g, key);
+        try {
+          this.writeEnrolment(p.dir, apiUrl, name, g, key);
+        } catch (e) {
+          // The old files are gone and the new ones could not be written: NEITHER
+          // installation is usable from this machine, yet both are live in Bridge. Revoke
+          // both (their keys are still in memory), and tell the person which one stays.
+          this.endLogin(mine);
+          const left = await this.abandonEnrolment(p.dir, meta, key.signer, g, signal);
+          if (old && old.inst.installationId !== g.installation_id) {
+            if (!(await this.revokeStored(old, signal).then(() => true, () => false))) left.push(machineLabel(old.inst));
+          }
+          this.d.notify(
+            `Bridge: machine not connected — its new sign-in could not be saved on this machine (${errDetail(e)}), so it is signed out now; fix the disk problem and run /bridge:login again.${stillEnrolled(left)}`
+          );
+          return { cancelled: true as const, abandoned: true as const };
+        }
         this.endLogin(mine);
         this.access = null;
         this.sessionBlocked = false;
@@ -834,20 +855,13 @@ export class CredentialManager {
           this.d.log(`bridge auth: reconnect after login failed: ${e}`);
         }
         this.d.notify(`Bridge: this machine is connected (profile ${profileLabel(p)}). Connecting…`);
-        if (old && old.inst.installationId !== g.installation_id && old.jwk && old.state) {
+        if (old && old.inst.installationId !== g.installation_id) {
           try {
-            const oldMeta = old.inst.apiUrl === apiUrl ? meta : await this.tokens.discover(old.inst.apiUrl, signal);
-            await this.tokens.revoke(
-              oldMeta,
-              await softwareSigner(old.jwk),
-              { installationId: old.inst.installationId, joinState: old.state, attempt: old.attempt, scope: "installation" },
-              { signal }
-            );
+            await this.revokeStored(old, signal);
           } catch (e) {
             this.d.log(`bridge auth: could not revoke the previous installation ${old.inst.installationId}: ${e}`);
-            const why = isOAuthError(e) ? `${e.error}${e.description ? `/${e.description}` : ""}` : e instanceof Error ? e.message : String(e);
             this.d.notify(
-              `Bridge: this machine's PREVIOUS sign-in "${old.inst.installationName ?? old.inst.installationId}" could not be revoked (${why}). Its key is gone from this machine, but it STAYS ENROLLED in Bridge until you revoke it in Settings → Agents → Machines.`
+              `Bridge: this machine's PREVIOUS sign-in "${machineLabel(old.inst)}" could not be revoked (${errDetail(e)}). Its key is gone from this machine, but it STAYS ENROLLED in Bridge until you revoke it in Settings → Agents → Machines.`
             );
           }
         }
@@ -856,10 +870,41 @@ export class CredentialManager {
       this.lockOpts()
     );
     if (outcome.cancelled) {
-      await this.revokeNew(meta, key.signer, g);
+      // A write failure already revoked it (under the lock); a cancel has not.
+      if (!("abandoned" in outcome)) await this.revokeNew(meta, key.signer, g);
       return false;
     }
     return true;
+  }
+
+  /**
+   * Revoke an installation whose key + state + attempt were read from disk under the
+   * lock the caller holds (§3.5: verified, not advanced). Throws what went wrong —
+   * including "no key/state on disk", which cannot be revoked from here.
+   */
+  private async revokeStored(
+    o: { inst: store.Installation; jwk: EcPrivateJwk | null; state: string | null; attempt: string | null },
+    signal: AbortSignal
+  ): Promise<void> {
+    if (!o.jwk || !o.state) throw new Error("no key on disk");
+    await this.tokens.revoke(
+      await this.tokens.discover(o.inst.apiUrl, signal),
+      await softwareSigner(o.jwk),
+      { installationId: o.inst.installationId, joinState: o.state, attempt: o.attempt, scope: "installation" },
+      { signal }
+    );
+  }
+
+  /**
+   * An enrolment whose files could not be written (full disk, EACCES): clear what was
+   * written, revoke the new installation (seq-0 state, the key still in memory). Returns
+   * the labels of what could NOT be revoked (the caller tells the person).
+   */
+  private async abandonEnrolment(dir: string, meta: AuthMetadata, signer: Signer, g: EnrolGrant, signal: AbortSignal): Promise<string[]> {
+    try {
+      store.deleteInstallationFiles(dir);
+    } catch {}
+    return (await this.revokeNew(meta, signer, g, signal)) ? [] : [`the new sign-in ${g.installation_id}`];
   }
 
   /**
@@ -883,12 +928,7 @@ export class CredentialManager {
         let revoke: "revoked" | "locked" | "skipped" | { failed: string } = "skipped";
         if (inst && !local && jwk && state) {
           try {
-            await this.tokens.revoke(
-              await this.tokens.discover(inst.apiUrl, signal),
-              await softwareSigner(jwk),
-              { installationId: inst.installationId, joinState: state, attempt, scope: "installation" },
-              { signal }
-            );
+            await this.revokeStored({ inst, jwk, state, attempt }, signal);
             revoke = "revoked";
           } catch (e) {
             const a = classifyTokenError(e);
@@ -899,7 +939,7 @@ export class CredentialManager {
                   a.reason === "installation_locked"
                   ? "locked"
                   : "revoked"
-                : { failed: isOAuthError(e) ? `${e.error}${e.description ? `/${e.description}` : ""}` : e instanceof Error ? e.message : String(e) };
+                : { failed: errDetail(e) };
           }
         }
         store.deleteInstallationFiles(p.dir);
@@ -915,7 +955,7 @@ export class CredentialManager {
     this.d.onLoggedOut();
     const { inst, revoke } = r;
     if (!inst) return `Profile ${profileLabel(p)} was not signed in.`;
-    const machine = inst.installationName ?? inst.installationId;
+    const machine = machineLabel(inst);
     if (local) {
       // C17.
       return `Signed out locally (profile ${profileLabel(p)}). ⚠️ This machine STAYS ENROLLED in Bridge until you revoke "${machine}" in Settings → Agents → Machines.`;
@@ -960,13 +1000,19 @@ export class CredentialManager {
           }
           // Stray key/state from an enrolment that died before installation.json: not ours any more.
           store.deleteInstallationFiles(p.dir);
-          this.writeEnrolment(p.dir, apiUrl, name, g, key);
+          try {
+            this.writeEnrolment(p.dir, apiUrl, name, g, key);
+          } catch (e) {
+            // Enrolled in Bridge, but unusable here: revoke it rather than leave it live.
+            const left = await this.abandonEnrolment(p.dir, meta, key.signer, g, signal);
+            throw new Error(`its sign-in could not be saved on this machine (${errDetail(e)})${stillEnrolled(left)}`);
+          }
           this.d.log(`bridge auth: enrolled installation ${g.installation_id} with BRIDGE_ENROLMENT_KEY`);
         },
         this.lockOpts()
       );
     } catch (e) {
-      const why = isOAuthError(e) ? `${e.error}${e.description ? `/${e.description}` : ""}` : e instanceof Error ? e.message : String(e);
+      const why = errDetail(e);
       this.d.notify(`Bridge: BRIDGE_ENROLMENT_KEY could not enrol this machine (${why}) — the key may be used up or expired, or Bridge did not answer in time.`);
     }
   }
@@ -976,6 +1022,22 @@ export class CredentialManager {
     this.ticker = null;
     this.pendingLogin?.cancel();
   }
+}
+
+/** An error as the person should see it: the OAuth code (+ description token), else the message. */
+function errDetail(e: unknown): string {
+  return isOAuthError(e) ? `${e.error}${e.description ? `/${e.description}` : ""}` : e instanceof Error ? e.message : String(e);
+}
+
+function machineLabel(inst: store.Installation): string {
+  return inst.installationName ?? inst.installationId;
+}
+
+/** The warning for installations that could not be revoked from here ("" when none). */
+function stillEnrolled(labels: string[]): string {
+  return labels.length === 0
+    ? ""
+    : ` ⚠️ ${labels.map((l) => `"${l}"`).join(" and ")} STAYS ENROLLED in Bridge until you revoke it in Settings → Agents → Machines.`;
 }
 
 /** What the person is told when Bridge says this installation is gone for good (§3.3, §5.4). */
