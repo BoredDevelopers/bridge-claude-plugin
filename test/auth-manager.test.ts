@@ -8,7 +8,7 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, statSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startAuthStub } from "./agent-auth-stub";
+import { startAuthStub } from "./agent-auth-stub-rfc014";
 import { CredentialManager, CredentialError, type ManagerDeps } from "../auth/manager";
 import { resolveProfile } from "../auth/profile";
 import { withProfileLock } from "../auth/lock";

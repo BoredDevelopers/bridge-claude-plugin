@@ -5,7 +5,7 @@
  */
 import { describe, test, expect } from "bun:test";
 import { generateSoftwareKey } from "../auth/core/signer";
-import { dpopProof, normalizeHtu, wsHtu } from "../auth/core/dpop";
+import { dpopProof, httpHtu, normalizeHtu, wsHtu } from "../auth/core/dpop";
 import { clientAssertion, ASSERTION_TTL_S } from "../auth/core/assertion";
 import { Clock } from "../auth/core/clock";
 import { isJoinState, joinStateSeq } from "../auth/core/join-state";
@@ -34,6 +34,15 @@ describe("DPoP proofs (RFC 9449, RFC-016 §3.4 / E11)", () => {
     expect(wsHtu("wss://h.example:443")).toBe("https://h.example/ws");
     expect(wsHtu("ws://127.0.0.1:4000/ws")).toBe("http://127.0.0.1:4000/ws");
     expect(() => wsHtu("ftp://h.example")).toThrow();
+  });
+
+  test("C16: the HTTP htu is the apiUrl ORIGIN + the request path — no query, no double slash", () => {
+    expect(httpHtu("https://Bridge-API.example.com", "/api/channels")).toBe("https://bridge-api.example.com/api/channels");
+    expect(httpHtu("https://bridge-api.example.com/", "/api/channels")).toBe("https://bridge-api.example.com/api/channels");
+    expect(httpHtu("https://bridge-api.example.com//", "api/channels")).toBe("https://bridge-api.example.com/api/channels");
+    expect(httpHtu("https://h.example:443/", "//api/x?since=1#frag")).toBe("https://h.example/api/x");
+    expect(httpHtu("http://127.0.0.1:4000/some/base/", "/api/x")).toBe("http://127.0.0.1:4000/api/x");
+    expect(() => httpHtu("ftp://h.example", "/api/x")).toThrow();
   });
 
   test("an empty access token or nonce is refused, never signed into a proof", async () => {

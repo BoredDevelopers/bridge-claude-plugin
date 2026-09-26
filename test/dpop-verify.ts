@@ -30,9 +30,16 @@ export function parseJws(token: unknown): Jws | null {
   }
 }
 
+/** 32 bytes in CANONICAL base64url (the server refuses a non-canonical spelling: one point, many jkts). */
+function canonical32(v: unknown): boolean {
+  if (typeof v !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(v)) return false;
+  const b = Buffer.from(v, "base64url");
+  return b.length === 32 && b.toString("base64url") === v;
+}
+
 export function isPublicP256(jwk: any): boolean {
   // `d` present = a private key was put in a header — refuse, loudly.
-  return !!jwk && jwk.kty === "EC" && jwk.crv === "P-256" && typeof jwk.x === "string" && typeof jwk.y === "string" && !("d" in jwk);
+  return !!jwk && typeof jwk === "object" && jwk.kty === "EC" && jwk.crv === "P-256" && canonical32(jwk.x) && canonical32(jwk.y) && !("d" in jwk);
 }
 
 /** ES256, raw r‖s only (64 bytes) — a DER signature fails here even though it is "valid". */

@@ -46,14 +46,15 @@ export class TransportError extends Error {
 }
 
 /**
- * Only a failure to get an answer is transient: `fetch`'s TypeError, an abort or
- * timeout (DOMException `AbortError` / `TimeoutError`), or a TransportError. By name,
- * so a DOMException from another realm counts too. Anything else thrown is a bug —
- * retrying it forever would hide it.
+ * Only a failure to get an answer is transient: a TransportError (the TokenClient wraps
+ * every `fetch` / body-read failure in one) or an abort / timeout (DOMException
+ * `AbortError` / `TimeoutError`). By name, so a DOMException from another realm counts
+ * too. NOT a bare TypeError: outside the fetch call that is a programming bug, and
+ * retrying it forever would hide it. Anything else thrown is `refused`.
  */
 function isTransportFailure(e: unknown): boolean {
   const name = (e as { name?: unknown } | null)?.name;
-  return name === "TypeError" || name === "AbortError" || name === "TimeoutError" || name === "TransportError";
+  return name === "AbortError" || name === "TimeoutError" || name === "TransportError";
 }
 
 export const GONE_REASONS = ["installation_locked", "installation_revoked", "installation_expired", "installation_unknown", "agent_deactivated"] as const;

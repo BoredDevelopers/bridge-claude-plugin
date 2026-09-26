@@ -21,16 +21,27 @@ export function normalizeHtu(url: string): string {
 const HTTP_FORM: Record<string, string> = { "ws:": "http:", "wss:": "https:", "http:": "http:", "https:": "https:" };
 
 /**
- * E11: the WebSocket `htu` is the normalised apiUrl ORIGIN + `/ws`, in its
- * http(s) form — never ws(s). RFC-016 C16: HTTP = the same origin + request path.
- * Never a nonce on WS (C15): WS proofs are bound by `iat` + `jti` only.
+ * RFC-016 C16: an HTTP request's `htu` is the normalised apiUrl ORIGIN + the request PATH —
+ * no query, no fragment, and never a double slash from a trailing-slash apiUrl or a
+ * path given with or without its leading "/". Any path in apiUrl itself is ignored (the
+ * server's `deployment.apiUrl` is an origin). A ws(s) apiUrl maps to its http(s) form.
  */
-export function wsHtu(apiUrl: string): string {
+export function httpHtu(apiUrl: string, path: string): string {
   const u = new URL(apiUrl);
   const scheme = HTTP_FORM[u.protocol];
   if (!scheme) throw new Error(`the API URL must be http(s) or ws(s), got ${u.protocol}`);
+  const pathname = "/" + path.split(/[?#]/, 1)[0]!.replace(/^\/+/, "");
   // Re-parse in the http(s) form so the default port of THAT scheme is dropped.
-  return normalizeHtu(`${scheme}//${u.host}/ws`);
+  return normalizeHtu(`${scheme}//${u.host}${pathname}`);
+}
+
+/**
+ * E11: the WebSocket `htu` is the normalised apiUrl ORIGIN + `/ws`, in its
+ * http(s) form — never ws(s). Never a nonce on WS (C15): WS proofs are bound by
+ * `iat` + `jti` only.
+ */
+export function wsHtu(apiUrl: string): string {
+  return httpHtu(apiUrl, "/ws");
 }
 
 /** `ath`: base64url SHA-256 of the ASCII access token (RFC 9449 §4.2). */

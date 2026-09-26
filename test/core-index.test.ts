@@ -10,6 +10,7 @@ test("the barrel exports the public surface and nothing internal", () => {
     "jwkThumbprint",
     "dpopProof",
     "wsHtu",
+    "httpHtu",
     "normalizeHtu",
     "clientAssertion",
     "CLIENT_ASSERTION_TYPE",

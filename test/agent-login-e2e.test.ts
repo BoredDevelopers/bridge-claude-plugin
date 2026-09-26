@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { startAuthStub } from "./agent-auth-stub";
+import { startAuthStub } from "./agent-auth-stub-rfc014";
 import { writeInstallation, readInstallation, sessionFileFor } from "../auth/store";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;

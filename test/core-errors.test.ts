@@ -58,13 +58,15 @@ describe("§3.3 error table → client action", () => {
     expect(classifyTokenError(err)).toEqual(action as any);
   });
 
-  test("a real fetch failure (TypeError from fetch) is transient", async () => {
+  test("a bare TypeError is a bug, not a network failure: refused (the TokenClient wraps fetch's own as TransportError)", async () => {
     const err = await fetch("http://127.0.0.1:1/").then(
       () => null,
       (x: unknown) => x
     );
     expect(err).toBeInstanceOf(TypeError);
-    expect(classifyTokenError(err)).toEqual({ kind: "transient" });
+    expect(classifyTokenError(err)).toEqual({ kind: "refused" });
+    expect(classifyTokenError(new TypeError("undefined is not a function"))).toEqual({ kind: "refused" });
+    expect(classifyTokenError(new TransportError("fetch failed", { cause: err }))).toEqual({ kind: "transient" });
   });
 });
 
