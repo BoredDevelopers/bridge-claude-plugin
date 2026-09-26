@@ -202,7 +202,11 @@ export interface RevokeInput {
 export interface TokenClientOptions {
   /** The server clock estimate (E12); every token-endpoint `Date` teaches it. */
   clock: Clock;
-  /** This runtime's PUBLIC client id (RFC-016 §3.2 `AGENT_AUTH_CLIENTS`, e.g. `bridge-claude-plugin`) — used by the enrolment flows. */
+  /**
+   * This runtime's PUBLIC client id (RFC-016 §3.2 `AGENT_AUTH_CLIENTS`) — sent by the enrolment
+   * flows. REQUIRED, no default: an SDK consumer must never silently enrol as another runtime.
+   * The Claude plugin passes "bridge-claude-plugin" from its own (non-core) module.
+   */
   clientId: string;
   /** Injected transport (tests, proxies, other runtimes). Default: the global `fetch`. */
   fetch?: FetchLike;

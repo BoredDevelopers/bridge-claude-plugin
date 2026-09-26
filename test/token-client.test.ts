@@ -571,8 +571,26 @@ describe("TokenClient failure shapes (classifyTokenError input)", () => {
 });
 
 describe("TokenClient construction, discovery cache, typed failures", () => {
-  test("the public clientId is the caller's (no runtime's id is baked into auth/core)", () => {
+  test("clientId is REQUIRED (a type error if omitted, a throw if empty) — no runtime's id is baked into auth/core", () => {
+    // @ts-expect-error — clientId has no default: an SDK consumer can never silently enrol as the Claude plugin.
+    expect(() => new TokenClient({ clock: new Clock() })).toThrow(/clientId/);
     expect(() => new TokenClient({ clock: new Clock(), clientId: "" })).toThrow(/clientId/);
+  });
+
+  test("every public-client request sends the GIVEN clientId (device authorization, device poll, code exchange)", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const capture: FetchLike = async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body ?? "{}")));
+      return Response.json({ error: "invalid_grant" }, { status: 400 });
+    };
+    const tc = new TokenClient({ clock: new Clock(), clientId: "bridge-openclaw", fetch: capture });
+    const base = "http://127.0.0.1:9";
+    const meta = { issuer: `${base}/api/agent-auth`, token_endpoint: `${base}/api/agent-auth/token`, device_authorization_endpoint: `${base}/api/agent-auth/device_authorization` } as AuthMetadata;
+    const k = (await generateSoftwareKey()).signer;
+    await refused(tc.deviceAuthorization(meta, "mac"));
+    await refused(tc.pollDeviceCode(meta, k, "brg_dc_x"));
+    await refused(tc.exchangeCode(meta, k, { code: "brg_ac_x", verifier: "v".repeat(43), redirectUri: "http://127.0.0.1:1/cb" }));
+    expect(sent.map((b) => b.client_id)).toEqual(["bridge-openclaw", "bridge-openclaw", "bridge-openclaw"]);
   });
 
   test("discovery is cached PER CLIENT with a TTL; a failure is never cached", async () => {
