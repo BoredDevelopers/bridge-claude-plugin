@@ -12,9 +12,11 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { mintAgentToken } from "./agent-auth-stub";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 
 type Close = { code: number; reason: string };
 /** `firstClose` refuses auth #1; `closes` refuses auths #1..#n in order (overrides). */

@@ -31,7 +31,7 @@ import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { writeInstallation } from "../auth/store";
+import { writeInstallation } from "../auth/node/store";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
 const SESSION_ID = "aaaaaaaa-1111-2222-3333-444444444444";
@@ -44,7 +44,7 @@ const CLOSED_PORT_API_URL = "http://127.0.0.1:1";
 let dir = "";
 const lockFile = () => join(dir, "locks", `${SESSION_ID}.lock`);
 function seedCredentials(d: string): void {
-  writeInstallation(d, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), installationToken: "brg_it_test" });
+  writeInstallation(d, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
 }
 
 function procStart(pid: number): string {

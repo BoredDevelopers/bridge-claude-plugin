@@ -27,8 +27,9 @@ is **not** connected by default (connect-on-demand). So **always call the
 `status` tool first** and branch on it — do NOT call `set_session_label` blind
 and lean on its error:
 
-- `configured` is **false** → stop. The plugin has no API URL/token yet. Tell the
-  user to run `/bridge:configure`, and stop here.
+- `configured` is **false** → stop. The plugin has no API URL or this machine is
+  not signed in; `auth.problem` names the fix (`/bridge:configure` or
+  `/bridge:login`). Tell the user, and stop here.
 - not connected (`websocket` is not `connected`, or `wantConnected` is false) →
   stop. Do **not** call `set_session_label`. Tell the user this session isn't on
   Bridge yet, and offer the one-step fix: `/bridge:connect <name>` connects **and**

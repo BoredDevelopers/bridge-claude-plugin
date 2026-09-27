@@ -9,11 +9,12 @@
  * Config lives in ~/.claude/channels/bridge/.env:
  *   BRIDGE_API_URL=https://bridge-api.example.com
  *   BRIDGE_CHANNELS=general,dev (optional, empty = all)
- * Credentials come from /bridge:login (RFC-014): a per-machine installation in
- * <state>/credentials.json (or <state>/profiles/<BRIDGE_PROFILE>/), and a
- * rotating session grant per Claude session. The static BRIDGE_TOKEN is
- * retired — the server rejects it, so a leftover one is worth nothing but is
- * still surfaced as a hint (see CredentialManager.staleStaticTokenPresent).
+ * Credentials come from /bridge:login (RFC-016): a per-machine P-256 key and
+ * join state in <state>/{key.json,state,installation.json} (or
+ * <state>/profiles/<BRIDGE_PROFILE>/). Every Claude session mints its own 1 h
+ * DPoP-bound access token from them; every HTTP request and WS auth/reauth
+ * frame carries a fresh DPoP proof. The static BRIDGE_TOKEN is retired — a
+ * leftover one is surfaced as a hint only (CredentialManager.staleStaticTokenPresent).
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -44,6 +45,7 @@ import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectS
 import { classifyClose, describeClose, reconnectDelay, type CloseClass } from "./reconnect-policy";
 import { resolveProfile } from "./auth/profile";
 import { CredentialManager, CredentialError } from "./auth/manager";
+import { assertNever } from "./auth/core";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -342,9 +344,9 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 // slug, an env override) does not satisfy.
 let SESSION_KEY: string = FALLBACK_SESSION_KEY;
 
-// ── Credentials (RFC-014) ───────────────────────────────────────────────────
-// The bearer for this session: an access token from its own session grant under
-// the profile's installation. See auth/manager.ts.
+// ── Credentials (RFC-016) ───────────────────────────────────────────────────
+// This session's DPoP-bound access token, minted from the profile's installation
+// key + join state. See auth/manager.ts.
 const creds = new CredentialManager({
   profile: PROFILE,
   envApiUrl: ENV_API_URL,
@@ -357,12 +359,17 @@ const creds = new CredentialManager({
   platform: `${process.platform}-${process.arch}`,
   clientVersion: PLUGIN_VERSION,
   env: process.env,
-  onAccessRotated: (accessToken) => {
+  onAccessRotated: ({ token, dpop }) => {
     // The live socket authenticated with the previous token; hand it the new one
-    // in-band (RFC-014 D9) so the server's expiry timer re-arms — no reconnect.
+    // in-band (`reauth`, RFC-016 §3.4) so the server's expiry timer re-arms — no reconnect.
+    // RFC-016 E11: with its own proof (htm GET, htu <apiUrl origin>/ws, ath).
     if (ws && wsConnected && authenticated) {
       try {
-        ws.send(JSON.stringify({ type: "reauth", token: accessToken }));
+        ws.send(JSON.stringify({ type: "reauth", token, dpop }));
+        // The socket now rides THIS token (the server's reauth swaps its credential): a
+        // later 4008 / 4009 must be judged against its session and installation, not
+        // the ones the socket first authenticated with.
+        reauthedWith.get(ws)?.(token);
       } catch {}
     }
   },
@@ -611,18 +618,43 @@ process.on("uncaughtException", (err) => {
 // ── WebSocket ───────────────────────────────────────────────────────────────
 
 let ws: WebSocket | null = null;
+/** Per socket: re-point what it authenticated with after an in-band `reauth` (onAccessRotated). */
+const reauthedWith = new WeakMap<WebSocket, (token: string) => void>();
 let wsConnected = false;
 let reconnectAttempt = 0;
+// RFC-016 C14: a 4001 gets ONE immediate re-mint + reconnect; a second 4001 takes the
+// slow credential backoff (and tells the model once). Re-armed by the person acting
+// (/bridge:connect, a login) or by a socket that stayed authenticated for
+// REMINT_REARM_MS — NOT by any `authenticated`: a server that accepts the fresh token
+// and refuses it again moments later would otherwise get a mint + upgrade per cycle,
+// forever (a flap). 30 s: the server's own cadence (its 30 s ping) — a socket that
+// survived that long was usable, and a flap costs at most one mint per 30 s.
+let remintedAfter4001 = false;
+/** TEST-ONLY override (ms) of the re-arm window; default 30 s. */
+const REMINT_REARM_MS = testKnob("BRIDGE_TEST_REMINT_REARM_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
+/** When the current socket completed its auth (null while it has not). */
+let authenticatedAt: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 // Why the last socket closed — drives the reconnect schedule (reconnect-policy.ts)
 // and the reason `status` reports. Cleared by a completed auth.
-let lastClose: { cls: CloseClass; code?: number; reason?: string } = { cls: "transient" };
+let lastClose: { cls: CloseClass; code?: number; reason?: string; keyDeleted?: boolean } = { cls: "transient" };
 let nextReconnectAt: number | null = null;
 // Liveness watchdog for the current socket. The server pings every 30s, so a
 // healthy socket is never silent this long; a half-open one (laptop sleep,
 // NAT/tunnel timeout) is silent forever and never fires `close`.
 let livenessTimer: ReturnType<typeof setInterval> | null = null;
-const LIVENESS_TIMEOUT_MS = 90000;
+/** TEST-ONLY override (ms); default 90 s. The check runs every third of it (30 s by default). */
+const LIVENESS_TIMEOUT_MS = testKnob("BRIDGE_TEST_LIVENESS_MS", (n) => Number.isInteger(n) && n >= 300) ?? 90000;
+
+/**
+ * A TEST-ONLY timing knob: honoured only when BRIDGE_TEST=1, so a stray variable in a
+ * real environment can never change production timing. undefined = use the default.
+ */
+function testKnob(name: string, valid: (n: number) => boolean): number | undefined {
+  if (process.env.BRIDGE_TEST !== "1") return undefined;
+  const n = Number(process.env[name]);
+  return process.env[name] && valid(n) ? n : undefined;
+}
 let agentId = "";
 let agentName = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
@@ -641,6 +673,16 @@ let lastServerError = ""; // most recent server error frame, surfaced to tools
 let notifiedServerError = "";
 let notifiedServerErrorAt = 0;
 const SERVER_ERROR_NOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+/** Server `error` frames that only announce the close that follows (see the "error" case). */
+const CLOSE_OWNED_ERRORS = new Set([
+  "Invalid token", // 4001
+  "grant check failed", // 1011
+  "Access token expired", // 4009
+  "session revoked", // 4008 (closeDeadGrant sends the reason as the message)
+  "installation revoked",
+  "installation locked",
+  "session evicted",
+]);
 const loggedUnknownFrameTypes = new Set<string>();
 
 /**
@@ -901,6 +943,11 @@ function channelDecision(channelId: string): ChannelDecision {
 }
 
 function connectWs(): void {
+  // No socket is authenticated from here until this one says so. A predecessor that
+  // never reached the close handler (the liveness watchdog, credentialFailure and
+  // restartConnection all detach it first) must not leave its auth time behind: a
+  // later pre-auth 4001 would read that socket's uptime as this one's and re-arm C14.
+  authenticatedAt = null;
   if (livenessTimer) {
     clearInterval(livenessTimer);
     livenessTimer = null;
@@ -924,18 +971,22 @@ function connectWs(): void {
   // whatever credential the process holds by then.
   let sockBearer: string | undefined;
   let sockGrant: { installationId: string; sessionId: string } | null = null;
+  reauthedWith.set(sock, (token) => {
+    sockBearer = token;
+    sockGrant = creds.grant();
+  });
   sock.addEventListener("open", async () => {
     process.stderr.write(`bridge channel: WebSocket connected\n`);
     wsConnected = true;
-    let bearer: string;
+    let cred: { token: string; dpop: string };
     try {
-      bearer = await creds.bearer();
+      cred = await creds.wsAuth();
     } catch (err) {
       credentialFailure(sock, err);
       return;
     }
     if (ws !== sock) return;
-    sockBearer = bearer;
+    sockBearer = cred.token;
     sockGrant = creds.grant();
     // reconnectAttempt is NOT reset here: the handshake succeeding proves
     // nothing. A server that accepts the socket and then rejects auth (revoked
@@ -945,7 +996,9 @@ function connectWs(): void {
       sock.send(
         JSON.stringify({
           type: "auth",
-          token: bearer,
+          token: cred.token,
+          // RFC-016 E11: proof of the token's key for GET <apiUrl origin>/ws.
+          dpop: cred.dpop,
           since: sinceParam(),
           sessionInfo: await getSessionInfoForAuth(),
           // Re-present our credential to prove we are the SAME session
@@ -1003,37 +1056,59 @@ function connectWs(): void {
     }
     wsConnected = false;
     authenticated = false;
+    const upFor = authenticatedAt === null ? 0 : Date.now() - authenticatedAt;
+    authenticatedAt = null;
     const code = (event as CloseEvent).code;
     const reason = (event as CloseEvent).reason || undefined;
-    const cls = classifyClose(code);
+    const cls = classifyClose(code, reason);
     // A new KIND of refusal starts its own schedule from the bottom; a repeat
     // of the same kind keeps climbing it.
     if (cls !== lastClose.cls) reconnectAttempt = 0;
     lastClose = { cls, code, reason };
     process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
-    // RFC-014 D9. 4009: the access token ran out before a reauth — drop it so the
-    // reconnect's auth frame carries a fresh one.
-    if (cls === "expired") creds.invalidateAccess(sockBearer);
-    if (cls === "revoked" && reason === "session revoked") void creds.sessionRevoked(sockGrant?.sessionId ?? null);
-    if (cls === "revoked" && reason === "installation revoked") {
+    // RFC-016 §3.4: 4009 = the access token ran out before a reauth — drop it so the
+    // reconnect's auth frame carries a fresh one. C14: 4001 = the token (or its proof)
+    // was refused — a DPoP token dies with its installation or session, so the next
+    // attempt must MINT (the mint then reports the real reason, §3.3), where
+    // re-presenting the dead token would only loop on 4001. sockBearer follows an
+    // in-band reauth (reauthedWith), so it is the token the server just refused.
+    // 4008 "session evicted" (bridge#209): the session is gone but nothing is wrong with
+    // the credential — drop its token so the reconnect MINTS a new session. No
+    // sessionRevoked(): that block (E9) is for a session a person revoked.
+    if (cls === "expired" || cls === "evicted" || code === 4001) creds.invalidateAccess(sockBearer);
+    if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);
+    if (cls === "revoked" && (reason === "installation revoked" || reason === "installation locked")) {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
       // profile already holds the new one, this is a switch, not a sign-out.
+      // "installation locked" (RFC-016 E8: a copy of the credential was used) is
+      // terminal the same way — §5.4: the key is deleted, the person re-enrols after
+      // checking the machine (describeClose says so). Judged against the socket's
+      // CURRENT grant: sockGrant follows an in-band reauth (reauthedWith).
       void creds
         .installationRevoked(sockGrant?.installationId ?? null)
-        .catch(() => "logged_out" as const)
+        .catch((err) => {
+          process.stderr.write(`bridge channel: could not clear the revoked installation: ${err instanceof Error ? err.message : String(err)}\n`);
+          return "absent" as const;
+        })
         .then((r) => {
           if (ws !== null && ws !== sock) return;
           if (r === "switched") lastClose = { cls: "transient", code, reason };
           else {
-            awaitingCredentials = true;
-            notifyConnectionRefused(cls, code, reason);
+            waitingFor = "files";
+            lastClose = { cls, code, reason, keyDeleted: r === "deleted" };
+            notifyConnectionRefused(cls, code, reason, r === "deleted");
           }
           scheduleReconnect();
-        });
+        })
+        .catch((err) => process.stderr.write(`bridge channel: 4008 handling failed: ${err}\n`));
       return;
     }
-    notifyConnectionRefused(cls, code, reason);
-    scheduleReconnect();
+    if (upFor >= REMINT_REARM_MS) remintedAfter4001 = false;
+    const immediate = code === 4001 && !remintedAfter4001;
+    if (immediate) remintedAfter4001 = true;
+    // The first 4001 is handled here and now; only a repeat is the person's business.
+    if (!immediate) notifyConnectionRefused(cls, code, reason);
+    scheduleReconnect(immediate);
   });
 
   sock.addEventListener("error", (err) => {
@@ -1058,19 +1133,27 @@ function connectWs(): void {
       authenticated = false;
       scheduleReconnect();
     }
-  }, 30000);
+  }, LIVENESS_TIMEOUT_MS / 3);
   livenessTimer = liveness;
 }
 
-function scheduleReconnect(): void {
+/**
+ * TEST-ONLY: scales every reconnect delay (default 1). Lets an e2e test reach the slow
+ * credential schedule's first retry in about a second; the schedule's SHAPE is unchanged.
+ */
+const BACKOFF_SCALE = testKnob("BRIDGE_TEST_BACKOFF_SCALE", (n) => n > 0 && n <= 1) ?? 1;
+
+function scheduleReconnect(immediate = false): void {
   // The `disconnect` tool (and a persisted "0" at startup) sets this false —
   // a single guard here covers every caller (WebSocket creation failure, the
   // close handler, the liveness watchdog) rather than needing one at each
   // call site.
   if (!wantConnected) return;
   if (reconnectTimer) return;
-  reconnectAttempt++;
-  const delay = reconnectDelay(reconnectAttempt, lastClose.cls);
+  // C14's immediate re-mint is not a backoff step: the next slow retry starts at attempt 1.
+  if (!immediate) reconnectAttempt++;
+  const base = immediate ? 0 : reconnectDelay(reconnectAttempt, lastClose.cls);
+  const delay = base === null ? null : Math.round(base * BACKOFF_SCALE);
   if (delay === null) {
     // Revoked: this token will never work again. Only /bridge:connect (after
     // /bridge:configure) tries again.
@@ -1112,25 +1195,74 @@ function credentialFailure(sock: WebSocket, err: unknown): void {
   } else {
     lastClose = { cls: "revoked", reason: msg };
     lastServerError = msg;
-    awaitingCredentials = true;
-    notifyModel(`⚠️ Bridge: ${msg}`, "error");
+    waitingFor = waitFor(err as CredentialError);
+    // Each distinct refusal once per episode: the model already knows, and `status` shows it.
+    if (notifiedRefusal !== msg) {
+      notifiedRefusal = msg;
+      notifyModel(`⚠️ Bridge: ${msg}`, "error");
+    }
   }
   scheduleReconnect();
 }
 
+// ── Refusal episode ──────────────────────────────────────────────────────────
+// One episode runs from a refusal to the next thing that can end it: a completed
+// auth, or the person acting (/bridge:connect, a login — both via restartConnection
+// or the connect tool). resetRefusalEpisode() is the one place it ends.
+
 /**
- * Set while this session wants to connect but has no usable credential (never
- * signed in, or signed out). A login in ANOTHER session on this machine writes the
- * profile's files; this picks them up without a /bridge:connect here. Never set by
- * a 4008 "session revoked" — that stop is deliberate.
+ * What a STOPPED session waits for before the credential watch reconnects it:
+ * - "files": no usable sign-in on disk (never signed in, signed out, revoked,
+ *   locked) — a login in ANOTHER session writes the files; picked up without a
+ *   /bridge:connect here.
+ * - "stop-lift": minting is stopped by a refusal retrying will not fix
+ *   (creds.refreshStop()); the files are still there, so it waits for the stop to
+ *   lift (the profile holds a different installation) instead of reconnecting into it.
+ * - null: nothing the watch can see ends it (a revoked session, E9: /bridge:connect).
  */
-let awaitingCredentials = false;
+let waitingFor: null | "files" | "stop-lift" = null;
+/**
+ * The refusal last told to the model (`<code>:<reason>` for a close, the message for a
+ * credential failure) — each distinct one once per episode.
+ */
+let notifiedRefusal: string | null = null;
+
+function resetRefusalEpisode(): void {
+  waitingFor = null;
+  notifiedRefusal = null;
+}
+
+/** Exhaustive: a new CredentialError kind must decide here, or it would stop silently. */
+function waitFor(err: CredentialError): typeof waitingFor {
+  switch (err.kind) {
+    case "not_logged_in":
+    case "profile":
+    case "api_url":
+    case "logged_out":
+      return "files";
+    case "refused":
+    case "session_limit":
+      return "stop-lift";
+    case "session_revoked":
+      return null;
+    case "network":
+      return null; // not terminal — retried by the reconnect schedule, never waits
+    default:
+      return assertNever(err.kind);
+  }
+}
+
+/**
+ * TEST-ONLY override of the watch period (ms). Default 10 s. A lower value only makes
+ * the watch notice files sooner; it cannot make a stopped session mint.
+ */
+const CREDENTIAL_WATCH_MS = testKnob("BRIDGE_TEST_CREDENTIAL_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 10_000;
 const credentialWatch = setInterval(() => {
-  if (!awaitingCredentials || !wantConnected || shuttingDown || creds.configError()) return;
-  awaitingCredentials = false;
-  process.stderr.write("bridge channel: credentials appeared — connecting\n");
+  if (waitingFor === null || !wantConnected || shuttingDown || creds.configError()) return;
+  if (waitingFor === "stop-lift" && creds.refreshStop() !== null) return;
+  process.stderr.write(`bridge channel: ${waitingFor === "stop-lift" ? "a new sign-in on disk" : "credentials appeared"} — connecting\n`);
   restartConnection();
-}, 10_000);
+}, CREDENTIAL_WATCH_MS);
 credentialWatch.unref?.();
 
 function notifyModel(content: string, type: "error" | "status"): void {
@@ -1151,7 +1283,8 @@ function restartConnection(): void {
   }
   reconnectAttempt = 0;
   lastClose = { cls: "transient" };
-  notifiedCloseClass = null;
+  resetRefusalEpisode();
+  remintedAfter4001 = false;
   const old = ws;
   ws = null;
   wsConnected = false;
@@ -1186,24 +1319,28 @@ function stopConnection(): void {
 }
 
 /**
- * Tell the MODEL when a close means "a person must act", once per refusal
- * episode (re-armed by a completed auth).
+ * Tell the MODEL when a close means "a person must act", once per distinct
+ * `code:reason` per refusal episode (resetRefusalEpisode).
  *
- * ⚠️ ONLY 4003 AND 4008. 4001 and 4007 arrive with a server `error` frame
- * first ("Invalid token" / "Too many sessions"), which the error-frame path
- * already surfaces — a second notice here would say the same thing twice.
- * 4003 carries no frame (the server just closes), and 4008 may not either.
+ * ⚠️ ONLY 4003, 4008 AND A REPEATED 4001. 4007 arrives with a server `error`
+ * frame first ("Too many sessions"), which the error-frame path already
+ * surfaces — a second notice here would say the same thing twice. 4003 carries
+ * no frame (the server just closes), and 4008 may not either. A 4001 carries
+ * "Invalid token" — but a SECOND in a row (after C14's immediate re-mint) means a
+ * freshly minted token was refused too, which that frame does not say: this adds
+ * what to do (/bridge:login).
  */
-let notifiedCloseClass: CloseClass | null = null;
-function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined): void {
-  if (code !== 4003 && code !== 4008) return;
-  if (notifiedCloseClass === cls) return;
-  notifiedCloseClass = cls;
+function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined, keyDeleted = false): void {
+  if (code !== 4003 && code !== 4008 && code !== 4001) return;
+  if (cls === "evicted") return; // recovers on its own with a new session: nobody must act
+  const key = `${code}:${reason ?? ""}`;
+  if (notifiedRefusal === key) return;
+  notifiedRefusal = key;
   mcp
     .notification({
       method: "notifications/claude/channel",
       params: {
-        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason)}`,
+        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason, { keyDeleted })}`,
         meta: { type: "error", sender: "bridge" },
       },
     })
@@ -1215,7 +1352,7 @@ function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reas
 function connectionState(): string {
   if (wsConnected && authenticated) return "connected";
   if (wsConnected) return "connected, not authenticated";
-  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason)}`;
+  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, { keyDeleted: lastClose.keyDeleted })}`;
   if (reconnectTimer) {
     const inS = nextReconnectAt ? Math.max(0, Math.round((nextReconnectAt - Date.now()) / 1000)) : 0;
     return `disconnected (reconnect attempt ${reconnectAttempt}, in ${inS}s)${why}`;
@@ -1268,7 +1405,8 @@ function handleWsMessage(data: any): void {
       // proof the connection is actually usable.
       reconnectAttempt = 0;
       lastClose = { cls: "transient" };
-      notifiedCloseClass = null;
+      authenticatedAt = Date.now();
+      resetRefusalEpisode();
       // Re-arm the replay gate for this connection: without this, replay
       // frames from mid-session reconnects queue forever and are never
       // delivered (the flush triggers are one-shot per gate)
@@ -1369,6 +1507,10 @@ function handleWsMessage(data: any): void {
       );
       lastServerError = detail ?? JSON.stringify(data).slice(0, 500);
       process.stderr.write(`bridge channel: server error: ${lastServerError}\n`);
+      // The frame the server sends right before a close the close handler owns (ws.ts:
+      // runAuthenticateWs / closeDeadGrant / the 4009 timer): that handler decides what
+      // the model hears — a first 4001, a 1011 and a 4009 recover on their own.
+      if (CLOSE_OWNED_ERRORS.has(lastServerError)) break;
       // Notify once per distinct error per window: a rejected token repeats on
       // every reconnect, and the state stays visible via list_channels anyway.
       const now = Date.now();
@@ -1645,9 +1787,11 @@ async function apiFetch(
   opts: RequestInit = {},
   retried = false
 ): Promise<Response> {
-  let bearer: string;
+  let auth: { token: string; headers: { Authorization: string; DPoP: string } };
   try {
-    bearer = await creds.bearer();
+    // RFC-016 §3.4 / C16: `Authorization: DPoP …` + a fresh proof per request, for
+    // THIS method and the API origin + this path (the query is never signed).
+    auth = await creds.httpAuth(opts.method ?? "GET", path);
   } catch (err) {
     throw new Error(err instanceof Error ? err.message : String(err));
   }
@@ -1657,10 +1801,10 @@ async function apiFetch(
       ...opts,
       signal: opts.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
       headers: {
-        Authorization: `Bearer ${bearer}`,
+        ...auth.headers,
         "Content-Type": "application/json",
-        // Which SESSION is calling. The bearer token above is shared by every
-        // session of this agent and so cannot answer that; this can. Sent on
+        // Which SESSION is calling. The access token above authenticates the
+        // agent's installation, not this session's context; this names it. Sent on
         // every request rather than only on sends, so any future write endpoint
         // is attributable without another round of client changes. Servers that
         // predate it ignore an unknown header.
@@ -1687,10 +1831,22 @@ async function apiFetch(
   // again. THROWN, so every tool reports it the same way through its own
   // "X failed:" path; the two background callers (`loadChannelMap`,
   // `markReadUpTo`) already catch.
-  // An access token can die before its expiry (session revoked, server restarted
-  // its clock view): renew once and retry. Legacy tokens have nothing to renew.
+  // A 401 gets ONE retry, then is reported (no loop). What it retries with depends on
+  // the challenge (RFC 9449 §7.1 `WWW-Authenticate: DPoP error=…`):
+  //   - use_dpop_nonce (+ DPoP-Nonce): same token, the proof carries the nonce (§9);
+  //   - invalid_dpop_proof: same token, a fresh proof — after learning the server's
+  //     clock from this answer's Date (E12);
+  //   - invalid_token, or no DPoP challenge: the token died before its expiry (session
+  //     revoked, installation locked) — mint once (C-list: 401 → one re-mint).
   if (res.status === 401 && !retried && creds.source() === "installation") {
-    creds.invalidateAccess(bearer);
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    if (/error="?use_dpop_nonce/.test(challenge) && res.headers.get("dpop-nonce")) {
+      creds.noteResourceNonce(res.headers.get("dpop-nonce"));
+    } else if (/error="?invalid_dpop_proof/.test(challenge)) {
+      creds.observeServerDate(res.headers.get("date"));
+    } else {
+      creds.invalidateAccess(auth.token);
+    }
     return apiFetch(path, opts, true);
   }
   if (res.status === 429) {
@@ -2150,7 +2306,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "login",
       description:
-        "Sign this machine in to Bridge (RFC-014): opens the browser for one-click approval, or — on a headless/SSH machine — returns a short code to enter at the Bridge site. Returns immediately; completion is reported as a channel notification. Re-running replaces this profile's sign-in (the old one is revoked only after the new one succeeds).",
+        "Sign this machine in to Bridge (RFC-016 key credentials): opens the browser for one-click approval, or — on a headless/SSH machine — returns a short code to enter at the Bridge site. Returns immediately; completion is reported as a channel notification. Re-running replaces this profile's sign-in (the old one is revoked only after the new one succeeds).",
       inputSchema: {
         type: "object",
         properties: {
@@ -3088,6 +3244,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const problem = creds.configError();
         if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
+        // RFC-016 E9: after a session revoke, THIS is the explicit user reconnect —
+        // the next mint says so (reconnect=true) and the server opens a new session.
+        // (0.24 behaviour: connect after a session revoke starts a new session.)
+        creds.requestSessionReconnect();
         // Already open: re-persisting the intent above is enough. Tearing
         // down a healthy socket to "reconnect" would restart a connection
         // that does not need it — the no-op half of idempotent.
@@ -3102,6 +3262,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             nextReconnectAt = null;
           }
           reconnectAttempt = 0;
+          // The person asked: a new episode — a refusal that repeats is answered again,
+          // and a pending watch must not ALSO reconnect over this attempt.
+          resetRefusalEpisode();
+          remintedAfter4001 = false;
           connectUnlessDuplicate();
         }
         return {
@@ -3373,8 +3537,9 @@ function shutdown(): void {
   try {
     ws?.close();
   } catch {}
-  // A refresh in flight has already rotated the token on the server; exiting before
-  // it is written leaves a consumed token on disk (reuse ⇒ the grant is revoked).
+  // A mint in flight has already advanced the join state on the server; exiting
+  // before the new state is written leaves the old one + its attempt on disk. That
+  // still converges (E6b replay) — draining just saves the extra round trip.
   void Promise.all([creds.drain(8_000), Bun.sleep(1000)]).finally(() => {
     creds.stop();
     process.exit(0);
@@ -3430,12 +3595,23 @@ process.stderr.write(
 );
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-// Headless machines enrol once from BRIDGE_ENROLMENT_KEY (never through chat).
+// A 0.23 / 0.24 profile (RFC-014 files) is retired first, so it reads "run
+// /bridge:login", not "not signed in" — store.retireLegacy touches RFC-014 files
+// only, never a 0.25 installation. Headless machines enrol once from
+// BRIDGE_ENROLMENT_KEY (never through chat) — which also re-enrols a retired
+// headless machine.
+try {
+  await creds.retireLegacyCredentials();
+} catch (err) {
+  // Never fatal. A rejected top-level await here would skip the rest of the boot
+  // (enrolment key, connect) — the unhandledRejection hook only logs it. configError()
+  // still reports the old files ("run /bridge:login"); the next start retries.
+  process.stderr.write(`bridge channel: could not retire the plugin-0.24 credentials: ${err instanceof Error ? err.message : String(err)}\n`);
+}
 await creds.enrolFromKeyIfNeeded();
 const startupProblem = creds.configError();
 if (startupProblem) {
   process.stderr.write(`bridge channel: ${startupProblem}\n`);
-  awaitingCredentials = true;
+  waitingFor = "files";
 }
-creds.sweep();
 if (!shuttingDown && wantConnected && !startupProblem) connectUnlessDuplicate();

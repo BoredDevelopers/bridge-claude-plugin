@@ -24,9 +24,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
+import { mintAgentToken } from "./agent-auth-stub";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
-const ENROLMENT_KEY = "brg_ek_test";
+// A well-formed key (server format + CRC) — the strict core refuses anything else.
+const ENROLMENT_KEY = mintAgentToken("ek");
 
 type Sent = { method: string; path: string; body: Record<string, unknown> };
 
@@ -137,12 +139,18 @@ describe("reply posts a threaded reply to the thread-native route", () => {
     send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
   }, 30_000);
 
+  // ⚠️ CAPTURE, then await. If this hook times out (the machine slept mid-run — seen as
+  // a 100 s "hook timed out" in a full run), bun starts the NEXT test while this body is
+  // still parked on `exited`; reading the describe-level lets after the await would
+  // stop THAT test's stub and delete ITS state dir, failing it "never connected". The
+  // timeout covers the plugin's own shutdown (≤ 8 s drain + 1 s grace), not bun's 5 s.
   afterEach(async () => {
-    plugin?.kill();
-    await plugin?.exited;
-    stub?.stop();
-    if (dir) rmSync(dir, { recursive: true, force: true });
-  });
+    const [p, s, d] = [plugin, stub, dir];
+    p?.kill();
+    await p?.exited;
+    s?.stop();
+    if (d) rmSync(d, { recursive: true, force: true });
+  }, 15_000);
 
   async function waitForId(id: number, waitMs = 8000): Promise<any> {
     const deadline = Date.now() + waitMs;

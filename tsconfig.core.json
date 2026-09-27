@@ -1,0 +1,19 @@
+{
+  // auth/core is PURE (RFC-016 §5: it moves into @bridge/agent-sdk unchanged): WebCrypto,
+  // fetch, TextEncoder, atob/btoa — no Node `Buffer`, no Bun API. The main tsconfig loads
+  // bun-types, where `Buffer` and `Bun` typecheck; this one loads NO ambient types, so
+  // any runtime-specific global in auth/core is a compile error. Chained into
+  // `bun run typecheck`.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["auth/core/**/*.ts"]
+}

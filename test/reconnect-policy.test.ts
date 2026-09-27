@@ -16,6 +16,24 @@ describe("classifyClose", () => {
     expect(classifyClose(4009)).toBe("expired");
     for (const c of [1000, 1001, 1006, 4006, 4004, 4005, undefined]) expect(classifyClose(c)).toBe("transient");
   });
+
+  test('1011 "grant check failed" (RFC-016: the server\'s grant re-check hit a DB error) is transient — retry soon, same token', () => {
+    expect(classifyClose(1011)).toBe("transient");
+    expect(reconnectDelay(1, classifyClose(1011), hi)).toBeLessThanOrEqual(1000);
+  });
+});
+
+describe("4008 session evicted (bridge#209: evicted at the live-session cap)", () => {
+  test("is its own class: reconnect soon with a NEW session — never the revoked stop", () => {
+    expect(classifyClose(4008, "session evicted")).toBe("evicted");
+    expect(classifyClose(4008, "session revoked")).toBe("revoked");
+    expect(classifyClose(4008, undefined)).toBe("revoked");
+    expect(reconnectDelay(1, "evicted", hi)).toBeLessThanOrEqual(1000);
+    expect(reconnectDelay(9, "evicted")).not.toBeNull();
+    const t = describeClose("evicted", 4008, "session evicted");
+    expect(t).toContain("new session");
+    expect(t).not.toContain("/bridge:connect");
+  });
 });
 
 describe("reconnectDelay", () => {
@@ -48,6 +66,24 @@ describe("reconnectDelay", () => {
   test("4008 says what to do, by reason", () => {
     expect(describeClose("revoked", 4008, "session revoked")).toContain("/bridge:connect starts a new session");
     expect(describeClose("revoked", 4008, "installation revoked")).toContain("run /bridge:login");
+    // RFC-016 E8: a lock is a copy detected — say so, and how to recover.
+    const locked = describeClose("revoked", 4008, "installation locked");
+    expect(locked).toContain("credential copy detected");
+    expect(locked).toContain("LOCKED");
+    expect(locked).toContain("check this machine");
+    expect(locked).toContain("/bridge:login");
+    // S4: "deleted here" only when this process deleted it.
+    expect(locked).not.toContain("deleted");
+    const deleted = describeClose("revoked", 4008, "installation locked", { keyDeleted: true });
+    expect(deleted).toContain("its key was deleted here");
+    expect(deleted).toContain("/bridge:login");
+  });
+
+  test("4001 points at /bridge:login — never the retired /bridge:configure token", () => {
+    const t = describeClose("credential", 4001, "Invalid token");
+    expect(t).toContain("/bridge:login");
+    expect(t).not.toContain("/bridge:configure");
+    expect(describeClose("credential", 4003, undefined)).not.toContain("/bridge:configure");
   });
 
   test("revoked (4008): never reconnects on its own", () => {

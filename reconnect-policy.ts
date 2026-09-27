@@ -12,34 +12,45 @@
  * policy.
  *
  * Classes, by what fixes the refusal:
- * - transient   (1000/1001/1006/4006/anything unknown): the network or a
- *               restart; retry soon.
+ * - transient   (1000/1001/1006/1011/4006/anything unknown): the network or a
+ *               restart; retry soon. 1011 "grant check failed" (RFC-016) is the
+ *               server's grant re-check hitting a database error — its fault, not
+ *               the token's: same token, retry soon.
  * - session-cap (4007): this agent already has the server's maximum live
  *               sockets. A slot frees when a sibling session closes or a dead
  *               socket is swept — not within a second — and every refused
  *               retry spends the machine's per-IP upgrade budget that its
  *               HEALTHY sessions need. So: slow.
- * - credential  (4001 invalid token, 4003 deregistered/workspace archived):
- *               today both are undone by someone else with the SAME token
- *               (reactivate; workspace restore), so keep retrying — slowly — and
- *               the session recovers without anyone touching the terminal.
- * - expired     (4009, RFC-014 D9): the access token ran out before a reauth. The
- *               credential manager refreshes on the way back in, so retry soon.
+ * - credential  (4001 token or proof refused, 4003 deregistered/workspace
+ *               archived): a 4001 gets ONE immediate re-mint (RFC-016 C14, in
+ *               server.ts); after that, and for 4003 (undone by someone else:
+ *               reactivate, workspace restore), keep retrying — slowly — so the
+ *               session recovers without anyone touching the terminal.
+ * - expired     (4009, D9 — kept by RFC-016): the access token ran out before a reauth. The
+ *               credential manager mints a new token on the way back in, so retry soon.
+ * - evicted     (4008 "session evicted", bridge#209): the agent hit its live-session
+ *               cap and the server evicted THIS session to make room. Nothing is
+ *               wrong with the credential: mint a new session (no reconnect=true,
+ *               no block — E9's stop is for a session a PERSON revoked) and
+ *               reconnect soon.
  * - revoked     (4008): the session or the machine's installation was revoked
- *               ("session revoked" / "installation revoked") and will never work
- *               again. Retrying is pointless; stop and tell the user.
+ *               ("session revoked" / "installation revoked") or LOCKED because a
+ *               copy of its credential was used ("installation locked", RFC-016 E8)
+ *               and will never work again. Retrying is pointless; stop and tell the
+ *               user.
  */
 
-export type CloseClass = "transient" | "expired" | "session-cap" | "credential" | "revoked";
+export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked";
 
 const SCHEDULE: Record<Exclude<CloseClass, "revoked">, { baseMs: number; capMs: number }> = {
   transient: { baseMs: 1_000, capMs: 30_000 },
   expired: { baseMs: 1_000, capMs: 30_000 },
+  evicted: { baseMs: 1_000, capMs: 30_000 },
   "session-cap": { baseMs: 30_000, capMs: 300_000 },
   credential: { baseMs: 60_000, capMs: 300_000 },
 };
 
-export function classifyClose(code: number | undefined): CloseClass {
+export function classifyClose(code: number | undefined, reason?: string): CloseClass {
   switch (code) {
     case 4007:
       return "session-cap";
@@ -47,7 +58,7 @@ export function classifyClose(code: number | undefined): CloseClass {
     case 4003:
       return "credential";
     case 4008:
-      return "revoked";
+      return reason === "session evicted" ? "evicted" : "revoked";
     case 4009:
       return "expired";
     default:
@@ -68,19 +79,36 @@ export function reconnectDelay(attempt: number, cls: CloseClass, rand: () => num
 }
 
 /** A human-readable reason for `status` and notifications. */
-export function describeClose(cls: CloseClass, code: number | undefined, reason: string | undefined): string {
+export function describeClose(
+  cls: CloseClass,
+  code: number | undefined,
+  reason: string | undefined,
+  /** Whether THIS close made the plugin delete the installation's files (4008 revoked / locked). */
+  opts: { keyDeleted?: boolean } = {}
+): string {
   const tail = `${code ?? "?"}${reason ? ` "${reason}"` : ""}`;
   switch (cls) {
     case "session-cap":
       return `too many live sessions for this agent (${tail}) — close another session, or wait for a slot`;
     case "credential":
-      return `token rejected or agent deactivated (${tail}) — an admin can reactivate it; otherwise fix the token with /bridge:configure`;
+      switch (code) {
+        case 4001:
+          return `Bridge refused this session's access token (${tail}) — a new one is minted; if this keeps happening, run /bridge:login`;
+        case 4003:
+          return `agent deactivated or workspace archived (${tail}) — retrying slowly; an admin can reactivate it, otherwise run /bridge:login`;
+        default:
+          return `Bridge refused this session's credential (${tail}) — retrying slowly; if this keeps happening, run /bridge:login`;
+      }
     case "expired":
       return `access token expired (${tail}) — refreshing`;
+    case "evicted":
+      return `this session was evicted to make room under the agent's live-session cap (${tail}) — reconnecting with a new session`;
     case "revoked":
       if (reason === "session revoked") return `this session was revoked in Bridge (${tail}) — /bridge:connect starts a new session`;
       if (reason === "installation revoked")
         return `this machine was signed out of Bridge (${tail}) — run /bridge:login to connect it again`;
+      if (reason === "installation locked")
+        return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail})${opts.keyDeleted ? "; its key was deleted here" : ""} — check this machine, then run /bridge:login to re-enrol`;
       return `token revoked (${tail}) — run /bridge:login, then /bridge:connect`;
     default:
       return `connection closed (${tail})`;

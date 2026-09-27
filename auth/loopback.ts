@@ -10,8 +10,8 @@
  *   a page of its own;
  * - it closes after the answer or after `timeoutMs`.
  */
-import type { AuthMetadata } from "./oauth";
-import { CLIENT_ID } from "./oauth";
+import type { AuthMetadata } from "./core/protocol";
+import { PLUGIN_CLIENT_ID } from "./client-id";
 
 export type LoopbackAnswer = { code: string } | { error: string };
 
@@ -43,7 +43,7 @@ export interface LoopbackLogin {
 export async function startLoopback(
   meta: AuthMetadata,
   installationName: string,
-  opts: { timeoutMs?: number; doneUri?: string } = {}
+  opts: { timeoutMs?: number; doneUri?: string; dpopJkt?: string } = {}
 ): Promise<LoopbackLogin> {
   const { verifier, challenge } = await pkcePair();
   const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
@@ -70,7 +70,7 @@ export async function startLoopback(
     hostname: "127.0.0.1",
     port: 0,
     // Bun's default 10 s idle timeout would cut the held response while the code is
-    // exchanged and the profile lock is waited for; the hold is bounded below instead.
+    // exchanged and the installation lock is waited for; the hold is bounded below instead.
     idleTimeout: 0,
     fetch(req) {
       const url = new URL(req.url);
@@ -101,12 +101,15 @@ export async function startLoopback(
   const authorize = new URL(meta.authorization_endpoint);
   authorize.search = new URLSearchParams({
     response_type: "code",
-    client_id: CLIENT_ID,
+    client_id: PLUGIN_CLIENT_ID,
     redirect_uri: redirectUri,
     code_challenge: challenge,
     code_challenge_method: "S256",
     state,
     installation_name: installationName,
+    // RFC 9449 §10 / RFC-016 §3.2: bind the code to the key that will redeem it (C7:
+    // a code redeemed by any other key is burnt).
+    ...(opts.dpopJkt ? { dpop_jkt: opts.dpopJkt } : {}),
   }).toString();
 
   const close = () => {
