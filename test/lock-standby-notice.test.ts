@@ -68,6 +68,7 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
+        TZ: "Europe/Stockholm", // pinned: `since` is rendered in LOCAL time
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: CLOSED_PORT_API_URL,
         BRIDGE_AUTOCONNECT: "1",
@@ -92,7 +93,7 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
       expect(text).toContain("ttys010");
       expect(text).toContain("iTerm.app");
       expect(text).toContain("/Users/j/Code/holder-window");
-      expect(text).toContain("10:02"); // "since" — the timestamp is rendered, not omitted
+      expect(text).toContain("since 2026-09-27T12:02:00+02:00"); // LOCAL time (TZ pinned above), not UTC
       expect(text).toContain("/bridge:connect takeover");
 
       const r: any = await client.callTool({ name: "status", arguments: {} });
@@ -103,7 +104,7 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
         tty: "ttys010",
         termProgram: "iTerm.app",
         cwd: "/Users/j/Code/holder-window",
-        since: "2026-09-27T10:02:00.000Z",
+        since: "2026-09-27T12:02:00+02:00",
       });
     } finally {
       await client.close().catch(() => {});

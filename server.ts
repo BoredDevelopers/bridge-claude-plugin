@@ -67,6 +67,7 @@ import { resolveProfile, profileLabel } from "./auth/profile";
 import { CredentialManager, CredentialError } from "./auth/manager";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
 import { assertNever } from "./auth/core";
+import { localIso } from "./local-time";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -1624,7 +1625,7 @@ function holderStatus(): Record<string, unknown> | undefined {
       ...(h.tty ? { tty: h.tty } : {}),
       ...(h.termProgram ? { termProgram: h.termProgram } : {}),
       ...(h.cwd ? { cwd: h.cwd } : {}),
-      since: h.startedAt ?? h.at,
+      since: localIso(h.startedAt ?? h.at),
     };
   }
   if (lastClose.cls === "superseded" && lastClose.supersededBy) {
@@ -1669,7 +1670,7 @@ function otherProcessesStatus(): Array<Record<string, unknown>> {
     termProgram: p.termProgram,
     cwd: p.cwd,
     sessionKey: p.sessionKey,
-    startedAt: p.startedAt,
+    startedAt: localIso(p.startedAt),
     // finding 11d: false means `ps`/procStart could not confirm this pid is still the
     // same process (e.g. Windows, or `ps` off PATH) — listed, never asserted as fact.
     verified: p.verified,
@@ -1685,7 +1686,7 @@ function updateStatus(): Record<string, unknown> {
   return {
     version: PLUGIN_VERSION,
     installed_version: findInstalledVersion() ?? null,
-    stale_since: staleSince !== null ? new Date(staleSince).toISOString() : null,
+    stale_since: staleSince !== null ? localIso(staleSince) : null,
     server_versions: serverVersions
       ? {
           minimum: serverVersions.minimum,
@@ -4083,7 +4084,7 @@ function notifyStandby(rec: LockRecord): void {
   if (notifiedStandbyFor === key) return;
   notifiedStandbyFor = key;
   const holder: HolderIdentity = { pid: rec.pid, version: rec.version, tty: rec.tty, termProgram: rec.termProgram, cwd: rec.cwd };
-  const since = rec.startedAt ?? rec.at;
+  const since = localIso(rec.startedAt ?? rec.at);
   notifyModel(
     `Bridge is connected in another window of this session: pid ${holder.pid}, ${holder.version ?? "0.25.0"}` +
       `${holder.tty ? `, ${holder.tty}` : ""}${holder.termProgram ? ` (${holder.termProgram})` : ""}${holder.cwd ? `, ${holder.cwd}` : ""}` +

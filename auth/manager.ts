@@ -44,6 +44,7 @@ import { startLoopback, type LoopbackLogin } from "./loopback";
 import { pollDevice } from "./device";
 import { isHeadless, browserDisabled, openBrowser } from "./browser";
 import { profileLabel, type Profile } from "./profile";
+import { localIso } from "../local-time";
 
 export type CredentialSource = "installation" | "none";
 
@@ -654,7 +655,7 @@ export class CredentialManager {
             key_thumbprint: inst.jkt,
           }
         : {}),
-      ...(this.access ? { access_token_expires_at: new Date(this.access.expiresAt).toISOString() } : {}),
+      ...(this.access ? { access_token_expires_at: localIso(this.access.expiresAt) } : {}),
       ...(this.sessionBlocked ? { session: "revoked — /bridge:connect starts a new one" } : {}),
       ...(src === "none" && this.d.staleStaticTokenPresent ? { hint: STALE_TOKEN_HINT } : {}),
       ...(problem ? { problem } : {}),
