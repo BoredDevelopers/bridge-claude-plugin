@@ -68,6 +68,7 @@ import { CredentialManager, CredentialError } from "./auth/manager";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
 import { assertNever } from "./auth/core";
 import { localIso } from "./local-time";
+import { procStartOf, procStartMatches } from "./proc-start";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -195,15 +196,6 @@ const SESSION_MAP_DIRS = [
 const SESSION_MAP_WAIT_MS = 3000;
 const SESSION_MAP_POLL_MS = 100;
 
-/** Start time of a live process, for the pid-reuse check. "" if unknown. */
-function procStartOf(pid: number): string {
-  try {
-    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-    return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
-  } catch {
-    return "";
-  }
-}
 
 /** The controlling terminal of a live pid (D2: `ps -o tty= -p <claudePid>`). "" if unknown. */
 function ttyOf(pid: number): string {
@@ -319,8 +311,9 @@ function readSessionMapping(key: string): string | null {
       // `ps`); accept it rather than discarding an otherwise-valid mapping.
       const recordedStart = typeof m.procStart === "string" ? m.procStart : "";
       if (recordedStart) {
+        // "" = `ps` could not tell: accept, as before. Otherwise either form (proc-start.ts).
         const actualStart = procStartOf(m.claudePid as number);
-        if (actualStart && actualStart !== recordedStart) continue;
+        if (actualStart && !procStartMatches(m.claudePid as number, recordedStart)) continue;
       }
       // Deliberately no freshness window on updatedAt: Claude Code restarts a
       // crashed MCP server (so does /mcp reconnect), and a window anchored to
@@ -3848,7 +3841,7 @@ function holderIsLive(rec: LockRecord, lockFile: string): boolean {
   // therefore NOT live — it cannot pin anything, and holding on it would be the
   // lockout this is built to avoid.
   if (!rec.procStart) return false;
-  if (procStartOf(rec.pid) !== rec.procStart) return false;
+  if (!procStartMatches(rec.pid, rec.procStart)) return false;
   try {
     if (Date.now() - statSync(lockFile).mtimeMs > LOCK_STALE_MS) return false; // alive but wedged
   } catch {}
