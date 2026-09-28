@@ -8,8 +8,15 @@ on:
 
 jobs:
   plugin:
-    name: Plugin (Bun)
+    name: Plugin (Bun ${{ matrix.bun }})
     runs-on: ubuntu-latest
+    # Both minors users actually run. 1.3 alone hid nothing and 1.4 alone would have
+    # hidden two real bugs (2026-09-28: the lock hold deadline never fired and a
+    # watchdog-detached socket leaked its uptime into C14 — both Bun-1.3-only).
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ["1.3", "1.4"]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -19,7 +26,7 @@ jobs:
           # change. 1.3 is the family this suite was verified against — 28 pass /
           # 1 skip / 0 fail on both macOS (1.3.5) and Linux (oven/bun:1.3),
           # measured 2026-08-02 before this file was written.
-          bun-version: "1.3"
+          bun-version: ${{ matrix.bun }}
 
       # NOT `--frozen-lockfile`, unlike the server repo's CI, and deliberately:
       # `bun.lock` is in .gitignore here, so there is no committed lockfile to

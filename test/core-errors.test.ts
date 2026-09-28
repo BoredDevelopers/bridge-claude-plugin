@@ -79,7 +79,10 @@ describe("§3.3 error table → client action", () => {
       () => null,
       (x: unknown) => x
     );
-    expect(err).toBeInstanceOf(TypeError);
+    // fetch's own rejection is runtime-specific: a TypeError on Bun 1.4, a plain Error
+    // with code "ConnectionRefused" on Bun 1.3 (CI). Either way, UNWRAPPED it is refused;
+    // the TokenClient's job is to wrap it (TransportError, below).
+    expect(err).toBeInstanceOf(Error);
     expect(classifyTokenError(err)).toEqual({ kind: "refused" });
     expect(classifyTokenError(new TypeError("undefined is not a function"))).toEqual({ kind: "refused" });
     expect(classifyTokenError(new TransportError("fetch failed", { cause: err }))).toEqual({ kind: "transient" });

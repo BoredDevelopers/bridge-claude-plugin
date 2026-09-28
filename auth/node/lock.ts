@@ -239,9 +239,20 @@ export async function withInstallationLock<T>(
     if (Date.now() > deadline) throw new Error(`bridge: installation lock ${lockDir} held for over ${waitMs / 1000}s`);
     await sleep(RETRY_MS);
   }
+  // An explicit timer, not AbortSignal.timeout(holdMs): on Bun 1.3 a timeout signal
+  // that is only ever consumed through AbortSignal.any(...) (every request under the
+  // lock combines it with its own per-call timeout) measurably never fired, so the
+  // hold budget did not cut anything and the lock could be held past the stale break
+  // (CI: "ONE deadline" ran the un-cut 1.8 s). A timer the finally clears always fires.
+  const hold = new AbortController();
+  const holdTimer = setTimeout(
+    () => hold.abort(new DOMException("installation lock hold budget exhausted", "TimeoutError")),
+    holdMs
+  );
   try {
-    return await fn({ signal: AbortSignal.timeout(holdMs) });
+    return await fn({ signal: hold.signal });
   } finally {
+    clearTimeout(holdTimer);
     // Never let a failed release replace fn's result (or its error): report it; the lock
     // then ages out through the stale break.
     try {

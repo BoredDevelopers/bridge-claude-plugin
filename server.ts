@@ -1314,17 +1314,22 @@ function connectWs(): void {
     process.stderr.write(
       `bridge channel: no inbound frame for ${LIVENESS_TIMEOUT_MS / 1000}s — forcing reconnect\n`
     );
+    // Detach BEFORE close(). Bun 1.3's client WebSocket fires `close` synchronously
+    // inside close(): with `ws` still pointing here, the close handler ran as for a
+    // live socket and read this socket's uptime into C14's re-arm, so the NEXT
+    // socket's pre-auth 4001 got an immediate re-mint (CI, Bun 1.3; Bun 1.4 fires
+    // later and hid it). Detached first, a close that does fire is a no-op.
+    const wasCurrent = ws === sock;
+    if (wasCurrent) {
+      ws = null;
+      wsConnected = false;
+      authenticated = false;
+    }
     try {
       sock.close();
     } catch {}
     // A half-open socket may never emit `close`, so drive the reconnect here.
-    // Detaching ws makes the close handler above a no-op if it does fire.
-    if (ws === sock) {
-      ws = null;
-      wsConnected = false;
-      authenticated = false;
-      scheduleReconnect();
-    }
+    if (wasCurrent) scheduleReconnect();
   }, LIVENESS_TIMEOUT_MS / 3);
   livenessTimer = liveness;
 }
