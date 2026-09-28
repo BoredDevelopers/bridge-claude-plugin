@@ -18,6 +18,7 @@
  */
 import { clientAssertion, CLIENT_ASSERTION_TYPE } from "./assertion";
 import { apiOrigin, dpopProof } from "./dpop";
+import { deadline } from "./deadline";
 import { isJoinState } from "./join-state";
 import { OAuthError, isOAuthError, TransportError, DiscoveryError, AbortedError } from "./token-errors";
 import type { Clock } from "./clock";
@@ -221,6 +222,14 @@ export interface TokenClientOptions {
    */
   softwareId?: string;
   softwareVersion?: string;
+  /**
+   * Override the deadline constants (MINT_TIMEOUT_MS / MINT_BUDGET_MS / DISCOVERY_TIMEOUT_MS)
+   * — test-only-friendly: production callers never set this, so they get the constants
+   * (unset fields fall back individually). A test that needs a request to a server that
+   * never answers to settle in milliseconds, not `MINT_TIMEOUT_MS`'s 30 s, sets these
+   * instead of waiting out the real budgets.
+   */
+  timeouts?: { discoveryMs?: number; mintMs?: number; mintBudgetMs?: number };
 }
 
 export class TokenClient {
@@ -234,6 +243,9 @@ export class TokenClient {
   private readonly ttlMs: number;
   private readonly softwareId?: string;
   private readonly softwareVersion?: string;
+  private readonly discoveryMs: number;
+  private readonly mintMs: number;
+  private readonly mintBudgetMs: number;
 
   constructor(o: TokenClientOptions) {
     if (typeof o.clientId !== "string" || o.clientId === "") throw new Error("TokenClient needs the runtime's public clientId");
@@ -243,6 +255,9 @@ export class TokenClient {
     this.ttlMs = o.metadataTtlMs ?? METADATA_TTL_MS;
     this.softwareId = o.softwareId;
     this.softwareVersion = o.softwareVersion;
+    this.discoveryMs = o.timeouts?.discoveryMs ?? DISCOVERY_TIMEOUT_MS;
+    this.mintMs = o.timeouts?.mintMs ?? MINT_TIMEOUT_MS;
+    this.mintBudgetMs = o.timeouts?.mintBudgetMs ?? MINT_BUDGET_MS;
   }
 
   /** RFC-017 D5: spread into every grant's body — `{}` when this client was not given an identity. */
@@ -264,17 +279,22 @@ export class TokenClient {
     const hit = this.metadata.get(origin);
     if (hit && Date.now() - hit.at < this.ttlMs) return abortable(hit.p, signal);
     const p = (async () => {
-      const { res, json } = await exchange(this.f, `${origin}/.well-known/oauth-authorization-server/api/agent-auth`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-      });
-      if (!res.ok) throw toOAuthError(res, json);
-      const m = json as AuthMetadata | null;
-      if (!m || typeof m.token_endpoint !== "string" || typeof m.issuer !== "string") {
-        throw new DiscoveryError(`Bridge agent-auth discovery returned no token endpoint — is ${origin} a Bridge API?`);
+      const dl = deadline(this.discoveryMs);
+      try {
+        const { res, json } = await exchange(this.f, `${origin}/.well-known/oauth-authorization-server/api/agent-auth`, {
+          headers: { Accept: "application/json" },
+          signal: dl.signal,
+        });
+        if (!res.ok) throw toOAuthError(res, json);
+        const m = json as AuthMetadata | null;
+        if (!m || typeof m.token_endpoint !== "string" || typeof m.issuer !== "string") {
+          throw new DiscoveryError(`Bridge agent-auth discovery returned no token endpoint — is ${origin} a Bridge API?`);
+        }
+        assertSameAuthority(origin, m);
+        return m;
+      } finally {
+        dl.clear();
       }
-      assertSameAuthority(origin, m);
-      return m;
     })();
     this.metadata.set(origin, { at: Date.now(), p });
     p.catch(() => {
@@ -285,17 +305,23 @@ export class TokenClient {
 
   /** RFC 8628 §3.1 — public, no DPoP (the proof key is bound at the token request, C8). */
   async deviceAuthorization(m: AuthMetadata, installationName: string, o: CallOpts = {}): Promise<DeviceAuthorization> {
-    const { res, json } = await exchange(
-      this.f,
-      m.device_authorization_endpoint,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ client_id: this.clientId, installation_name: installationName }),
-        signal: o.signal ? AbortSignal.any([AbortSignal.timeout(MINT_TIMEOUT_MS), o.signal]) : AbortSignal.timeout(MINT_TIMEOUT_MS),
-      },
-      o.signal
-    );
+    const dl = deadline(this.mintMs, o.signal);
+    let res: Response, json: unknown;
+    try {
+      ({ res, json } = await exchange(
+        this.f,
+        m.device_authorization_endpoint,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ client_id: this.clientId, installation_name: installationName }),
+          signal: dl.signal,
+        },
+        o.signal
+      ));
+    } finally {
+      dl.clear();
+    }
     if (!res.ok) throw toOAuthError(res, json);
     const d = json as Partial<DeviceAuthorization> | null;
     if (typeof d?.device_code !== "string" || typeof d?.user_code !== "string" || typeof d?.verification_uri !== "string") {
@@ -319,51 +345,61 @@ export class TokenClient {
     signal?: AbortSignal
   ): Promise<unknown> {
     const origin = new URL(url).origin;
-    const budget = signal ? AbortSignal.any([AbortSignal.timeout(MINT_BUDGET_MS), signal]) : AbortSignal.timeout(MINT_BUDGET_MS);
-    let nonceRetried = false;
-    let proofRetried = false;
-    let assertionRetried = false;
-    for (;;) {
-      const body = await build();
-      // C16: dpopProof signs the endpoint's normalised origin + path — never its query.
-      const proof = await dpopProof(signer, this.clock, { htm: "POST", htu: url, nonce: this.nonces.get(origin) });
-      const { res, json } = await exchange(
-        this.f,
-        url,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json", DPoP: proof },
-          body: JSON.stringify(body),
-          signal: AbortSignal.any([AbortSignal.timeout(MINT_TIMEOUT_MS), budget]),
-        },
-        signal
-      );
-      this.clock.observe(res.headers.get("date"));
-      const nonce = res.headers.get("dpop-nonce");
-      if (nonce) this.nonces.set(origin, nonce);
-      if (res.ok) return json;
-      const err = toOAuthError(res, json);
-      if (err.error === "use_dpop_nonce" && nonce && !nonceRetried) {
-        nonceRetried = true;
-        continue;
+    const budget = deadline(this.mintBudgetMs, signal);
+    try {
+      let nonceRetried = false;
+      let proofRetried = false;
+      let assertionRetried = false;
+      for (;;) {
+        const body = await build();
+        // C16: dpopProof signs the endpoint's normalised origin + path — never its query.
+        const proof = await dpopProof(signer, this.clock, { htm: "POST", htu: url, nonce: this.nonces.get(origin) });
+        const attempt = deadline(this.mintMs, budget.signal);
+        let res: Response, json: unknown;
+        try {
+          ({ res, json } = await exchange(
+            this.f,
+            url,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json", DPoP: proof },
+              body: JSON.stringify(body),
+              signal: attempt.signal,
+            },
+            signal
+          ));
+        } finally {
+          attempt.clear();
+        }
+        this.clock.observe(res.headers.get("date"));
+        const nonce = res.headers.get("dpop-nonce");
+        if (nonce) this.nonces.set(origin, nonce);
+        if (res.ok) return json;
+        const err = toOAuthError(res, json);
+        if (err.error === "use_dpop_nonce" && nonce && !nonceRetried) {
+          nonceRetried = true;
+          continue;
+        }
+        // C6: `key_already_enrolled` is NOT a proof problem — the same key can never pass;
+        // the caller retries with a FRESH key (isKeyAlreadyEnrolled). `dpop_proof_required:`
+        // means the server thinks we sent none: a retry would only loop.
+        if (
+          err.error === "invalid_dpop_proof" &&
+          err.description !== "key_already_enrolled" &&
+          !err.description?.startsWith("dpop_proof_required:") &&
+          !proofRetried
+        ) {
+          proofRetried = true;
+          continue;
+        }
+        if (hasAssertion && err.error === "invalid_client" && err.description === "assertion_invalid" && !assertionRetried) {
+          assertionRetried = true;
+          continue;
+        }
+        throw err;
       }
-      // C6: `key_already_enrolled` is NOT a proof problem — the same key can never pass;
-      // the caller retries with a FRESH key (isKeyAlreadyEnrolled). `dpop_proof_required:`
-      // means the server thinks we sent none: a retry would only loop.
-      if (
-        err.error === "invalid_dpop_proof" &&
-        err.description !== "key_already_enrolled" &&
-        !err.description?.startsWith("dpop_proof_required:") &&
-        !proofRetried
-      ) {
-        proofRetried = true;
-        continue;
-      }
-      if (hasAssertion && err.error === "invalid_client" && err.description === "assertion_invalid" && !assertionRetried) {
-        assertionRetried = true;
-        continue;
-      }
-      throw err;
+    } finally {
+      budget.clear();
     }
   }
 

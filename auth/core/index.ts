@@ -4,6 +4,7 @@
  * purpose-built function (proof, assertion), never an arbitrary JWS.
  */
 export { type Signer, type KeyStorage, softwareSigner, generateSoftwareKey } from "./signer";
+export { type Deadline, deadline } from "./deadline";
 export { type EcPublicJwk, type EcPrivateJwk, isP256PublicJwk, isP256PrivateJwk, jwkThumbprint } from "./jwk";
 export { type ProofInput, dpopProof, wsHtu, httpHtu, apiOrigin, normalizeHtu } from "./dpop";
 export { clientAssertion, CLIENT_ASSERTION_TYPE, ASSERTION_TTL_S } from "./assertion";

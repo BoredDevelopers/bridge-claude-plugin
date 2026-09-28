@@ -699,3 +699,51 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     expect((a as any).retryAfterS).toBeLessThanOrEqual(9);
   });
 });
+
+// auth/core/deadline.ts replaced `AbortSignal.timeout` composed through `AbortSignal.any`
+// (unreliable on Bun 1.3–1.4 and on Node — see deadline.ts's header). These prove the
+// TokenClient's OWN internal deadlines actually fire against a server that never answers
+// at all — not just a caller-supplied external signal (the test above). `timeouts`
+// overrides the production constants (MINT_TIMEOUT_MS = 30 s, MINT_BUDGET_MS = 90 s,
+// DISCOVERY_TIMEOUT_MS = 10 s) so this does not have to wait out the real budgets.
+describe("TokenClientOptions.timeouts (test-only override; production defaults untouched)", () => {
+  const neverAnswers = () => Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Promise<Response>(() => {}) });
+
+  test("mint against a server that never answers rejects within its overridden timeout (TransportError, transient)", async () => {
+    const hang = neverAnswers();
+    stops.push(() => hang.stop(true));
+    const base = `http://127.0.0.1:${hang.port}`;
+    const meta: AuthMetadata = {
+      issuer: `${base}/api/agent-auth`,
+      authorization_endpoint: `${base}/a`,
+      device_authorization_endpoint: `${base}/d`,
+      token_endpoint: `${base}/api/agent-auth/token`,
+      revocation_endpoint: `${base}/r`,
+    };
+    const tc = new TokenClient({ clock: new Clock(), clientId: STUB_CLIENT_ID, timeouts: { mintMs: 150, mintBudgetMs: 150 } });
+    const k = (await generateSoftwareKey()).signer;
+    const input = { installationId: crypto.randomUUID(), joinState: "brg_js_0_" + "A".repeat(49), attempt: "a".repeat(43), sessionKey: "s", reconnect: false };
+    const started = Date.now();
+    const e = await refused(tc.mint(meta, k, input));
+    const elapsed = Date.now() - started;
+    expect(e).toBeInstanceOf(TransportError);
+    expect(classifyTokenError(e)).toEqual({ kind: "transient" });
+    // Slack around the 150 ms override; nowhere near MINT_TIMEOUT_MS's real 30 s — the
+    // proof that the override (not the production constant) governed this request.
+    expect(elapsed).toBeGreaterThanOrEqual(140);
+    expect(elapsed).toBeLessThan(3_000);
+  });
+
+  test("discovery against a server that never answers rejects within its overridden timeout (TransportError, transient)", async () => {
+    const hang = neverAnswers();
+    stops.push(() => hang.stop(true));
+    const tc = new TokenClient({ clock: new Clock(), clientId: STUB_CLIENT_ID, timeouts: { discoveryMs: 150 } });
+    const started = Date.now();
+    const e = await refused(tc.discover(`http://127.0.0.1:${hang.port}`));
+    const elapsed = Date.now() - started;
+    expect(e).toBeInstanceOf(TransportError);
+    expect(classifyTokenError(e)).toEqual({ kind: "transient" });
+    expect(elapsed).toBeGreaterThanOrEqual(140);
+    expect(elapsed).toBeLessThan(3_000);
+  });
+});

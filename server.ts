@@ -66,7 +66,7 @@ import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersio
 import { resolveProfile, profileLabel } from "./auth/profile";
 import { CredentialManager, CredentialError } from "./auth/manager";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
-import { assertNever } from "./auth/core";
+import { assertNever, deadline } from "./auth/core";
 import { localIso } from "./local-time";
 import { procStartOf, procStartMatches } from "./proc-start";
 
@@ -2148,10 +2148,17 @@ async function apiFetch(
     throw new Error(err instanceof Error ? err.message : String(err));
   }
   let res: Response;
+  // Our own deadline only — when the caller already passed a `signal`, that alone
+  // governs (as before: never composed with ours). It is deliberately never cleared
+  // below on the success path: it bounds the WHOLE outbound request, including any
+  // body read the caller does with the returned `res` after this function is back —
+  // same total HTTP_TIMEOUT_MS as before, not just "got headers". It is unref'd, so a
+  // late, no-op fire (the exchange already finished) never holds the process open.
+  const dl = opts.signal ? undefined : deadline(HTTP_TIMEOUT_MS);
   try {
     res = await fetch(`${apiUrl()}${path}`, {
       ...opts,
-      signal: opts.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      signal: opts.signal ?? dl!.signal,
       headers: {
         ...auth.headers,
         "Content-Type": "application/json",
@@ -2165,6 +2172,8 @@ async function apiFetch(
       },
     });
   } catch (err) {
+    // Nothing was returned to protect: safe (and the only place) to clear.
+    dl?.clear();
     // Distinguish "Bridge is unreachable/hung" from an HTTP-level failure, so
     // the model reports something actionable instead of a bare fetch error.
     const name = (err as any)?.name;

@@ -22,6 +22,7 @@ test("the barrel exports the public surface and nothing internal", () => {
     "isJoinState",
     "joinStateSeq",
     "classifyTokenError",
+    "deadline",
     "OAuthError",
     "isOAuthError",
     "TransportError",
