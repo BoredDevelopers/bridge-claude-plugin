@@ -20,6 +20,7 @@
  * server.ts's (server.ts has no exports and runs top-level side effects) — the same
  * shape test/fixtures/v024/lock.ts and server.ts already duplicate independently.
  */
+import { procStartOf, legacyProcStartOf } from "./proc-start";
 import { mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 
@@ -83,18 +84,8 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
-/** Same semantics as server.ts's procStartOf: "" when it cannot be determined. */
-export function procStartOf(pid: number): string {
-  try {
-    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-    return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
-  } catch {
-    return "";
-  }
-}
-
-/** Injected for tests; production calls the real pidAlive / procStartOf above. */
-export const __ps = { pidAlive, procStartOf };
+/** Injected for tests; production calls the real pidAlive / proc-start.ts. */
+export const __ps = { pidAlive, procStartOf, legacyProcStartOf };
 
 /** Injected for tests (a fake `startedAt`); production is the real clock. */
 export const __clock = { now: () => Date.now() };
@@ -211,5 +202,6 @@ function checkLive(pid: number, rec: Record<string, unknown>): LiveVerdict {
   const recordedStart = typeof rec.procStart === "string" ? rec.procStart : "";
   const currentStart = __ps.procStartOf(pid);
   if (!recordedStart || !currentStart) return "unverifiable";
-  return currentStart === recordedStart ? "live" : "dead";
+  // Either form: ≤ 0.26.0 wrote the local rendering (proc-start.ts).
+  return currentStart === recordedStart || __ps.legacyProcStartOf(pid) === recordedStart ? "live" : "dead";
 }

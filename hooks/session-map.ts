@@ -24,6 +24,7 @@
  * the user's session start.
  */
 
+import { procStartOf } from "../proc-start";
 import {
   readFileSync,
   writeFileSync,
@@ -108,12 +109,7 @@ async function readHookPayload(): Promise<Record<string, any>> {
  */
 function cliProcStart(pid: number | null): string {
   if (!pid) return "";
-  try {
-    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-    return new TextDecoder().decode(r.stdout).trim();
-  } catch {
-    return "";
-  }
+  return procStartOf(pid); // normalized TZ/locale — see ../proc-start.ts
 }
 
 function pidAlive(pid: unknown): boolean {

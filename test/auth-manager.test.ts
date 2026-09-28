@@ -392,8 +392,10 @@ describe("stop-class refusals and the ticker", () => {
     // The session is evicted and the cap is full: the ticker's next mint is refused session_limit.
     for (const s of stub.sessionsFor(inst)) s.revoked = "evicted";
     opts.sessionCap = 0;
-    expect(await until(() => stub.stats.mintBodies.length >= 2)).toBe(true);
-    expect(m.refreshStop()?.kind).toBe("session_limit");
+    // Wait for the OUTCOME, not the request: the stub counts the mint body the moment it
+    // arrives, before its refusal has reached the manager (a race CI lost twice).
+    expect(await until(() => m.refreshStop()?.kind === "session_limit")).toBe(true);
+    expect(stub.stats.mintBodies.length).toBeGreaterThanOrEqual(2);
     const after = stub.stats.mintBodies.length;
     const logged = logs.length;
     await Bun.sleep(1_000); // 20 ticks, each of which would have minted

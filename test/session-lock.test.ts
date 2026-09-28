@@ -27,6 +27,7 @@
  * concurrent processes racing one path produced exactly one winner — and that is
  * what the implementation uses. Reputation lost to measurement.
  */
+import { procStartOf } from "../proc-start";
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync, statSync, chmodSync } from "node:fs";
 import { join } from "node:path";
@@ -56,10 +57,8 @@ function seedCredentials(d: string): void {
   writeInstallation(d, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
 }
 
-function procStart(pid: number): string {
-  const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-  return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
-}
+// What a 0.26.1+ writer records (normalized TZ/locale — proc-start.ts).
+const procStart = (pid: number): string => procStartOf(pid);
 
 function writeLock(rec: Record<string, unknown>) {
   mkdirSync(join(dir, "locks"), { recursive: true });

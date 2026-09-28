@@ -67,6 +67,8 @@ import { resolveProfile, profileLabel } from "./auth/profile";
 import { CredentialManager, CredentialError } from "./auth/manager";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
 import { assertNever } from "./auth/core";
+import { localIso } from "./local-time";
+import { procStartOf, procStartMatches } from "./proc-start";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -194,15 +196,6 @@ const SESSION_MAP_DIRS = [
 const SESSION_MAP_WAIT_MS = 3000;
 const SESSION_MAP_POLL_MS = 100;
 
-/** Start time of a live process, for the pid-reuse check. "" if unknown. */
-function procStartOf(pid: number): string {
-  try {
-    const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-    return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
-  } catch {
-    return "";
-  }
-}
 
 /** The controlling terminal of a live pid (D2: `ps -o tty= -p <claudePid>`). "" if unknown. */
 function ttyOf(pid: number): string {
@@ -318,8 +311,9 @@ function readSessionMapping(key: string): string | null {
       // `ps`); accept it rather than discarding an otherwise-valid mapping.
       const recordedStart = typeof m.procStart === "string" ? m.procStart : "";
       if (recordedStart) {
+        // "" = `ps` could not tell: accept, as before. Otherwise either form (proc-start.ts).
         const actualStart = procStartOf(m.claudePid as number);
-        if (actualStart && actualStart !== recordedStart) continue;
+        if (actualStart && !procStartMatches(m.claudePid as number, recordedStart)) continue;
       }
       // Deliberately no freshness window on updatedAt: Claude Code restarts a
       // crashed MCP server (so does /mcp reconnect), and a window anchored to
@@ -1624,7 +1618,7 @@ function holderStatus(): Record<string, unknown> | undefined {
       ...(h.tty ? { tty: h.tty } : {}),
       ...(h.termProgram ? { termProgram: h.termProgram } : {}),
       ...(h.cwd ? { cwd: h.cwd } : {}),
-      since: h.startedAt ?? h.at,
+      since: localIso(h.startedAt ?? h.at),
     };
   }
   if (lastClose.cls === "superseded" && lastClose.supersededBy) {
@@ -1669,7 +1663,7 @@ function otherProcessesStatus(): Array<Record<string, unknown>> {
     termProgram: p.termProgram,
     cwd: p.cwd,
     sessionKey: p.sessionKey,
-    startedAt: p.startedAt,
+    startedAt: localIso(p.startedAt),
     // finding 11d: false means `ps`/procStart could not confirm this pid is still the
     // same process (e.g. Windows, or `ps` off PATH) — listed, never asserted as fact.
     verified: p.verified,
@@ -1685,7 +1679,7 @@ function updateStatus(): Record<string, unknown> {
   return {
     version: PLUGIN_VERSION,
     installed_version: findInstalledVersion() ?? null,
-    stale_since: staleSince !== null ? new Date(staleSince).toISOString() : null,
+    stale_since: staleSince !== null ? localIso(staleSince) : null,
     server_versions: serverVersions
       ? {
           minimum: serverVersions.minimum,
@@ -3847,7 +3841,7 @@ function holderIsLive(rec: LockRecord, lockFile: string): boolean {
   // therefore NOT live — it cannot pin anything, and holding on it would be the
   // lockout this is built to avoid.
   if (!rec.procStart) return false;
-  if (procStartOf(rec.pid) !== rec.procStart) return false;
+  if (!procStartMatches(rec.pid, rec.procStart)) return false;
   try {
     if (Date.now() - statSync(lockFile).mtimeMs > LOCK_STALE_MS) return false; // alive but wedged
   } catch {}
@@ -4083,7 +4077,7 @@ function notifyStandby(rec: LockRecord): void {
   if (notifiedStandbyFor === key) return;
   notifiedStandbyFor = key;
   const holder: HolderIdentity = { pid: rec.pid, version: rec.version, tty: rec.tty, termProgram: rec.termProgram, cwd: rec.cwd };
-  const since = rec.startedAt ?? rec.at;
+  const since = localIso(rec.startedAt ?? rec.at);
   notifyModel(
     `Bridge is connected in another window of this session: pid ${holder.pid}, ${holder.version ?? "0.25.0"}` +
       `${holder.tty ? `, ${holder.tty}` : ""}${holder.termProgram ? ` (${holder.termProgram})` : ""}${holder.cwd ? `, ${holder.cwd}` : ""}` +

@@ -6,6 +6,7 @@
  * reconnect-close-codes.test.ts) so the model-facing notice and `status`'s `holder`
  * field are observable too.
  */
+import { procStartOf } from "../proc-start";
 import { describe, test, expect } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,10 +25,8 @@ const SESSION_ID = "aaaaaaaa-1111-2222-3333-444444444444";
 // A closed port: this test is about lock contention, never about a real socket.
 const CLOSED_PORT_API_URL = "http://127.0.0.1:1";
 
-function procStart(pid: number): string {
-  const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-  return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
-}
+// What a 0.26.1+ writer records (normalized TZ/locale — proc-start.ts).
+const procStart = (pid: number): string => procStartOf(pid);
 
 async function until(pred: () => boolean, ms: number): Promise<boolean> {
   const end = Date.now() + ms;
@@ -68,6 +67,9 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
+        // Pinned to a zone unlike this machine's AND CI's: `since` renders in LOCAL time, and
+        // the holder's procStart (written by THIS process) must still match across zones.
+        TZ: "Asia/Kolkata",
         BRIDGE_STATE_DIR: dir,
         BRIDGE_API_URL: CLOSED_PORT_API_URL,
         BRIDGE_AUTOCONNECT: "1",
@@ -92,7 +94,7 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
       expect(text).toContain("ttys010");
       expect(text).toContain("iTerm.app");
       expect(text).toContain("/Users/j/Code/holder-window");
-      expect(text).toContain("10:02"); // "since" — the timestamp is rendered, not omitted
+      expect(text).toContain("since 2026-09-27T15:32:00+05:30"); // LOCAL time (TZ pinned above), not UTC
       expect(text).toContain("/bridge:connect takeover");
 
       const r: any = await client.callTool({ name: "status", arguments: {} });
@@ -103,7 +105,7 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
         tty: "ttys010",
         termProgram: "iTerm.app",
         cwd: "/Users/j/Code/holder-window",
-        since: "2026-09-27T10:02:00.000Z",
+        since: "2026-09-27T15:32:00+05:30",
       });
     } finally {
       await client.close().catch(() => {});
