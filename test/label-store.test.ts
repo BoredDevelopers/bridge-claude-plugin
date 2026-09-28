@@ -10,6 +10,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, utimesSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "../label-store";
@@ -100,5 +101,13 @@ describe("sweepLabelFiles", () => {
     expect(existsSync(staleFile), "stale, non-current file must be swept").toBe(false);
     expect(existsSync(labelFileFor(dir, "fresh")), "fresh file must remain").toBe(true);
     expect(existsSync(currentFile), "currentPath must never be removed, even when backdated").toBe(true);
+  });
+});
+
+/** RFC-017 P0/C8: real 0.25 output (test/fixtures/generate-v025.ts) must still load. */
+describe("C8: the v025 fixture loads", () => {
+  test("readLabelFile reads 0.25's own file", () => {
+    const v025 = fileURLToPath(new URL("./fixtures/v025", import.meta.url));
+    expect(readLabelFile(v025, "fixture-session")).toBe("Fixture Session");
   });
 });

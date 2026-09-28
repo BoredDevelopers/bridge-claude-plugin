@@ -36,6 +36,81 @@ describe("4008 session evicted (bridge#209: evicted at the live-session cap)", (
   });
 });
 
+describe("RFC-017 D6: superseded / too-old 4008 reasons, matched on the prefix before ':'", () => {
+  test("classifyClose: 'session superseded: …' -> superseded; 'client too old: …' and 'client version withdrawn: …' (blocked) -> too-old", () => {
+    expect(classifyClose(4008, "session superseded: a newer Bridge plugin took over in another window of this session")).toBe("superseded");
+    expect(classifyClose(4008, "client too old: run /plugin update bridge, then /reload-plugins")).toBe("too-old");
+    expect(classifyClose(4008, "client version withdrawn: run /plugin update bridge, then /reload-plugins")).toBe("too-old");
+  });
+
+  test("neither class steals an existing reason: 'session evicted' and 'session revoked' are unaffected", () => {
+    expect(classifyClose(4008, "session evicted")).toBe("evicted");
+    expect(classifyClose(4008, "session revoked")).toBe("revoked");
+  });
+
+  test("an unrecognised 4008 reason (even with a colon) stays 'revoked' — D6's reserved 'stop, a person must act' default", () => {
+    expect(classifyClose(4008, "something new: nobody coded this yet")).toBe("revoked");
+    expect(classifyClose(4008, undefined)).toBe("revoked");
+  });
+
+  test("neither class ever reconnects on its own", () => {
+    expect(reconnectDelay(1, "superseded")).toBeNull();
+    expect(reconnectDelay(9, "superseded")).toBeNull();
+    expect(reconnectDelay(1, "too-old")).toBeNull();
+    expect(reconnectDelay(9, "too-old")).toBeNull();
+  });
+
+  test("describeClose: superseded — a NEWER holder says update; equal/older/unknown says take it back", () => {
+    // RFC-017 D3/finding 6: the wording must not claim "a newer plugin" took over unless
+    // the holder's OWN version really is newer than this process's — a person's explicit
+    // `/bridge:connect takeover` from an equal or older window is a plain takeover, not an
+    // update prompt.
+    const newer = describeClose("superseded", 4008, "session superseded: …", {
+      supersededBy: { pid: 4242, version: "0.27.0", tty: "ttys003", termProgram: "iTerm.app", cwd: "/Users/j/Code/x" },
+      myVersion: "0.26.0",
+    });
+    expect(newer).toContain("pid 4242");
+    expect(newer).toContain("0.27.0");
+    expect(newer).toContain("ttys003");
+    expect(newer).toContain("iTerm.app");
+    expect(newer).toContain("/Users/j/Code/x");
+    expect(newer).toContain("/reload-plugins");
+    expect(newer).toContain("/bridge:connect takeover");
+
+    const equal = describeClose("superseded", 4008, "session superseded: …", {
+      supersededBy: { pid: 4242, version: "0.26.0" },
+      myVersion: "0.26.0",
+    });
+    expect(equal).not.toContain("/reload-plugins");
+    expect(equal).toContain("took over Bridge");
+    expect(equal).toContain("/bridge:connect takeover");
+
+    const older = describeClose("superseded", 4008, "session superseded: …", {
+      supersededBy: { pid: 4242, version: "0.20.0" },
+      myVersion: "0.26.0",
+    });
+    expect(older).not.toContain("/reload-plugins");
+
+    const unknown = describeClose("superseded", 4008, "session superseded: …", {
+      supersededBy: { pid: 4242 },
+      myVersion: "0.26.0",
+    });
+    expect(unknown).not.toContain("/reload-plugins");
+    expect(unknown).toContain("pid 4242");
+
+    const anonymous = describeClose("superseded", 4008, "session superseded: …");
+    expect(anonymous).toContain("another window");
+    expect(anonymous).toContain("/bridge:connect takeover");
+    expect(anonymous).not.toContain("/reload-plugins");
+  });
+
+  test("describeClose: too-old always says the update instruction", () => {
+    const text = describeClose("too-old", 4008, "client too old: run /plugin update bridge, then /reload-plugins");
+    expect(text).toContain("/plugin update bridge");
+    expect(text).toContain("/reload-plugins");
+  });
+});
+
 describe("reconnectDelay", () => {
   test("transient: 1s → 30s, same curve as the web client", () => {
     expect(reconnectDelay(1, "transient", hi)).toBeLessThanOrEqual(1000);

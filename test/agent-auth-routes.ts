@@ -27,7 +27,7 @@ export interface AgentAuthRoutes {
   addEnrolmentKey(key: string, uses?: number): void;
 }
 
-export function createAgentAuthRoutes(opts: Pick<StubOptions, "agentId" | "accessTtlS"> = {}): AgentAuthRoutes {
+export function createAgentAuthRoutes(opts: Pick<StubOptions, "agentId" | "accessTtlS" | "mintDelayMs"> = {}): AgentAuthRoutes {
   const core = createAuthCore(opts);
   return {
     mintEnrolmentKey: (uses = 1) => core.mintEnrolmentKey(uses),

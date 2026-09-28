@@ -70,6 +70,7 @@ export async function pollDevice(
         case "session_limit":
         case "corrupt_state":
         case "update_required":
+        case "too_old":
         case "refused":
           return { ok: false, error: isOAuthError(e) ? e.error : e instanceof Error ? e.message : String(e) };
         default:

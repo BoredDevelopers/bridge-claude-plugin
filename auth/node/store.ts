@@ -28,6 +28,20 @@
  * Windows: the 0600 / 0700 modes are ignored there; the files are as private as the
  * profile directory's ACL (by default the user's profile, owner-only).
  *
+ * ⚠️ D8 (RFC-017): installation.json, key.json, state and attempt are ONE unit — the
+ * whole profile — gated on installation.json's declared `format` (../../format-guard.ts).
+ * A `format` higher than this build knows means a NEWER plugin wrote it: readInstallation
+ * reads that the same as "signed out" (conservative, never wrong), and
+ * deleteInstallationFiles refuses the WHOLE delete rather than only skip
+ * installation.json — key.json/state belong to that same newer installation and must
+ * survive with it. `writeInstallation` itself is NOT guarded here: every writer of it
+ * (login, headless enrolment — including enrolFromKeyIfNeeded's own re-check, both
+ * outside AND inside its installation lock, see its "P1 gap" comment in auth/manager.ts)
+ * gates on `readInstallation`/`isNewerInstallation` returning something first.
+ * `sweepOrphanTemps` needs no such guard: it only ever removes a `*.tmp` — a
+ * crash-abandoned write that never became the canonical file — never the credential
+ * itself, whichever format it is at.
+ *
  * ⚠️ CROSS-VERSION: A STALE 0.24 PROCESS MAY SHARE THIS DIRECTORY. 0.24 (RFC-014) reads
  * and deletes only `credentials.json` and `sessions/` (recursively), sweeps `sessions/*`
  * by age and writes `logged-out`; its lock is `<profile>/.lock`. So 0.25 NEVER writes a
@@ -45,8 +59,11 @@ import { isP256PrivateJwk, type EcPrivateJwk } from "../core/jwk";
 import { isJoinState, joinStateSeq } from "../core/join-state";
 import { randomB64url } from "../core/b64url";
 import type { KeyStorage } from "../core/signer";
+import { readVersioned, KNOWN_FORMAT } from "../../format-guard";
 
 export interface Installation {
+  /** D8. Omitted on read (a missing field means 0); written explicitly from KNOWN_FORMAT. */
+  format?: number;
   apiUrl: string;
   installationId: string;
   installationName?: string;
@@ -169,17 +186,33 @@ function remove(path: string): void {
   } catch {}
 }
 
+/**
+ * D8: `null` for BOTH "no installation" and "a newer plugin's installation" — a reader
+ * that cannot use a credential behaves the same way either way (never mint, never
+ * delete). `isNewerInstallation` is the one place that tells the two apart, for the
+ * callers that must (deleteInstallationFiles; a future notice, D9).
+ */
 export function readInstallation(dir: string): Installation | null {
-  const c = readJson<Installation>(installationFile(dir));
-  return c && typeof c.apiUrl === "string" && typeof c.installationId === "string" && typeof c.jkt === "string" ? c : null;
+  const v = readVersioned<Installation>(installationFile(dir), KNOWN_FORMAT);
+  if (v.kind !== "ok") return null;
+  const c = v.data;
+  return typeof c.apiUrl === "string" && typeof c.installationId === "string" && typeof c.jkt === "string" ? c : null;
+}
+
+/** D8: true when installation.json was written by a plugin newer than this one knows. */
+export function isNewerInstallation(dir: string): boolean {
+  return readVersioned(installationFile(dir), KNOWN_FORMAT).kind === "newer";
 }
 
 /**
  * Whitelisted fields only: nothing a caller spreads in (e.g. an RFC-014 `installationToken`)
  * reaches the file — a 0.24 process must never be able to read it as its own installation.
+ * `format` is additive (D8: "additive fields never bump it") — 0.25's readInstallation
+ * ignores it, so this is fully compatible with a 0.25 window sharing the profile.
  */
 export function writeInstallation(dir: string, c: Installation): void {
   const out: Installation = {
+    format: KNOWN_FORMAT,
     apiUrl: c.apiUrl,
     installationId: c.installationId,
     ...(c.installationName !== undefined ? { installationName: c.installationName } : {}),
@@ -327,8 +360,13 @@ export function deleteAttempt(dir: string): void {
  * under the installation lock, which the caller holds, so none is in flight. NOT an
  * `upgrade-required.json` temp — that marker is no credential, and its writer may be
  * mid-write (it is left to the age-gated sweep at open).
+ *
+ * D8: a no-op when installation.json is a newer format — the four files are one unit
+ * (see this file's header), so refusing only the delete of installation.json while
+ * still deleting key.json/state would strand a newer window's credential just as badly.
  */
 export function deleteInstallationFiles(dir: string): void {
+  if (isNewerInstallation(dir)) return;
   remove(installationFile(dir));
   remove(keyFile(dir));
   remove(stateFile(dir));
@@ -348,6 +386,11 @@ export const ORPHAN_TMP_AGE_MS = 60_000;
  * Remove this store's temp files a crash left behind — they can hold the PRIVATE KEY.
  * Call once when a process opens the profile (default age: a concurrent writer's
  * in-flight temp is never touched). Returns how many it removed.
+ *
+ * D8 audit: no format check needed. A `*.tmp` is never the canonical file (writeAtomic
+ * renames it into place only on success), so an orphan is always debris from a write
+ * that never completed — sweeping it cannot destroy a live credential at ANY format,
+ * this build's or a newer one's.
  */
 export function sweepOrphanTemps(dir: string, minAgeMs = ORPHAN_TMP_AGE_MS): number {
   return sweep(dir, OWN_TMP, minAgeMs);

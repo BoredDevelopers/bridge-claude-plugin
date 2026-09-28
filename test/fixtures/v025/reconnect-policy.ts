@@ -38,38 +38,17 @@
  *               copy of its credential was used ("installation locked", RFC-016 E8)
  *               and will never work again. Retrying is pointless; stop and tell the
  *               user.
- * - superseded  (4008 "session superseded: …", RFC-017 D3/D6): a newer (or explicitly
- *               taking-over) Bridge plugin claimed this session in another window.
- *               Nothing is wrong with the credential — stop; only a person acting —
- *               `/bridge:connect takeover`, or `/bridge:disconnect` then a plain
- *               `/bridge:connect` — resumes this window (finding 6: NOT takeover alone).
- * - too-old     (4008 "client too old: …" / "client version withdrawn: …", RFC-017 D5/D6):
- *               the server's `minimum` (or `blocked`) refuses this build outright.
- *               Retrying changes nothing until the plugin itself is updated; stop.
- *
- * D6: `superseded` and `too-old` are matched on the REASON PREFIX before the first `:` —
- * the server packs its own detail after it (D6's "each reason must instruct on its own"),
- * and a 0.25 client (test/fixtures/v025/reconnect-policy.ts, C6) never coded either
- * prefix, so both fall through to its `revoked` case and stop just the same. The exact
- * `session evicted` reason (no colon) stays a full-string match, unchanged.
  */
 
-export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked" | "superseded" | "too-old";
+export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked";
 
-const SCHEDULE: Record<Exclude<CloseClass, "revoked" | "superseded" | "too-old">, { baseMs: number; capMs: number }> = {
+const SCHEDULE: Record<Exclude<CloseClass, "revoked">, { baseMs: number; capMs: number }> = {
   transient: { baseMs: 1_000, capMs: 30_000 },
   expired: { baseMs: 1_000, capMs: 30_000 },
   evicted: { baseMs: 1_000, capMs: 30_000 },
   "session-cap": { baseMs: 30_000, capMs: 300_000 },
   credential: { baseMs: 60_000, capMs: 300_000 },
 };
-
-/** The part of a 4008 reason before its first `:` (D6) — the whole string when there is none. */
-function reasonPrefix(reason: string | undefined): string {
-  if (!reason) return "";
-  const i = reason.indexOf(":");
-  return i === -1 ? reason : reason.slice(0, i);
-}
 
 export function classifyClose(code: number | undefined, reason?: string): CloseClass {
   switch (code) {
@@ -78,13 +57,8 @@ export function classifyClose(code: number | undefined, reason?: string): CloseC
     case 4001:
     case 4003:
       return "credential";
-    case 4008: {
-      if (reason === "session evicted") return "evicted";
-      const prefix = reasonPrefix(reason);
-      if (prefix === "session superseded") return "superseded";
-      if (prefix === "client too old" || prefix === "client version withdrawn") return "too-old";
-      return "revoked";
-    }
+    case 4008:
+      return reason === "session evicted" ? "evicted" : "revoked";
     case 4009:
       return "expired";
     default:
@@ -97,54 +71,11 @@ export function classifyClose(code: number | undefined, reason?: string): CloseC
  * reconnect. `rand` in [0, 1).
  */
 export function reconnectDelay(attempt: number, cls: CloseClass, rand: () => number = Math.random): number | null {
-  if (cls === "revoked" || cls === "superseded" || cls === "too-old") return null;
+  if (cls === "revoked") return null;
   const { baseMs, capMs } = SCHEDULE[cls];
   const n = Math.max(1, Math.floor(attempt));
   const backoff = Math.min(capMs, baseMs * 2 ** (n - 1));
   return Math.round(backoff / 2 + rand() * (backoff / 2));
-}
-
-/**
- * Just enough of the new holder's identity (RFC-017 D2/D3's lock record) to name it in a
- * notice — pid, version, tty, terminal, cwd. Every field is optional: server.ts reads it
- * best-effort (D3: "names the new holder from the lock record when readable"), and a
- * record it cannot read at all means `describeClose` falls back to a generic phrase.
- */
-export interface HolderIdentity {
-  pid: number;
-  version?: string;
-  tty?: string;
-  termProgram?: string;
-  cwd?: string;
-}
-
-/** "pid 123, 0.26.0, ttys003 (iTerm), ~/Code/x" — omits whatever a partial record lacks. */
-function describeHolder(h: HolderIdentity): string {
-  const parts = [`pid ${h.pid}`, h.version, h.tty ? (h.termProgram ? `${h.tty} (${h.termProgram})` : h.tty) : h.termProgram, h.cwd];
-  return parts.filter((p): p is string => !!p).join(", ");
-}
-
-const SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)$/;
-
-function parseSemver(v: string | undefined): [number, number, number] | null {
-  if (v === undefined) return null;
-  const m = SEMVER_RE.exec(v.trim());
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-/**
- * True only when `other` is a STRICTLY newer, well-formed semver than `mine` — a missing
- * or unparseable `other` (same "never guess" spirit as lock-decision.ts's own present-
- * but-unparseable rule) is never "newer". Duplicated in miniature rather than imported
- * from lock-decision.ts — same "each pure module owns its own comparator" idiom as
- * proc-registry.ts's liveness check and stale-watcher.ts's own semver parser.
- */
-function isNewerThan(other: string | undefined, mine: string): boolean {
-  const o = parseSemver(other);
-  const m = parseSemver(mine);
-  if (!o || !m) return false;
-  for (let i = 0; i < 3; i++) if (o[i] !== m[i]) return o[i] > m[i];
-  return false;
 }
 
 /** A human-readable reason for `status` and notifications. */
@@ -153,7 +84,7 @@ export function describeClose(
   code: number | undefined,
   reason: string | undefined,
   /** Whether THIS close made the plugin delete the installation's files (4008 revoked / locked). */
-  opts: { keyDeleted?: boolean; supersededBy?: HolderIdentity; myVersion?: string } = {}
+  opts: { keyDeleted?: boolean } = {}
 ): string {
   const tail = `${code ?? "?"}${reason ? ` "${reason}"` : ""}`;
   switch (cls) {
@@ -179,21 +110,6 @@ export function describeClose(
       if (reason === "installation locked")
         return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail})${opts.keyDeleted ? "; its key was deleted here" : ""} — check this machine, then run /bridge:login to re-enrol`;
       return `token revoked (${tail}) — run /bridge:login, then /bridge:connect`;
-    case "superseded": {
-      const who = opts.supersededBy ? describeHolder(opts.supersededBy) : "another window";
-      // Finding 6: only a genuinely NEWER holder gets the update prompt — equal, older or
-      // unknown (no record, or a version this build cannot read) is a plain takeover
-      // (a person's own /bridge:connect takeover, possibly onto an older window on
-      // purpose), so telling the person to update would be wrong.
-      if (opts.myVersion && isNewerThan(opts.supersededBy?.version, opts.myVersion)) {
-        return `Bridge moved to a newer plugin in ${who} (${tail}) — /reload-plugins here to update this window; /bridge:connect takeover to move Bridge back`;
-      }
-      return opts.supersededBy
-        ? `another window took over Bridge (${who}) (${tail}) — /bridge:connect takeover moves it back`
-        : `another window took over Bridge (${tail}) — /bridge:connect takeover moves it back`;
-    }
-    case "too-old":
-      return `this plugin is too old for Bridge (${tail}) — /plugin update bridge, then /reload-plugins`;
     default:
       return `connection closed (${tail})`;
   }

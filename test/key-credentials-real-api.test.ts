@@ -61,6 +61,11 @@ import { CredentialManager } from "../auth/manager";
 import { resolveProfile } from "../auth/profile";
 import { PLUGIN_CLIENT_ID } from "../auth/client-id";
 import { startAuthStub } from "./agent-auth-stub";
+import pkg from "../package.json" with { type: "json" };
+
+/** RFC-017 P9: this build's own reported version — never a hardcoded string that
+ * drifts from the next bump. */
+const PLUGIN_VERSION: string = pkg.version;
 
 const API_DIR = process.env.BRIDGE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
@@ -236,7 +241,11 @@ function sibling(apiUrl: string, dir: string, sessionKey: string): CredentialMan
     sessionKey: () => sessionKey,
     sessionKeyReady: async () => {},
     platform: "test",
-    clientVersion: "0.0.0",
+    // RFC-017 S4 now enforces `minimum` for real against this file's actual server —
+    // "0.0.0" (this helper's version before that shipped) is refused `too_old` on
+    // every mint. This helper is for installation-lock/eviction/replay coverage, not
+    // version enforcement, so it reports the SAME real build as the plugin under test.
+    clientVersion: PLUGIN_VERSION,
     env: {},
     onAccessRotated: () => {},
     onLoggedIn: () => {},
@@ -927,6 +936,105 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       expect(classifyTokenError(new OAuthError({ error: j.error, status: r.status, description: j.error_description }))).toEqual({ kind: "update_required" });
     }
   });
+
+  test("RFC-017 D3/S6: supersede — two processes on ONE session, the older (0.25.0) is superseded by the newer, exactly one session grant and one context survive", async () => {
+    const dir = tmp("keys-real-supersede-");
+    const p1 = await plugin(api.url, dir, {
+      BRIDGE_ENROLMENT_KEY: enrolmentKey(),
+      BRIDGE_SESSION_KEY: "supersede-s1",
+      // A same-codebase stand-in for a 0.25 sibling (see PLUGIN_VERSION's own
+      // BRIDGE_TEST_PLUGIN_VERSION comment) — the newer (this build's real
+      // version) must win the local lock and send `supersede: true`.
+      BRIDGE_TEST_PLUGIN_VERSION: "0.25.0",
+    });
+    let p2: Plugin | null = null;
+    try {
+      expect(await until(p1.connected, 20_000), p1.stderr()).toBe(true);
+      const inst = readInstallation(dir)!.installationId;
+      const agentId = (await grantRow(inst)).agent_id;
+      const before = await sessionsOf(inst, "supersede-s1");
+      expect(before).toHaveLength(1);
+      const sessionId = before[0].id;
+      const ctxId = (await p1.status()).context_id;
+      expect(ctxId).toBeTruthy();
+
+      // A second window of the SAME Claude Code session (`claude -c`): same
+      // machine, same session key, same installation on disk — no enrolment
+      // key needed — running this build's TRUE (newer) version.
+      p2 = await plugin(api.url, dir, { BRIDGE_SESSION_KEY: "supersede-s1" });
+      expect(await until(p2.connected, 20_000), p2.stderr()).toBe(true);
+
+      // The older is told and stops — and does not auto-reconnect (D3).
+      expect(await until(() => /session superseded/.test(p1.stderr()), 10_000), p1.stderr()).toBe(true);
+      expect(await until(async () => !(await p1.connected()), 5_000)).toBe(true);
+      await Bun.sleep(1_500);
+      expect(await p1.connected()).toBe(false);
+
+      // The newer claims the SAME context — not a second one (C4).
+      expect((await p2.status()).context_id).toBe(ctxId);
+      const contexts = await q(`SELECT id, state FROM agent_contexts WHERE agent_id = $1 AND id = $2`, [agentId, ctxId]);
+      expect(contexts).toHaveLength(1);
+      expect(contexts[0].state).toBe("active");
+
+      // The SAME session grant — no new one minted for the takeover.
+      const after = await sessionsOf(inst, "supersede-s1");
+      expect(after).toHaveLength(1);
+      expect(after[0].id).toBe(sessionId);
+      expect(after[0].revoked_at).toBeNull();
+    } finally {
+      await p1.close();
+      if (p2) await p2.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("RFC-017 D5/S4: BRIDGE_TEST_BLOCKED_VERSIONS refuses this build's mint — it stops with the update text, files intact", async () => {
+    const blocked = await startApi({ BRIDGE_TEST_BLOCKED_VERSIONS: PLUGIN_VERSION });
+    const dir = tmp("keys-real-blocked-");
+    try {
+      // Enrol as an older, unblocked build first — real files on disk, exactly as
+      // a machine that installed 0.25 and has been running fine ever since.
+      const p1 = await plugin(blocked.url, dir, {
+        BRIDGE_ENROLMENT_KEY: enrolmentKey(),
+        BRIDGE_SESSION_KEY: "blocked-s1",
+        BRIDGE_TEST_PLUGIN_VERSION: "0.25.0",
+      });
+      try {
+        expect(await until(p1.connected, 20_000), p1.stderr()).toBe(true);
+      } finally {
+        await p1.close();
+      }
+      const keyBefore = readKey(dir);
+      const stateBefore = readState(dir);
+      const instBefore = readInstallation(dir);
+      // p1's own successful mint already opened this session — the refusal below
+      // must not touch IT either (no new session, the old one not revoked).
+      const sessionsBefore = await sessionsOf(instBefore!.installationId, "blocked-s1");
+      expect(sessionsBefore).toHaveLength(1);
+
+      // Same machine, same installation — "upgraded" to THIS (blocked) build.
+      const p2 = await plugin(blocked.url, dir, { BRIDGE_SESSION_KEY: "blocked-s1" });
+      try {
+        expect(await until(() => p2.notices.some((n) => /plugin update bridge/.test(n)), 15_000), p2.stderr()).toBe(true);
+        expect(await p2.connected()).toBe(false);
+        // S4/P5: a too-old/blocked refusal must not touch anything on disk.
+        expect(readKey(dir)).toEqual(keyBefore);
+        expect(readState(dir)).toEqual(stateBefore);
+        expect(readInstallation(dir)).toEqual(instBefore);
+        // Stopped, not merely slow — no later mint sneaks through on its own.
+        const mintsBefore = (p2.stderr().match(/bridge auth: minted/g) ?? []).length;
+        await Bun.sleep(1_500);
+        expect((p2.stderr().match(/bridge auth: minted/g) ?? []).length).toBe(mintsBefore);
+        // No new session, and the existing one is untouched.
+        expect(await sessionsOf(instBefore!.installationId, "blocked-s1")).toEqual(sessionsBefore);
+      } finally {
+        await p2.close();
+      }
+    } finally {
+      await blocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("BRIDGE_API_URL ≠ the server's BRIDGE_PUBLIC_URL: refused at discovery, naming both origins — the enrolment key is not spent", async () => {
     const port = new URL(api.url).port;

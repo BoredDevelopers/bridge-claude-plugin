@@ -14,6 +14,16 @@
  * > "" (derived), read into module-scope `sessionLabel` once SESSION_KEY is
  * settled and consumed by minimalSessionInfo(); the `set_session_label` tool
  * writes/clears the file through writeLabelFile/clearLabelFile below.
+ *
+ * D8 audit, DELIBERATELY NO GUARD: unlike connect-store.ts, this file's value space is
+ * unconstrained — ANY string is a legitimate label (someone may well name a session
+ * "{main}"), so there is no byte-shape that distinguishes "not ours" from "a label that
+ * happens to look unusual". A real guard here needs a structural change (a JSON
+ * envelope with a `format` field), which would itself make a 0.26-written label
+ * unreadable by a 0.25 window sharing the file — the opposite of §7's mixed-period
+ * rule, and not something this RFC's on-disk changes call for. Losing a custom label to
+ * a stale overwrite is a cosmetic regression (re-run /bridge:rename), not a destroyed
+ * credential, so this is left as a documented gap rather than an invented heuristic.
  */
 import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
 import { join } from "path";

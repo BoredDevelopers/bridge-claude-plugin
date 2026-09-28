@@ -21,8 +21,25 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import pkg from "./package.json" with { type: "json" };
 
-/** Single source of truth for the version reported over MCP. */
-const PLUGIN_VERSION: string = pkg.version;
+/**
+ * Single source of truth for the version reported over MCP.
+ *
+ * TEST-ONLY override: BRIDGE_TEST=1 and a well-formed BRIDGE_TEST_PLUGIN_VERSION let a
+ * process built from THIS SAME codebase claim an older version — RFC-017 D3's
+ * version-aware takeover needs two live processes on genuinely different versions, and
+ * spinning up a second checkout for every test is not that. A stray variable in a real
+ * environment can never change what a production build reports (same shape as
+ * `testKnob`, just not numeric).
+ */
+const PLUGIN_VERSION: string =
+  (process.env.BRIDGE_TEST === "1" && process.env.BRIDGE_TEST_PLUGIN_VERSION && /^\d+\.\d+\.\d+$/.test(process.env.BRIDGE_TEST_PLUGIN_VERSION)
+    ? process.env.BRIDGE_TEST_PLUGIN_VERSION
+    : undefined) ?? pkg.version;
+/** RFC-017 D2/D3: this process's own "since", stamped once at the top of the module (not
+ * re-read from the clock at whatever later moment happens to write it) — the session
+ * lock record's `startedAt` (P3) reuses it, the same identity proc-registry.ts's own
+ * `writeProc` stamps for `procs/<pid>.json` at the very same moment, a few lines apart. */
+const PROCESS_STARTED_AT = new Date().toISOString();
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
@@ -42,9 +59,13 @@ import { homedir, hostname } from "os";
 import { join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
 import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
-import { classifyClose, describeClose, reconnectDelay, type CloseClass } from "./reconnect-policy";
-import { resolveProfile } from "./auth/profile";
+import { classifyClose, describeClose, reconnectDelay, type CloseClass, type HolderIdentity } from "./reconnect-policy";
+import { writeProc, removeProc, updateProcState, listProcs, type ProcInfo } from "./proc-registry";
+import { decideLock, type LockDecision } from "./lock-decision";
+import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersion, INITIAL_STALE_WATCH_STATE, type StaleWatchState } from "./stale-watcher";
+import { resolveProfile, profileLabel } from "./auth/profile";
 import { CredentialManager, CredentialError } from "./auth/manager";
+import { PLUGIN_CLIENT_ID } from "./auth/client-id";
 import { assertNever } from "./auth/core";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -183,6 +204,16 @@ function procStartOf(pid: number): string {
   }
 }
 
+/** The controlling terminal of a live pid (D2: `ps -o tty= -p <claudePid>`). "" if unknown. */
+function ttyOf(pid: number): string {
+  try {
+    const r = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)]);
+    return r.success ? new TextDecoder().decode(r.stdout).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 function pidAlive(pid: unknown): boolean {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -224,6 +255,30 @@ function parentPid(pid: number): number | null {
 }
 
 const ANCESTRY_MAX_DEPTH = 8;
+
+/** RFC-017 D2: this process's own identity fields, shared by the proc registry write
+ * below AND the session lock record (P3) — computed once (the ancestry walk costs a
+ * few `ps` calls) rather than duplicated at each call site. */
+interface MyIdentity {
+  claudePid: number | null;
+  tty: string;
+  termProgram: string;
+  cwd: string;
+}
+let myIdentityCache: MyIdentity | null = null;
+function myIdentity(): MyIdentity {
+  if (!myIdentityCache) {
+    const mapped = readMappingByAncestry();
+    const claudePid = mapped?.pid ?? null;
+    myIdentityCache = {
+      claudePid,
+      tty: claudePid !== null ? ttyOf(claudePid) : "",
+      termProgram: process.env.TERM_PROGRAM ?? "",
+      cwd: PROJECT_DIR,
+    };
+  }
+  return myIdentityCache;
+}
 
 /** Mapping written by the hook against any ancestor of ours, nearest first. */
 function readMappingByAncestry(): { id: string; pid: number } | null {
@@ -473,6 +528,9 @@ function minimalSessionInfo(): Record<string, string> {
   const info: Record<string, string> = {
     clientName: "Claude Code",
     clientVersion: PLUGIN_VERSION,
+    // RFC-017 D5: this build's own identity, alongside clientVersion (which predates
+    // this RFC and stays for the older servers that only know it).
+    softwareId: PLUGIN_CLIENT_ID,
   };
   try {
     info.hostName = hostname();
@@ -637,7 +695,7 @@ let authenticatedAt: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 // Why the last socket closed — drives the reconnect schedule (reconnect-policy.ts)
 // and the reason `status` reports. Cleared by a completed auth.
-let lastClose: { cls: CloseClass; code?: number; reason?: string; keyDeleted?: boolean } = { cls: "transient" };
+let lastClose: { cls: CloseClass; code?: number; reason?: string; keyDeleted?: boolean; supersededBy?: HolderIdentity } = { cls: "transient" };
 let nextReconnectAt: number | null = null;
 // Liveness watchdog for the current socket. The server pings every 30s, so a
 // healthy socket is never silent this long; a half-open one (laptop sleep,
@@ -669,6 +727,53 @@ let myContextId = ""; // this connection's context ID (from the authenticated pa
  */
 let mySendToken = "";
 let authenticated = false;
+/**
+ * RFC-017 D5/P6/P8: the `client` block from the last `authenticated` frame — kept for
+ * `status` regardless of whether it produced a notice (P8's `server_versions`/`advice`).
+ * `undefined` until the first frame that carries one; a pre-017 server never sends it,
+ * so this legitimately stays undefined forever against one of those.
+ */
+let serverVersions:
+  | { minimum: string; recommended?: string; pending_minimum?: string; minimum_from?: string; advice: string }
+  | undefined;
+/** "one notice per distinct advice value per process" (P6) — never reset, so a value
+ * already told to the model stays told even across reconnects. */
+const notifiedAdviceValues = new Set<string>();
+
+/**
+ * RFC-017 D5/P6: tell the model once per distinct `advice` value this process ever
+ * sees. `ok` is silent — there is nothing to act on. The two actionable values each get
+ * their own wording (the plan's exact texts); an unrecognised value (a future advice
+ * this build predates) is silent rather than guessed at, same fail-open spirit as the
+ * server's own `verdict()`.
+ */
+function noteServerAdvice(client: unknown): void {
+  if (!client || typeof client !== "object") return;
+  const c = client as Record<string, unknown>;
+  const advice = typeof c.advice === "string" ? c.advice : "";
+  if (!advice) return;
+  serverVersions = {
+    minimum: typeof c.minimum === "string" ? c.minimum : "",
+    ...(typeof c.recommended === "string" ? { recommended: c.recommended } : {}),
+    ...(typeof c.pending_minimum === "string" ? { pending_minimum: c.pending_minimum } : {}),
+    ...(typeof c.minimum_from === "string" ? { minimum_from: c.minimum_from } : {}),
+    advice,
+  };
+  if (advice === "ok" || notifiedAdviceValues.has(advice)) return;
+  notifiedAdviceValues.add(advice);
+  if (advice === "update_available") {
+    notifyModel(
+      `Bridge plugin ${serverVersions.recommended ?? "a newer version"} is available (this window runs ${PLUGIN_VERSION}) — /plugin update bridge, then /reload-plugins`,
+      "status"
+    );
+  } else if (advice.startsWith("update_required_by ")) {
+    const date = advice.slice("update_required_by ".length);
+    notifyModel(
+      `Bridge will stop accepting plugin ${PLUGIN_VERSION} on ${date} — /plugin update bridge, then /reload-plugins`,
+      "status"
+    );
+  }
+}
 let lastServerError = ""; // most recent server error frame, surfaced to tools
 let notifiedServerError = "";
 let notifiedServerErrorAt = 0;
@@ -942,6 +1047,20 @@ function channelDecision(channelId: string): ChannelDecision {
   return known ? "drop" : "unknown";
 }
 
+/** RFC-017 D3/findings 1-2: `supersede` rides on EVERY auth frame this process sends —
+ * the initial one and every reconnect's — for as long as `lockHeld` is true. Holding the
+ * local lock means any OTHER live socket for the same session grant is stale (a
+ * lost-lock process, or this process's own half-open ghost), so it is always safe, and
+ * always correct, to ask the server to evict it. There is no one-shot flag any more: the
+ * old design sent `supersede` only on the ONE auth frame right after a takeover, so a
+ * transient failure on THAT attempt silently lost it on retry (finding 1's F1). Every
+ * caller of connectWs — the initial connect, every scheduled reconnect, the lock-retry
+ * loop — now goes through the SAME gate (connectUnlessDuplicate re-reads the lock before
+ * every one of them, finding 2's F2). That is not enough on its own, though: the `open`
+ * handler below still AWAITS a mint and session-info collection between the gate and the
+ * actual send, and someone else can win the local lock in that window (finding 2, T3) —
+ * so the handler re-reads the lock file ITSELF, immediately before the frame goes out,
+ * rather than trusting whatever `lockHeld` said before those awaits started. */
 function connectWs(): void {
   // No socket is authenticated from here until this one says so. A predecessor that
   // never reached the close handler (the liveness watchdog, credentialFailure and
@@ -988,6 +1107,33 @@ function connectWs(): void {
     if (ws !== sock) return;
     sockBearer = cred.token;
     sockGrant = creds.grant();
+    const sessionInfo = await getSessionInfoForAuth();
+    if (ws !== sock) return; // re-check after the second await, same reason as above
+    // finding 2 (2026-09-27 re-review): `lockHeld` can go stale during the two awaits
+    // above (a mint, session-info collection) — someone else can win the LOCAL lock
+    // while this socket is mid-handshake (T3). Re-read the lock file right here,
+    // immediately before the frame that would claim it, instead of trusting whatever
+    // `lockHeld` said before either await started.
+    let supersede = false;
+    if (lockHeld) {
+      const rec = readLockRecord(lockPathFor(SESSION_KEY));
+      if (rec === null) {
+        // Unreadable/absent: fail open — we are the last known holder, so still claim
+        // it rather than silently going quiet (same fail-open spirit as acquisition).
+        supersede = true;
+      } else if (rec.pid === process.pid) {
+        supersede = true;
+      } else if (holderIsLive(rec, lockPathFor(SESSION_KEY))) {
+        // THE OWNERSHIP RULE: someone else already won this key while we were
+        // minting — never send (supersede or otherwise); go straight to superseded.
+        handleLockLost(rec);
+        return;
+      } else {
+        // A dead/stale record sitting where ours used to be — not a live winner, but
+        // not us either. Fail open: still claim it, as the acquisition path would.
+        supersede = true;
+      }
+    }
     // reconnectAttempt is NOT reset here: the handshake succeeding proves
     // nothing. A server that accepts the socket and then rejects auth (revoked
     // token) would reset the backoff on every attempt and spin at ~1s forever.
@@ -1000,7 +1146,7 @@ function connectWs(): void {
           // RFC-016 E11: proof of the token's key for GET <apiUrl origin>/ws.
           dpop: cred.dpop,
           since: sinceParam(),
-          sessionInfo: await getSessionInfoForAuth(),
+          sessionInfo,
           // Re-present our credential to prove we are the SAME session
           // reconnecting, not a sibling claiming this session key. Under
           // BRIDGE_CONTEXT_CLAIM_MODE=enforce a claim on a live context without
@@ -1009,8 +1155,15 @@ function connectWs(): void {
           // Empty on a first connect, which is correct: there is nothing to
           // prove yet. The server never requires it to authenticate.
           ...(mySendToken ? { sendToken: mySendToken } : {}),
+          // RFC-017 D3/D4/findings 1-2: this process holds the LOCAL session lock — ask
+          // the server to evict any other live socket for the same session grant
+          // (honoured only for that same grant; otherwise ignored, same as today's
+          // live-incumbent rename). `lastAuthCarriedSupersede` records this for the
+          // "authenticated" reply (finding 1b: did the takeover actually take?).
+          ...(supersede ? { supersede: true } : {}),
         })
       );
+      lastAuthCarriedSupersede = supersede;
     } catch (err) {
       process.stderr.write(`bridge channel: auth send failed: ${err}\n`);
     }
@@ -1066,6 +1219,10 @@ function connectWs(): void {
     if (cls !== lastClose.cls) reconnectAttempt = 0;
     lastClose = { cls, code, reason };
     process.stderr.write(`bridge channel: WebSocket closed (${code}${reason ? ` ${reason}` : ""})\n`);
+    // finding 11b: reflect the drop immediately — "connected" is set again only once a
+    // NEW socket's "authenticated" frame arrives (handleWsMessage). The "superseded"
+    // branch just below sets its own, more specific state instead.
+    if (cls !== "superseded") updateProcState(STATE_DIR, process.pid, "disconnected");
     // RFC-016 §3.4: 4009 = the access token ran out before a reauth — drop it so the
     // reconnect's auth frame carries a fresh one. C14: 4001 = the token (or its proof)
     // was refused — a DPoP token dies with its installation or session, so the next
@@ -1076,6 +1233,41 @@ function connectWs(): void {
     // the credential — drop its token so the reconnect MINTS a new session. No
     // sessionRevoked(): that block (E9) is for a session a person revoked.
     if (cls === "expired" || cls === "evicted" || code === 4001) creds.invalidateAccess(sockBearer);
+    // RFC-017 D3: a newer (or explicitly taking-over) Bridge plugin claimed this session
+    // in another window — nothing is wrong with the CREDENTIAL, so this touches neither
+    // `creds` nor any file: nothing here is a revocation. `superseded` (module-level)
+    // stops every automatic reconnect path (connectUnlessDuplicate / scheduleReconnect);
+    // only a person acting — `connect {takeover: true}`, or a `disconnect` (which also
+    // clears it, stopConnection below) — clears it (finding 6). The new holder just
+    // wrote its record — read it best-effort for the notice (D3: "when readable").
+    if (cls === "superseded") {
+      superseded = true;
+      // finding 5: the local lock file was just overwritten by whoever superseded us —
+      // it is no longer ours to renew, and pretending otherwise (a stale `lockHeld`)
+      // would be wrong the moment anything next consults it.
+      if (lockRenewTimer) { clearInterval(lockRenewTimer); lockRenewTimer = null; }
+      lockHeld = false;
+      // finding 11a: nothing is wrong with the credential itself, but this window must
+      // stop MINTING for it — D3's "a superseded process never reconnects by itself"
+      // means the next legitimate use of this token is `takeover`, which mints fresh
+      // anyway. Dropping the access token here means the refresh ticker's own `due()`
+      // check (armTicker) has nothing to renew until then — it goes idle on its own.
+      creds.invalidateAccess(sockBearer);
+      updateProcState(STATE_DIR, process.pid, "superseded");
+      const holderRec = readLockRecord(lockPathFor(SESSION_KEY));
+      // finding 2 (:1226 note): never let a race hand us OUR OWN pid back here — this
+      // read happens AFTER we already marked ourselves superseded, so a record that
+      // (by the time this runs) names us again must not be reported as "another window
+      // took over Bridge (pid <ourselves>)".
+      lastClose = {
+        cls,
+        code,
+        reason,
+        ...(holderRec && holderRec.pid !== process.pid
+          ? { supersededBy: { pid: holderRec.pid, version: holderRec.version, tty: holderRec.tty, termProgram: holderRec.termProgram, cwd: holderRec.cwd } }
+          : {}),
+      };
+    }
     if (cls === "revoked" && reason === "session revoked") creds.sessionRevoked(sockGrant?.sessionId ?? null);
     if (cls === "revoked" && (reason === "installation revoked" || reason === "installation locked")) {
       // Re-login elsewhere on this machine revokes the OLD installation; if the
@@ -1096,7 +1288,7 @@ function connectWs(): void {
           else {
             waitingFor = "files";
             lastClose = { cls, code, reason, keyDeleted: r === "deleted" };
-            notifyConnectionRefused(cls, code, reason, r === "deleted");
+            notifyConnectionRefused(cls, code, reason, { keyDeleted: r === "deleted" });
           }
           scheduleReconnect();
         })
@@ -1107,7 +1299,7 @@ function connectWs(): void {
     const immediate = code === 4001 && !remintedAfter4001;
     if (immediate) remintedAfter4001 = true;
     // The first 4001 is handled here and now; only a repeat is the person's business.
-    if (!immediate) notifyConnectionRefused(cls, code, reason);
+    if (!immediate) notifyConnectionRefused(cls, code, reason, { supersededBy: lastClose.supersededBy, myVersion: PLUGIN_VERSION });
     scheduleReconnect(immediate);
   });
 
@@ -1158,7 +1350,7 @@ function scheduleReconnect(immediate = false): void {
     // Revoked: this token will never work again. Only /bridge:connect (after
     // /bridge:configure) tries again.
     nextReconnectAt = null;
-    process.stderr.write(`bridge channel: not reconnecting — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason)}\n`);
+    process.stderr.write(`bridge channel: not reconnecting — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, { supersededBy: lastClose.supersededBy, myVersion: PLUGIN_VERSION })}\n`);
     return;
   }
   nextReconnectAt = Date.now() + delay;
@@ -1168,7 +1360,13 @@ function scheduleReconnect(immediate = false): void {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     nextReconnectAt = null;
-    connectWs();
+    // finding 1/2: every reconnect goes through the SAME gate as the initial connect —
+    // connectUnlessDuplicate re-reads the lock file first. Most of the time it finds we
+    // still own it (a live process's own lockHeld survives a merely transient socket
+    // drop) and proceeds straight to connectWs(); but if another live process has taken
+    // the key over in the meantime (F2), this is what stops us from blindly re-auth'ing
+    // over a lock we no longer hold — the bug a bare `connectWs()` here used to have.
+    connectUnlessDuplicate();
   }, delay);
 }
 
@@ -1242,6 +1440,7 @@ function waitFor(err: CredentialError): typeof waitingFor {
       return "files";
     case "refused":
     case "session_limit":
+    case "too_old":
       return "stop-lift";
     case "session_revoked":
       return null;
@@ -1265,6 +1464,31 @@ const credentialWatch = setInterval(() => {
 }, CREDENTIAL_WATCH_MS);
 credentialWatch.unref?.();
 
+// RFC-017 D7/P7: this process notices it is running from a directory Claude Code has
+// already orphaned (an update or uninstall moved the live install elsewhere) and its
+// files are on a 14-day deletion clock. Skipped entirely when CLAUDE_PLUGIN_ROOT is
+// unset — a dev-channel launch (`--dangerously-load-development-channels`) has no
+// versioned plugin directory for Claude Code to orphan in the first place.
+const CLAUDE_PLUGIN_ROOT = (process.env.CLAUDE_PLUGIN_ROOT ?? "").trim();
+/** TEST-ONLY override (ms); default 60 s. */
+const STALE_WATCH_MS = testKnob("BRIDGE_TEST_STALE_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 60_000;
+let staleWatchState: StaleWatchState = INITIAL_STALE_WATCH_STATE;
+/** P8: when this copy became orphaned — `null` until the first detection. Sticky once set. */
+let staleSince: number | null = null;
+if (CLAUDE_PLUGIN_ROOT) {
+  const staleWatch = setInterval(() => {
+    const orphanedAt = readOrphanedAt(CLAUDE_PLUGIN_ROOT);
+    if (orphanedAt === null) return;
+    staleSince = orphanedAt;
+    const now = Date.now();
+    const { notice, state } = decideStaleNotice(now, orphanedAt, staleWatchState);
+    staleWatchState = state;
+    if (!notice) return;
+    notifyModel(staleNoticeText(notice, PLUGIN_VERSION, findInstalledVersion(), now, orphanedAt), "status");
+  }, STALE_WATCH_MS);
+  staleWatch.unref?.();
+}
+
 function notifyModel(content: string, type: "error" | "status"): void {
   mcp
     .notification({
@@ -1276,6 +1500,14 @@ function notifyModel(content: string, type: "error" | "status"): void {
 
 /** Drop the current socket and connect afresh (a login switched the credential). */
 function restartConnection(): void {
+  // finding 4: a superseded window never auto-reconnects (D3) — connectUnlessDuplicate
+  // would refuse to proceed anyway (no `takeover`), so there is nothing useful left for
+  // this function to do. Returning here BEFORE any of the resets below is what matters:
+  // wiping `lastClose`/`reconnectAttempt` etc. would erase the supersededBy identity that
+  // `connectionState()`/`holderStatus()` report, for zero benefit — a caller (onLoggedIn,
+  // the credential watch) that runs this while superseded must not silently blank
+  // `status` back to a plain "disconnected".
+  if (superseded) return;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -1313,6 +1545,13 @@ function stopConnection(): void {
     clearTimeout(lockRetryTimer);
     lockRetryTimer = null;
   }
+  // An explicit disconnect ends a superseded episode too: the NEXT plain `connect`
+  // (no takeover) should compete for the lock normally rather than stay gated on a
+  // supersession from a prior episode.
+  superseded = false;
+  notifiedStandbyFor = null;
+  standbyHolder = null;
+  updateProcState(STATE_DIR, process.pid, "disconnected");
   try {
     ws?.close();
   } catch {}
@@ -1330,7 +1569,12 @@ function stopConnection(): void {
  * freshly minted token was refused too, which that frame does not say: this adds
  * what to do (/bridge:login).
  */
-function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reason: string | undefined, keyDeleted = false): void {
+function notifyConnectionRefused(
+  cls: CloseClass,
+  code: number | undefined,
+  reason: string | undefined,
+  opts: { keyDeleted?: boolean; supersededBy?: HolderIdentity; myVersion?: string } = {}
+): void {
   if (code !== 4003 && code !== 4008 && code !== 4001) return;
   if (cls === "evicted") return; // recovers on its own with a new session: nobody must act
   const key = `${code}:${reason ?? ""}`;
@@ -1340,7 +1584,7 @@ function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reas
     .notification({
       method: "notifications/claude/channel",
       params: {
-        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason, { keyDeleted })}`,
+        content: `⚠️ Bridge disconnected this session: ${describeClose(cls, code, reason, opts)}`,
         meta: { type: "error", sender: "bridge" },
       },
     })
@@ -1352,7 +1596,10 @@ function notifyConnectionRefused(cls: CloseClass, code: number | undefined, reas
 function connectionState(): string {
   if (wsConnected && authenticated) return "connected";
   if (wsConnected) return "connected, not authenticated";
-  const why = lastClose.cls === "transient" ? "" : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, { keyDeleted: lastClose.keyDeleted })}`;
+  const why =
+    lastClose.cls === "transient"
+      ? ""
+      : ` — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, { keyDeleted: lastClose.keyDeleted, supersededBy: lastClose.supersededBy, myVersion: PLUGIN_VERSION })}`;
   if (reconnectTimer) {
     const inS = nextReconnectAt ? Math.max(0, Math.round((nextReconnectAt - Date.now()) / 1000)) : 0;
     return `disconnected (reconnect attempt ${reconnectAttempt}, in ${inS}s)${why}`;
@@ -1360,7 +1607,36 @@ function connectionState(): string {
   return `disconnected${why}`;
 }
 
+/** RFC-017 D3/D9: the process currently in this window's way — the standby holder, or
+ * (once superseded) whoever took over — for `status` to name (D9's "status says the
+ * same" as the model notice; nothing else from D9's larger field set, that is P8's job). */
+function holderStatus(): Record<string, unknown> | undefined {
+  if (standbyHolder) {
+    const h = standbyHolder;
+    return {
+      pid: h.pid,
+      version: h.version ?? "0.25.0",
+      ...(h.tty ? { tty: h.tty } : {}),
+      ...(h.termProgram ? { termProgram: h.termProgram } : {}),
+      ...(h.cwd ? { cwd: h.cwd } : {}),
+      since: h.startedAt ?? h.at,
+    };
+  }
+  if (lastClose.cls === "superseded" && lastClose.supersededBy) {
+    const h = lastClose.supersededBy;
+    return {
+      pid: h.pid,
+      version: h.version ?? "0.25.0",
+      ...(h.tty ? { tty: h.tty } : {}),
+      ...(h.termProgram ? { termProgram: h.termProgram } : {}),
+      ...(h.cwd ? { cwd: h.cwd } : {}),
+    };
+  }
+  return undefined;
+}
+
 function connectionStatus(): Record<string, unknown> {
+  const holder = holderStatus();
   return {
     websocket: connectionState(),
     receiving_messages: wsConnected && authenticated,
@@ -1368,6 +1644,53 @@ function connectionStatus(): Record<string, unknown> {
     context_id: myContextId || null,
     channel_filter: CHANNELS_FILTER.length > 0 ? CHANNELS_FILTER : "all",
     ...(lastServerError ? { last_server_error: lastServerError } : {}),
+    ...(holder ? { holder } : {}),
+    // finding 1b: this process is connected and authenticated, but a takeover it
+    // attempted did not actually claim SESSION_KEY — someone else still holds the
+    // stable context id.
+    ...(supersedeIneffective ? { supersede_ineffective: true } : {}),
+  };
+}
+
+/** RFC-017 D9/P8: `other_processes` — every OTHER live Bridge process on this machine,
+ * shaped down to what a person deciding "which window" needs; the record's own `format`
+ * and `software` fields are proc-registry's business, not `status`'s. */
+function otherProcessesStatus(): Array<Record<string, unknown>> {
+  return listProcs(STATE_DIR, process.pid).map((p) => ({
+    pid: p.pid,
+    version: p.version,
+    state: p.state,
+    tty: p.tty,
+    termProgram: p.termProgram,
+    cwd: p.cwd,
+    sessionKey: p.sessionKey,
+    startedAt: p.startedAt,
+    // finding 11d: false means `ps`/procStart could not confirm this pid is still the
+    // same process (e.g. Windows, or `ps` off PATH) — listed, never asserted as fact.
+    verified: p.verified,
+  }));
+}
+
+/** RFC-017 D5/D9/P8: this build's own update-smoothness snapshot — version identity,
+ * the server's advertised minimum/recommended (from the last `authenticated` frame),
+ * this copy's staleness (D7), and every other window on the box (D2). Kept out of
+ * `connectionStatus()` on purpose: that one is the SOCKET's business (mirrored by the
+ * standby/superseded notices), this one is the PROCESS's. */
+function updateStatus(): Record<string, unknown> {
+  return {
+    version: PLUGIN_VERSION,
+    installed_version: findInstalledVersion() ?? null,
+    stale_since: staleSince !== null ? new Date(staleSince).toISOString() : null,
+    server_versions: serverVersions
+      ? {
+          minimum: serverVersions.minimum,
+          ...(serverVersions.recommended ? { recommended: serverVersions.recommended } : {}),
+          ...(serverVersions.pending_minimum ? { pending_minimum: serverVersions.pending_minimum } : {}),
+          ...(serverVersions.minimum_from ? { minimum_from: serverVersions.minimum_from } : {}),
+        }
+      : null,
+    advice: serverVersions?.advice ?? null,
+    other_processes: otherProcessesStatus(),
   };
 }
 
@@ -1391,6 +1714,30 @@ function handleWsMessage(data: any): void {
           mySendToken = "";
         }
         myContextId = newContextId;
+        // finding 1b: did a takeover we just attempted actually claim OUR session key?
+        // An ineligible grant, a pre-017 server (which ignores `supersede` entirely), or
+        // a lost race all land here as "authenticated, but renamed" — the plugin keeps
+        // working, it just is not the stable context id any more. Tell the model once;
+        // `status` keeps showing it until a later attempt DOES claim SESSION_KEY.
+        if (lastAuthCarriedSupersede) {
+          if (newContextId && newContextId !== SESSION_KEY) {
+            supersedeIneffective = true;
+            process.stderr.write(
+              `bridge channel: supersede did not claim the session key (authenticated as context ${newContextId}, expected ${SESSION_KEY})\n`
+            );
+            if (!notifiedSupersedeIneffective) {
+              notifiedSupersedeIneffective = true;
+              notifyModel(
+                "Bridge is connected but another window still holds this session's id — /bridge:update to see windows",
+                "status"
+              );
+            }
+          } else if (newContextId === SESSION_KEY) {
+            supersedeIneffective = false;
+            notifiedSupersedeIneffective = false;
+          }
+        }
+        lastAuthCarriedSupersede = false;
       }
       // Present only when the server just MINTED it — an existing context's
       // credential is never re-disclosed, so a reconnect that PROVED ownership
@@ -1399,7 +1746,13 @@ function handleWsMessage(data: any): void {
       if (typeof data.data?.sendToken === "string" && data.data.sendToken) {
         mySendToken = data.data.sendToken;
       }
+      // RFC-017 D5/P6: absent against a pre-017 server — noteServerAdvice no-ops on undefined.
+      noteServerAdvice(data.data?.client);
       authenticated = true;
+      // finding 11b: "connected" means an authenticated socket, not merely having won
+      // the local lock (connectUnlessDuplicate no longer sets it) — this is the one
+      // place a process's proc-registry state actually becomes "connected".
+      updateProcState(STATE_DIR, process.pid, "connected");
       lastServerError = "";
       // Backoff resets only here — a completed auth round-trip is the only
       // proof the connection is actually usable.
@@ -2283,13 +2636,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "connect",
       description:
-        "Connect this session to Bridge. Idempotent — calling it while already connected is a no-op on the socket. Persists across restarts until disconnect is called. Optionally set a display label at the same time (applied before the connect handshake, so the very first auth frame already carries it).",
+        "Connect this session to Bridge. Idempotent — calling it while already connected is a no-op on the socket, EXCEPT takeover:true against a connection that is up but did not actually claim this session's id, which reopens the socket to retry. Persists across restarts until disconnect is called. Optionally set a display label at the same time (applied before the connect handshake, so the very first auth frame already carries it). Pass takeover:true to claim the session lock from another window of this session (equal-or-newer, or a window that superseded this one) — the other window is told and stops.",
       inputSchema: {
         type: "object",
         properties: {
           label: {
             type: "string",
             description: "Optional display name to set at connect time.",
+          },
+          takeover: {
+            type: "boolean",
+            description: "Claim the session lock from another window, even one running an equal or newer plugin version, or the one that superseded this window.",
           },
         },
       },
@@ -2332,7 +2689,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "status",
       description:
-        "Show this session's Bridge connection/intent snapshot — configured, wantConnected (persisted intent), websocket state, and display label. Always answers, even when unconfigured or disconnected; unlike the other tools it is not gated.",
+        "Show this session's Bridge connection/intent snapshot — configured, wantConnected (persisted intent), websocket state, and display label. Also this build's own version, the installed version (if this copy is stale), the server's advertised minimum/recommended versions and advice, and every other Bridge process on this machine (other_processes). Always answers, even when unconfigured or disconnected; unlike the other tools it is not gated.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -3231,6 +3588,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // before the auth frame below is even built.
         const label = String(args.label ?? "").trim();
         if (label) persistLabel(label);
+        // RFC-017 D3: the ONE way a superseded window resumes. Clearing it here (an
+        // explicit person action) is what lets connectUnlessDuplicate proceed at all —
+        // its own guard refuses every automatic path.
+        const takeover = args.takeover === true;
+        if (takeover) superseded = false;
 
         wantConnected = true;
         // Mark BEFORE awaiting resolution below: this must win over the
@@ -3255,7 +3617,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // slow 4001/4003/4007 schedules and a revoked token's stop. Without
         // clearing the timer, the pending retry would ALSO fire and open a
         // second socket over the one this call just opened.
-        if (!(wsConnected && authenticated)) {
+        // finding 7: the ONE exception to "already open is a no-op" — a PRIOR
+        // takeover attempt left this socket connected but NOT holding SESSION_KEY
+        // (supersede_ineffective), so an explicit retry must reopen the socket
+        // rather than report "connected" and do nothing.
+        const forceRetake = takeover && supersedeIneffective;
+        if (!(wsConnected && authenticated) || forceRetake) {
+          // finding 4 (prior round): a PLAIN connect (no takeover) cannot resume a
+          // superseded window — connectUnlessDuplicate's own guard refuses it
+          // outright, so claiming "connecting" here would be dishonest: nothing is
+          // about to happen. `takeover` already cleared `superseded` above, so this
+          // only fires for the plain case.
+          if (superseded) {
+            return {
+              content: [
+                { type: "text", text: "another window took over this session — /bridge:connect takeover to move it back" },
+              ],
+            };
+          }
           if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
@@ -3266,7 +3645,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           // and a pending watch must not ALSO reconnect over this attempt.
           resetRefusalEpisode();
           remintedAfter4001 = false;
-          connectUnlessDuplicate();
+          if (forceRetake) {
+            // Already connected — detach and close the existing socket first (same
+            // idiom as restartConnection()): resets the observable state so the
+            // "connecting" reply below is honest, and connectWs() then opens a
+            // genuinely fresh socket rather than reauthing the still-ineffective one.
+            const old = ws;
+            ws = null;
+            wsConnected = false;
+            authenticated = false;
+            try { old?.close(); } catch {}
+          }
+          connectUnlessDuplicate({ takeover });
         }
         return {
           content: [
@@ -3315,6 +3705,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               text: JSON.stringify(
                 {
                   ...connectionStatus(),
+                  ...updateStatus(),
                   wantConnected,
                   configured: !creds.configError(),
                   auth: creds.status(),
@@ -3381,7 +3772,8 @@ await mcp.connect(new StdioServerTransport());
 // It stays up serving tools and retries, so a holder that dies or shuts down
 // hands over rather than stranding the session.
 const LOCK_DIR = join(STATE_DIR, "locks");
-const LOCK_RETRY_MS = 30_000;
+/** TEST-ONLY override (ms); default 30 s. */
+const LOCK_RETRY_MS = testKnob("BRIDGE_TEST_LOCK_RETRY_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
 // A holder renews while it lives, so this only expires a process that is alive
 // but wedged. Generous against a renew interval of 30s: a reconnect loop is a
 // legitimate holder and must not be evicted mid-backoff.
@@ -3391,11 +3783,56 @@ function lockPathFor(key: string): string {
   return join(LOCK_DIR, `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.lock`);
 }
 
-type LockRecord = { pid: number; procStart: string; sessionKey: string; at: string };
+/** RFC-017 D3/D8: the lock record's own format. Stays 0 — the RFC-017 identity fields
+ * (software/version/claudePid/tty/termProgram/cwd/startedAt) are purely additive on top
+ * of 0.25's implicit, field-less shape (pid/procStart/sessionKey/at only, pinned by
+ * test/fixtures/v025/locks): a 0.25 reader ignores the extra keys, and its lock RENEWAL
+ * round-trips whatever is currently on disk (RFC-017 §3.1: "B's lock renewal spreads the
+ * file it reads"), which is exactly what lets a takeover survive a 0.25 sibling's next
+ * renew. D8: "format is bumped only when an older reader would misread the file —
+ * additive fields never bump it," so this is 0, not 1.
+ */
+const LOCK_RECORD_FORMAT = 0;
+
+type LockRecord = {
+  pid: number;
+  procStart: string;
+  sessionKey: string;
+  at: string;
+  format?: number;
+  software?: string;
+  version?: string;
+  claudePid?: number | null;
+  tty?: string;
+  termProgram?: string;
+  cwd?: string;
+  startedAt?: string;
+};
 
 let lockHeld = false;
 let lockRenewTimer: ReturnType<typeof setInterval> | null = null;
 let lockRetryTimer: ReturnType<typeof setTimeout> | null = null;
+/** RFC-017 D3: set once this session's socket is closed 4008 "session superseded".
+ * `notifyStandby`'s "once per holder" gate (below) is keyed separately. */
+let superseded = false;
+/** finding 1b: whether the auth frame currently in flight (or the last one sent) carried
+ * `supersede: true` — set in connectWs right where the frame is sent, consumed by the
+ * very next "authenticated" reply to judge whether the takeover actually claimed this
+ * session's context id. */
+let lastAuthCarriedSupersede = false;
+/** finding 1b: a takeover we attempted did NOT claim this session's context id (an
+ * ineligible grant, a pre-017 server, or a race) — `status` and a one-time model notice
+ * both read this. Cleared the moment a later "authenticated" frame DOES carry our own
+ * SESSION_KEY as its context id. */
+let supersedeIneffective = false;
+let notifiedSupersedeIneffective = false;
+/** "once per episode" gate for the standby notice (C2) — keyed by the holder's identity,
+ * so a DIFFERENT holder (the common case: the process that superseded us) gets its own
+ * notice, but the SAME holder is not renotified on every 30s retry. */
+let notifiedStandbyFor: string | null = null;
+/** The live holder while THIS process stands by — `status` shows it (D3/D9's "status
+ * says the same"), cleared the moment this process wins the lock or disconnects. */
+let standbyHolder: LockRecord | null = null;
 
 /** Is the recorded holder a live process, and still the SAME process? */
 function holderIsLive(rec: LockRecord, lockFile: string): boolean {
@@ -3412,62 +3849,204 @@ function holderIsLive(rec: LockRecord, lockFile: string): boolean {
   return true;
 }
 
-function writeLockExclusive(lockFile: string): boolean {
-  const rec: LockRecord = {
+/** Unreadable or truncated reads as `null` — treated as stale/absent, never as a holder. */
+function readLockRecord(lockFile: string): LockRecord | null {
+  try {
+    return JSON.parse(readFileSync(lockFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** finding 8: the read that decides whether the stale-acquisition path unlinks the
+ * file. An empty or unparseable read here can be a genuine race with another
+ * process's O_EXCL create (not atomic against a concurrent reader) rather than real
+ * corruption — retried once, briefly, before this process commits to treating the
+ * record as stale. Used ONLY for that one decision; every other reader (renewal,
+ * confirm-ownership, status) stays a single, non-blocking `readLockRecord`. */
+function readLockRecordForAcquire(lockFile: string): LockRecord | null {
+  const rec = readLockRecord(lockFile);
+  if (rec !== null) return rec;
+  Bun.sleepSync(20);
+  return readLockRecord(lockFile);
+}
+
+/** This process's own record — RFC-017 D3's identity fields, reusing `myIdentity()`
+ * (the same values the proc registry write uses) and `PROCESS_STARTED_AT`. */
+function buildLockRecord(): LockRecord {
+  const id = myIdentity();
+  return {
+    format: LOCK_RECORD_FORMAT,
     pid: process.pid,
     procStart: procStartOf(process.pid),
     sessionKey: SESSION_KEY,
     at: new Date().toISOString(),
+    software: "bridge-claude-plugin",
+    version: PLUGIN_VERSION,
+    claudePid: id.claudePid,
+    tty: id.tty,
+    termProgram: id.termProgram,
+    cwd: id.cwd,
+    startedAt: PROCESS_STARTED_AT,
   };
+}
+
+function writeLockExclusive(lockFile: string): boolean {
   try {
-    writeFileSync(lockFile, JSON.stringify(rec), { flag: "wx" });
+    writeFileSync(lockFile, JSON.stringify(buildLockRecord()), { flag: "wx", mode: 0o600 });
     return true;
   } catch {
     return false;
   }
 }
 
-/** True if this process may open a Bridge socket for SESSION_KEY. */
-function acquireSessionLock(): boolean {
+/** RFC-017 D3/finding 5: overwrite a LIVE holder's record with ours — the takeover
+ * itself, via tmp + rename (0600), same idiom as every other atomic write here. Never
+ * `unlinkSync`s the live file directly (that invariant is unchanged): this is a plain
+ * overwrite, not a remove-then-recreate. */
+function writeLockTakeover(lockFile: string): void {
+  try {
+    const tmp = `${lockFile}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(buildLockRecord()), { mode: 0o600 });
+    renameSync(tmp, lockFile);
+  } catch {}
+}
+
+/**
+ * THE OWNERSHIP RULE (RFC-017 D3, hardened by findings 1-3, 2026-09-27 re-review): a
+ * process that HOLDS the session lock (`lockHeld`) and finds the record naming a
+ * DIFFERENT, LIVE pid has LOST — whoever overwrote a live record already won the
+ * decision (the auto newer-wins path, or a person's explicit takeover). It NEVER
+ * re-decides by comparing versions; `decideLock` only ever runs for a process that
+ * does NOT currently hold the lock (see the `lockHeld` check in acquireSessionLock).
+ * Shared by every point a holder re-reads the lock and can discover this: the
+ * renewal tick, the reconnect gate (acquireSessionLock), and the pre-send check in
+ * connectWs's `open` handler.
+ */
+function handleLockLost(rec: LockRecord): void {
+  if (lockRenewTimer) { clearInterval(lockRenewTimer); lockRenewTimer = null; }
+  lockHeld = false;
+  superseded = true;
+  const sock = ws;
+  if (sock) {
+    // Detach FIRST — the socket's own "close" listener no-ops once `ws !== sock`, so
+    // this is never mistaken for an ordinary drop (which would classify the close and
+    // schedule a plain reconnect instead of staying superseded).
+    ws = null;
+    wsConnected = false;
+    authenticated = false;
+    try { sock.close(); } catch {}
+  }
+  // Stop minting for a token this window has no legitimate use for any more — same
+  // reasoning as the server-driven 4008 "session superseded" path (finding 11a).
+  creds.invalidateAccess();
+  updateProcState(STATE_DIR, process.pid, "superseded");
+  // finding 2 (:1226 note): never let supersededBy name OURSELVES.
+  const holder: HolderIdentity | undefined =
+    rec.pid === process.pid
+      ? undefined
+      : { pid: rec.pid, version: rec.version, tty: rec.tty, termProgram: rec.termProgram, cwd: rec.cwd };
+  lastClose = { cls: "superseded", ...(holder ? { supersededBy: holder } : {}) };
+  process.stderr.write(
+    `bridge channel: session lock LOST for ${SESSION_KEY} to pid ${rec.pid}${rec.version ? ` (v${rec.version})` : ""} — this window is now superseded\n`
+  );
+  notifyModel(
+    `⚠️ Bridge disconnected this session: ${describeClose("superseded", undefined, undefined, { supersededBy: holder, myVersion: PLUGIN_VERSION })}`,
+    "error"
+  );
+}
+
+/** RFC-017 D3: who wins this session key — acquire (no live holder), takeover (ours is
+ * newer, or `opts.takeover`), standby, or `lost` (THE OWNERSHIP RULE above: this process
+ * already held it and a different live pid has since won — handleLockLost did
+ * everything needed, and the caller has nothing further to do). Every existing lock
+ * invariant is unchanged: fail open, O_EXCL for a fresh lock, confirm-ownership
+ * re-read, never `unlinkSync` a live holder's record (a takeover overwrites it in
+ * place instead, see writeLockTakeover). */
+function acquireSessionLock(opts: { takeover?: boolean } = {}): LockDecision | "lost" {
   const lockFile = lockPathFor(SESSION_KEY);
   try {
-    mkdirSync(LOCK_DIR, { recursive: true });
+    mkdirSync(LOCK_DIR, { recursive: true, mode: 0o700 });
+    let outcome: LockDecision = "acquire";
     if (!writeLockExclusive(lockFile)) {
-      let rec: LockRecord | null = null;
-      try {
-        rec = JSON.parse(readFileSync(lockFile, "utf8"));
-      } catch {
-        rec = null; // unreadable or truncated -> treat as stale, not as a holder
+      const rec = readLockRecordForAcquire(lockFile);
+      if (rec && rec.pid === process.pid) {
+        lockHeld = true;
+        return "acquire"; // already ours
       }
-      if (rec && rec.pid !== process.pid && holderIsLive(rec, lockFile)) return false;
-      if (rec && rec.pid === process.pid) { lockHeld = true; return true; } // already ours
-      // Stale. Clear it and take it.
-      try { unlinkSync(lockFile); } catch {}
-      if (!writeLockExclusive(lockFile)) return false; // a sibling got there first
+      if (rec && holderIsLive(rec, lockFile)) {
+        if (lockHeld) {
+          // THE OWNERSHIP RULE: we believed we held this key and a DIFFERENT live
+          // process now sits at the path — it already won (auto or explicit
+          // takeover). Never re-decide by version from here.
+          handleLockLost(rec);
+          return "lost";
+        }
+        const decision = decideLock({ version: rec.version }, { version: PLUGIN_VERSION }, opts);
+        if (decision === "standby") {
+          // finding 2: a live process that is NOT us genuinely holds this key — drop any
+          // stale lockHeld/renew state of our own so the NEXT reconnect re-decides from
+          // scratch through this same gate, instead of trusting memory that no longer
+          // matches the file (e.g. a reconnect timer armed before we lost a race).
+          if (lockRenewTimer) { clearInterval(lockRenewTimer); lockRenewTimer = null; }
+          lockHeld = false;
+          return "standby";
+        }
+        outcome = "takeover";
+        writeLockTakeover(lockFile);
+      } else {
+        // Stale (dead holder, pid reuse, or an unreadable/truncated record). Clear it and take it.
+        try { unlinkSync(lockFile); } catch {}
+        if (!writeLockExclusive(lockFile)) return "standby"; // a sibling got there first
+      }
     }
     // CONFIRM OWNERSHIP. Two processes can both find the same stale lock, both
     // unlink, and both create — the second unlink removes the first's fresh file.
     // Re-reading settles it: the file holds exactly ONE pid, so at most one
     // process can see its own, and whoever wrote last is that one. Without this
     // the stale path silently degrades to the duplicate it is meant to prevent.
-    try {
-      const back: LockRecord = JSON.parse(readFileSync(lockFile, "utf8"));
-      if (back.pid !== process.pid) return false;
-    } catch {
-      // Cannot confirm: fail OPEN. Connecting twice beats not connecting.
-    }
+    // finding 3: readLockRecord() itself never throws (unreadable/corrupt both read as
+    // `null`), so an unreadable readback fails OPEN here too — connecting twice beats not
+    // connecting — and only a record that is readable AND names someone else's pid stands
+    // this process down.
+    const back = readLockRecord(lockFile);
+    if (back && back.pid !== process.pid) return "standby";
     lockHeld = true;
     if (!lockRenewTimer) {
       lockRenewTimer = setInterval(() => {
-        // Renewal is an mtime touch, and it REWRITES rather than utimes so a
-        // holder that somehow lost its file re-establishes it.
-        try { writeFileSync(lockFile, JSON.stringify({ ...JSON.parse(readFileSync(lockFile, "utf8")), at: new Date().toISOString() })); } catch {}
+        // Renewal is an mtime touch, and it REWRITES (tmp + rename, 0600) rather than
+        // utimes so a holder that somehow lost its file re-establishes it — but ONLY when
+        // the file still names US (finding 5): if a takeover (or a stale-path race)
+        // replaced it with someone else's record, renewing would spread OUR `at` over
+        // THEIR file. Stop renewing what is no longer ours and let the gate re-decide.
+        try {
+          const current = JSON.parse(readFileSync(lockFile, "utf8"));
+          if (current.pid !== process.pid) {
+            if (lockRenewTimer) { clearInterval(lockRenewTimer); lockRenewTimer = null; }
+            lockHeld = false;
+            // finding 3 (T2): a LIVE stranger at the path already won the decision —
+            // THE OWNERSHIP RULE applies here exactly as it does in acquireSessionLock,
+            // and for the same reason: this socket may still be up and delivering, so
+            // waiting for a 4008 that may never arrive would risk two windows both
+            // thinking they are live. Only a dead/unreadable name (pid reuse, a
+            // stale-path race) reclaims the key via the normal gate below.
+            if (holderIsLive(current, lockFile)) {
+              handleLockLost(current);
+              return;
+            }
+            connectUnlessDuplicate();
+            return;
+          }
+          const tmp = `${lockFile}.${process.pid}.tmp`;
+          writeFileSync(tmp, JSON.stringify({ ...current, at: new Date().toISOString() }), { mode: 0o600 });
+          renameSync(tmp, lockFile);
+        } catch {}
       }, LOCK_RETRY_MS);
       lockRenewTimer.unref?.();
     }
-    return true;
+    return outcome;
   } catch {
-    return true; // the lock mechanism itself must never take Bridge down
+    return "acquire"; // the lock mechanism itself must never take Bridge down
   }
 }
 
@@ -3477,21 +4056,45 @@ function releaseSessionLock(): void {
   lockHeld = false;
   const lockFile = lockPathFor(SESSION_KEY);
   try {
-    // Only remove OUR lock — a stale-path race may have handed it to a sibling,
-    // and unlinking theirs on our way out would let a third instance in.
+    // Only remove OUR lock — a stale-path race (or a takeover that superseded us) may
+    // have handed it to someone else, and unlinking theirs on our way out would let a
+    // third instance in.
     const rec: LockRecord = JSON.parse(readFileSync(lockFile, "utf8"));
     if (rec.pid === process.pid) unlinkSync(lockFile);
   } catch {}
 }
 
+/** RFC-017 D3/C2: tell the model once per distinct holder who is standing in this
+ * window's way — pid, version, tty, terminal, cwd, since. Mirrors notifyConnectionRefused's
+ * "once per episode" shape, keyed by the holder rather than by a close code. */
+function notifyStandby(rec: LockRecord): void {
+  // finding 9: pid + procStart, NEVER `at` — `at` is the holder's own lock-RENEWAL
+  // timestamp, which changes every 30s while it lives. Keying on it would make every
+  // 30s standby retry (this function is re-invoked from connectUnlessDuplicate's own
+  // lockRetryTimer loop) see a "new" holder each time the file re-reads with a fresher
+  // `at`, defeating "once per distinct holder" — procStart is stable for the holder's
+  // whole lifetime and is present on every lock record, 0.25's included.
+  const key = `${rec.pid}@${rec.procStart}`;
+  if (notifiedStandbyFor === key) return;
+  notifiedStandbyFor = key;
+  const holder: HolderIdentity = { pid: rec.pid, version: rec.version, tty: rec.tty, termProgram: rec.termProgram, cwd: rec.cwd };
+  const since = rec.startedAt ?? rec.at;
+  notifyModel(
+    `Bridge is connected in another window of this session: pid ${holder.pid}, ${holder.version ?? "0.25.0"}` +
+      `${holder.tty ? `, ${holder.tty}` : ""}${holder.termProgram ? ` (${holder.termProgram})` : ""}${holder.cwd ? `, ${holder.cwd}` : ""}` +
+      `, since ${since}. This window stands by. /bridge:connect takeover moves it here.`,
+    "status"
+  );
+}
+
 /**
- * Connect, or stand by until the holder goes away.
+ * Connect, or stand by until the holder goes away (or a newer/explicit takeover wins).
  *
  * Standing by rather than exiting is deliberate: the MCP host treats a server
  * that exits as a failure (-32000) and does not respawn it, so exiting would
  * turn a duplicate into a broken session the moment the holder shut down first.
  */
-function connectUnlessDuplicate(): void {
+function connectUnlessDuplicate(opts: { takeover?: boolean } = {}): void {
   // This is its own self-recursion (via lockRetryTimer below), NOT a call
   // routed through scheduleReconnect() — so scheduleReconnect()'s own
   // `!wantConnected` guard never sees these retries. Without this guard, a
@@ -3502,7 +4105,17 @@ function connectUnlessDuplicate(): void {
   // makes a stray fire inert regardless.
   if (!wantConnected) return;
   if (shuttingDown) return;
-  if (acquireSessionLock()) {
+  // RFC-017 D3: a superseded process NEVER auto-reconnects — neither the lock retry
+  // timer below nor scheduleReconnect (whose own reconnectDelay is already null for the
+  // "superseded" close class). Only a person acting — `connect {takeover: true}`, or a
+  // `disconnect` (which also clears it, finding 6) — clears `superseded` before ever
+  // reaching this function again.
+  if (superseded && !opts.takeover) return;
+  const decision = acquireSessionLock(opts);
+  // THE OWNERSHIP RULE: this process held the lock and just discovered it lost — handleLockLost
+  // already did everything (closed our socket, marked superseded, notified). Nothing left to do.
+  if (decision === "lost") return;
+  if (decision !== "standby") {
     if (lockRetryTimer) { clearTimeout(lockRetryTimer); lockRetryTimer = null; }
     // Say which process owns the key. Without this there is no way to tell two
     // instances apart from outside — which is most of why the duplicate cost an
@@ -3510,18 +4123,42 @@ function connectUnlessDuplicate(): void {
     // visible on the SERVER while the cause was a second local process nobody
     // could see. An operator greps for this line; so does the test.
     process.stderr.write(
-      `bridge channel: session lock acquired for ${SESSION_KEY} (pid ${process.pid})\n`
+      decision === "takeover"
+        ? `bridge channel: session lock TAKEN OVER for ${SESSION_KEY} (pid ${process.pid}, v${PLUGIN_VERSION})\n`
+        : `bridge channel: session lock acquired for ${SESSION_KEY} (pid ${process.pid})\n`
     );
+    // finding 11b: winning the lock is not the socket being up — "connected" is set only
+    // once the "authenticated" frame actually arrives (handleWsMessage). This just clears
+    // whatever this process's OWN prior state was (e.g. a stale "standby" from before it
+    // won a later race).
+    updateProcState(STATE_DIR, process.pid, "disconnected");
+    standbyHolder = null;
     connectWs();
     return;
   }
+  updateProcState(STATE_DIR, process.pid, "standby");
+  const holder = readLockRecord(lockPathFor(SESSION_KEY));
+  standbyHolder = holder;
+  if (holder) notifyStandby(holder);
   process.stderr.write(
     `bridge channel: DUPLICATE INSTANCE — another process on this box already holds session key ` +
       `${SESSION_KEY}. Not connecting; standing by and retrying every ${LOCK_RETRY_MS / 1000}s. ` +
       `This session is loaded twice (marketplace plugin + a user-scope MCP entry or ` +
       `--dangerously-load-development-channels); remove one.\n`
   );
-  lockRetryTimer = setTimeout(connectUnlessDuplicate, LOCK_RETRY_MS);
+  // finding 4 (2026-09-27 re-review): retry with NO sticky takeover. `opts.takeover` is
+  // the person's ONE-TIME choice for THIS attempt, not a standing instruction — the
+  // comment above already said so, but the code still closed over `opts` itself, so an
+  // attempt that reached "standby" WITH `takeover: true` (the confirm-ownership race
+  // just above can do this even though decideLock always returns "takeover" for an
+  // explicit one) kept re-asserting it on every future 30s retry, auto-taking-over from
+  // whoever legitimately holds the key by then — even a newer process with every right
+  // to it. The retry must go through the gate exactly like a fresh, non-takeover
+  // contender (initial connect, standby retry). Also clear any timer already armed
+  // (belt and suspenders against this being re-entered while one is still pending)
+  // before arming a fresh one.
+  if (lockRetryTimer) { clearTimeout(lockRetryTimer); lockRetryTimer = null; }
+  lockRetryTimer = setTimeout(() => connectUnlessDuplicate(), LOCK_RETRY_MS);
   lockRetryTimer.unref?.();
 }
 
@@ -3534,6 +4171,7 @@ function shutdown(): void {
   if (livenessTimer) clearInterval(livenessTimer);
   if (lockRetryTimer) clearTimeout(lockRetryTimer);
   releaseSessionLock();
+  removeProc(STATE_DIR, process.pid); // RFC-017 D2
   try {
     ws?.close();
   } catch {}
@@ -3593,6 +4231,31 @@ sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), C
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
 );
+
+// RFC-017 D2: register this process so a person (or a future `status` / /bridge:update)
+// can answer "where is the other window" — the question the RFC-016 rollout could not
+// answer. `myIdentity()` reuses the SAME ancestry walk resolveSessionKey() already did;
+// re-running it here (rather than threading the pid through) costs a few more `ps` calls
+// at startup only, and the session lock record (P3) reuses this exact same identity.
+// Initial `state` is "disconnected": acquireSessionLock() below decides connected vs
+// standby, and updates it. Best-effort: writeProc() never throws.
+{
+  const id = myIdentity();
+  const proc: ProcInfo = {
+    pid: process.pid,
+    procStart: procStartOf(process.pid),
+    software: "bridge-claude-plugin",
+    version: PLUGIN_VERSION,
+    sessionKey: SESSION_KEY,
+    profile: "error" in PROFILE ? "(invalid)" : profileLabel(PROFILE),
+    claudePid: id.claudePid,
+    tty: id.tty,
+    termProgram: id.termProgram,
+    cwd: id.cwd,
+    state: "disconnected",
+  };
+  writeProc(STATE_DIR, proc);
+}
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
 // A 0.23 / 0.24 profile (RFC-014 files) is retired first, so it reads "run

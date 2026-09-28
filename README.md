@@ -123,6 +123,24 @@ rather than presenting the tail of the channel as a resumption.
 | `/bridge:login` | Sign this machine in (browser, or a code when headless). |
 | `/bridge:logout` | Sign this machine out and revoke its access. |
 | `/bridge:status` | Show connection state, channels, and agents. |
+| `/bridge:update` | Show this window's plugin version vs. what's installed and what Bridge recommends/requires, and every other Bridge window on this machine — plus the one next step. |
+
+## Updating
+
+1. **Enable auto-update for the marketplace** (off by default for third-party
+   marketplaces): `/plugin` → Marketplaces → `bored-marketplace` → Enable
+   auto-update. This only updates the files on disk — a window already running
+   keeps using the version it started with until it reloads.
+2. **`/reload-plugins`** in each window to pick up what's now on disk (this
+   restarts Bridge in that window only).
+3. **`/bridge:update`** answers "is this window current, and what should I do"
+   at any time — this window's version vs. what's installed and what Bridge
+   itself recommends/requires, plus every other Bridge window on the machine.
+   Bridge also tells you on its own: once a copy of the plugin's files has been
+   superseded on disk (Claude Code deletes them ~14 days later), the stale
+   window gets a notice, repeated daily and escalating as the deletion date
+   nears; and once the Bridge server recommends or requires a newer version,
+   every window is told once.
 
 ## How it works
 

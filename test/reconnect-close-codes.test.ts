@@ -81,7 +81,7 @@ function startStub(firstClose: Close | null, opts: { channels429?: boolean; clos
 }
 
 async function withPlugin<T>(
-  stub: ReturnType<typeof startStub>,
+  stub: { port: number; stop(): unknown },
   fn: (client: Client, notices: () => string[]) => Promise<T>
 ): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "rcc-"));
@@ -180,6 +180,58 @@ describe("close codes", () => {
     });
   }, 40_000);
 
+  test("RFC-017 D3: 4008 'session superseded' stops, a plain /bridge:connect does NOT retry, only takeover:true does", async () => {
+    const stub = startStub({ code: 4008, reason: "session superseded: a newer Bridge plugin took over in another window of this session" });
+    await withPlugin(stub, async (client, notices) => {
+      expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
+      await Bun.sleep(300);
+      const s = await status(client);
+      expect(s.websocket).toContain("/bridge:connect takeover");
+      expect(s.websocket).not.toContain("reconnect attempt");
+      expect(notices().some((c) => c.includes("Bridge disconnected this session") && c.includes("/bridge:connect takeover"))).toBe(true);
+      // A plain connect (no takeover) must NOT mint/auth again — the whole point of D3's
+      // "never auto-reconnects, only takeover resumes". Finding 4: it must also say so
+      // honestly rather than claim "connecting", which would never actually happen.
+      const plain: any = await client.callTool({ name: "connect", arguments: {} });
+      expect(plain.content[0].text).toContain("/bridge:connect takeover");
+      expect(plain.content[0].text).not.toBe("connecting");
+      await Bun.sleep(1_000);
+      expect(stub.auths()).toBe(1);
+      // takeover:true is the ONE escape hatch.
+      await client.callTool({ name: "connect", arguments: { takeover: true } });
+      expect(await until(() => stub.auths() >= 2, 5_000)).toBe(true);
+    });
+  }, 40_000);
+
+  test("RFC-017 D5/D6: 4008 'client too old' stops (never reconnects on its own), and says the update instruction", async () => {
+    const stub = startStub({ code: 4008, reason: "client too old: run /plugin update bridge, then /reload-plugins" });
+    await withPlugin(stub, async (client) => {
+      expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
+      await Bun.sleep(300);
+      const s = await status(client);
+      expect(s.websocket).toContain("/plugin update bridge");
+      expect(s.websocket).toContain("/reload-plugins");
+      expect(s.websocket).not.toContain("reconnect attempt");
+      // Unlike "superseded", too-old is not gated by the extra `superseded` flag — a
+      // plain /bridge:connect is free to try again (and would be refused again by a
+      // real server; the stub here just accepts every later auth, same as the
+      // existing 4008 token-revoked test above).
+      await client.callTool({ name: "connect", arguments: {} });
+      expect(await until(() => stub.auths() >= 2, 5_000)).toBe(true);
+    });
+  }, 40_000);
+
+  test("RFC-017 D6: 'client version withdrawn' (blocked) maps to the SAME too-old stop, not a new class", async () => {
+    const stub = startStub({ code: 4008, reason: "client version withdrawn: run /plugin update bridge, then /reload-plugins" });
+    await withPlugin(stub, async (client) => {
+      expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
+      await Bun.sleep(300);
+      const s = await status(client);
+      expect(s.websocket).toContain("/plugin update bridge");
+      expect(s.websocket).not.toContain("reconnect attempt");
+    });
+  }, 40_000);
+
   test("/bridge:connect during a backoff cancels the pending retry — one socket, not two", async () => {
     // 4007, so the pending retry is 15–30s out: a wide, race-free window.
     const stub = startStub({ code: 4007, reason: "Too many sessions" });
@@ -204,6 +256,93 @@ describe("close codes", () => {
       expect(stub.maxOpen()).toBe(1);
     });
   }, 60_000);
+});
+
+/**
+ * RFC-017 D3: refuses auth #1 with "session superseded", accepts every later one, and
+ * hands the caller a way to force-close the socket that authenticated — distinct from
+ * `startStub` above, which can only refuse by AUTH NUMBER and never touches a socket
+ * that already got in.
+ */
+function startTakeoverThenDropStub() {
+  let auths = 0;
+  let liveSocket: any = null;
+  let onAuthenticated: (() => void) | null = null;
+  const agentAuth = createAgentAuthRoutes();
+  agentAuth.addEnrolmentKey(ENROLMENT_KEY);
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(req, srv) {
+      const auth = await agentAuth.handle(req);
+      if (auth) return auth;
+      if (srv.upgrade(req)) return;
+      return Response.json([]);
+    },
+    websocket: {
+      message(ws, raw) {
+        let frame: any = {};
+        try { frame = JSON.parse(String(raw)); } catch { return; }
+        if (frame.type !== "auth") return;
+        auths++;
+        if (auths === 1) {
+          ws.close(4008, "session superseded: a newer Bridge plugin took over in another window of this session");
+          return;
+        }
+        liveSocket = ws;
+        ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "ctx" } }));
+        onAuthenticated?.();
+      },
+    },
+  });
+  return {
+    port: server.port!,
+    auths: () => auths,
+    onceAuthenticated: () => new Promise<void>((r) => (onAuthenticated = r)),
+    dropLiveSocket: (code: number, reason: string) => liveSocket?.close(code, reason),
+    stop: () => server.stop(true),
+  };
+}
+
+describe("RFC-017 D3: takeover then a later ordinary close", () => {
+  test("superseded -> connect takeover -> authenticated -> a later TRANSIENT close still reconnects on its own", async () => {
+    const stub = startTakeoverThenDropStub();
+    await withPlugin(stub, async (client) => {
+      // The stub refuses auth #1 with "session superseded" — same as the plugin
+      // reaching that state from a real live-holder takeover elsewhere.
+      expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
+      await Bun.sleep(300);
+      const stopped = await status(client);
+      expect(stopped.websocket).toContain("/bridge:connect takeover");
+
+      // The ONE way this window resumes (D3): an explicit takeover.
+      const authed = stub.onceAuthenticated();
+      await client.callTool({ name: "connect", arguments: { takeover: true } });
+      await authed;
+      await Bun.sleep(300);
+      expect((await status(client)).websocket).toBe("connected");
+
+      // Now an ordinary transient close (1011, "grant check failed" — nothing to do
+      // with supersession) — the plugin must reconnect on its own, same as any other
+      // live session. NOTE: this does NOT mutation-prove the connect tool's
+      // `if (takeover) superseded = false` — a transient close reconnects via
+      // scheduleReconnect()/connectWs() directly, which never reads `superseded` at
+      // all, so this test stays green even with that line deleted (checked by hand).
+      // That line's real job is downstream of THIS reconnect: it is what lets a LATER
+      // restartConnection() (a fresh /bridge:login, or the credential watch noticing
+      // files reappear — server.ts's `onLoggedIn` / `credentialWatch`) proceed at all;
+      // without it, `connectUnlessDuplicate()` from either path returns immediately
+      // because `superseded` is still stuck `true`. Kept as coverage for "a takeover
+      // survives an ordinary reconnect", a real behaviour worth pinning either way.
+      // (Mutation-proven separately: agent-login-e2e.test.ts "RFC-017 D3: after a
+      // takeover, the module-level `superseded` flag does not stay stuck…" drives an
+      // installation revoke + a re-login elsewhere through the credential watch, which
+      // DOES go through this exact `connectUnlessDuplicate()` no-takeover path.)
+      const authsBefore = stub.auths();
+      stub.dropLiveSocket(1011, "grant check failed");
+      expect(await until(() => stub.auths() > authsBefore, 5_000)).toBe(true);
+    });
+  }, 40_000);
 });
 
 describe("HTTP 429", () => {

@@ -21,6 +21,13 @@ describe("§3.3 error table → client action", () => {
     [e("invalid_dpop_proof"), { kind: "new_proof" }],
     [e("use_dpop_nonce"), { kind: "new_proof" }],
     [e("unsupported_grant_type"), { kind: "update_required" }],
+    // RFC-017 D5: this build itself is refused, at any grant. Both descriptions use the
+    // `<token>: <hint>` convention; the token alone decides — the hint after it never does.
+    [e("unauthorized_client", "client_too_old: bridge-claude-plugin >= 0.26.0 required — /plugin update bridge"), { kind: "too_old" }],
+    [e("unauthorized_client", "client_blocked: bridge-claude-plugin 0.25.3 is withdrawn — /plugin update bridge"), { kind: "too_old" }],
+    // An unauthorized_client this build does not recognise: an unlisted refusal, never a loop.
+    [e("unauthorized_client", "something_else"), { kind: "refused" }],
+    [e("unauthorized_client"), { kind: "refused" }],
     // Server-verified rows (bridge routes/agent-auth.ts + agent-credentials.ts), beyond the RFC table:
     // C6 — the same key can never pass, so it is NOT a "new proof" (the fresh-key retry happens before classification).
     [e("invalid_dpop_proof", "key_already_enrolled"), { kind: "refused" }],
@@ -111,6 +118,7 @@ describe("OAuthError brand (dual-package hazard)", () => {
         case "new_proof":
         case "update_required":
         case "rate_limited":
+        case "too_old":
         case "refused":
         case "transient":
         case "aborted":
