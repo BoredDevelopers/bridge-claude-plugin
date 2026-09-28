@@ -599,6 +599,41 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     expect(sent.map((b) => b.client_id)).toEqual(["bridge-openclaw", "bridge-openclaw", "bridge-openclaw"]);
   });
 
+  test("RFC-017 D5: software_id + software_version ride on EVERY grant (enrolment key, code, device, mint) when given", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const capture: FetchLike = async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body ?? "{}")));
+      return Response.json({ error: "invalid_grant" }, { status: 400 });
+    };
+    const tc = new TokenClient({ clock: new Clock(), clientId: "bridge-claude-plugin", fetch: capture, softwareId: "bridge-claude-plugin", softwareVersion: "0.26.0" });
+    const base = "http://127.0.0.1:9";
+    const meta = { issuer: `${base}/api/agent-auth`, token_endpoint: `${base}/api/agent-auth/token`, device_authorization_endpoint: `${base}/api/agent-auth/device_authorization` } as AuthMetadata;
+    const k = (await generateSoftwareKey()).signer;
+    await refused(tc.enrolWithKey(meta, k, { enrolmentKey: "ek", installationName: "t" }));
+    await refused(tc.exchangeCode(meta, k, { code: "c", verifier: "v".repeat(43), redirectUri: "http://127.0.0.1:1/cb" }));
+    await refused(tc.pollDeviceCode(meta, k, "dc"));
+    await refused(tc.mint(meta, k, { installationId: "i", joinState: "brg_js_0_x", attempt: "a".repeat(43), sessionKey: "s1", reconnect: false }));
+    expect(sent).toHaveLength(4);
+    for (const b of sent) {
+      expect(b.software_id).toBe("bridge-claude-plugin");
+      expect(b.software_version).toBe("0.26.0");
+    }
+  });
+
+  test("…and neither field is sent at all when the TokenClient was never given an identity (pre-017 shape, unchanged)", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const capture: FetchLike = async (_url, init) => {
+      sent.push(JSON.parse(String(init?.body ?? "{}")));
+      return Response.json({ error: "invalid_grant" }, { status: 400 });
+    };
+    const tc = new TokenClient({ clock: new Clock(), clientId: "bridge-claude-plugin", fetch: capture });
+    const k = (await generateSoftwareKey()).signer;
+    const meta = { issuer: "x", token_endpoint: "http://127.0.0.1:9/t", device_authorization_endpoint: "http://127.0.0.1:9/d" } as AuthMetadata;
+    await refused(tc.enrolWithKey(meta, k, { enrolmentKey: "ek", installationName: "t" }));
+    expect("software_id" in sent[0]!).toBe(false);
+    expect("software_version" in sent[0]!).toBe(false);
+  });
+
   test("discovery is cached PER CLIENT with a TTL; a failure is never cached", async () => {
     const stub = startAuthStub({ discoveryFail: 1 });
     stops.push(() => stub.stop());

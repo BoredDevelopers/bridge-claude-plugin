@@ -103,13 +103,6 @@ export type TokenAction =
   /** `unsupported_grant_type` / `rfc014_retired` / `dpop_proof_required`: plugin and server disagree on the protocol. */
   | { kind: "update_required" }
   | { kind: "rate_limited"; retryAfterS: number }
-  /**
-   * RFC-017 D5: `unauthorized_client` with a `client_too_old:` or `client_blocked:`
-   * description — this build itself is refused (below `minimum`, or individually
-   * `blocked`). Stop minting until the process restarts; keep the files (this is not a
-   * credential problem, so there is nothing to delete).
-   */
-  | { kind: "too_old" }
   /** A refusal the table does not name, or a non-transport throw: stop and show it, keep the files. */
   | { kind: "refused" }
   /** 5xx / network / timeout: retry later with the SAME attempt. */
@@ -137,13 +130,6 @@ export function classifyTokenError(e: unknown): TokenAction {
   if (e.status === 429) return { kind: "rate_limited", retryAfterS: retryAfter(e.retryAfterS) };
   if (e.status >= 500) return { kind: "transient" };
   switch (e.error) {
-    case "unauthorized_client":
-      // RFC-017 D5's `<token>: <hint>` convention, same shape as `rfc014_retired:` /
-      // `dpop_proof_required:` above. Any OTHER `unauthorized_client` description (a
-      // future refusal this build does not know) is an unlisted refusal: stop and show
-      // it, never loop — the same default every other unrecognised code here falls to.
-      if (e.description?.startsWith("client_too_old:") || e.description?.startsWith("client_blocked:")) return { kind: "too_old" };
-      return { kind: "refused" };
     case "invalid_client":
       if (isGoneReason(e.description)) return { kind: "installation_gone", reason: e.description };
       if (e.description === "assertion_invalid") return { kind: "clock" };

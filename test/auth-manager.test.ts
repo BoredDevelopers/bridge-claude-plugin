@@ -117,7 +117,16 @@ describe("mint (§3.3, §5.2)", () => {
     expect(seq(dir)).toBe(1);
     expect(readAttempt(dir)).toBeNull();
     for (const f of ["key.json", "state", "installation.json"]) expect(statSync(join(dir, f)).mode & 0o777).toBe(0o600);
-    expect(stub.stats.mintBodies[0]).toMatchObject({ grant_type: "client_credentials", session_key: "session-a", platform: "test-os", client_version: "9.9.9" });
+    expect(stub.stats.mintBodies[0]).toMatchObject({
+      grant_type: "client_credentials",
+      session_key: "session-a",
+      platform: "test-os",
+      client_version: "9.9.9",
+      // RFC-017 D5: the manager's TokenClient is built with the plugin's own identity —
+      // sent alongside the pre-017 client_version, not instead of it.
+      software_id: "bridge-claude-plugin",
+      software_version: "9.9.9",
+    });
     expect(stub.stats.mintBodies[0]!.reconnect).toBeUndefined();
     expect(await m.accessToken()).toBe(at);
     expect(stub.stats.mints).toBe(1);
@@ -695,6 +704,104 @@ describe("revocation", () => {
     expect(readKey(dir)).toBeNull();
     // Nothing left to delete (a mint's refusal, or a sibling, got there first): said so.
     expect(await a.installationRevoked(first)).toBe("absent");
+  });
+
+  test("RFC-017 D8/C7: installation.json at a newer format reads as 'absent' — never deleted", async () => {
+    const { stub, dir } = setup();
+    const installationId = await enrolledProfile(stub, dir);
+    const before = readFileSync(join(dir, "installation.json"), "utf8");
+    // A future plugin's rewrite this build does not understand.
+    writeFileSync(join(dir, "installation.json"), JSON.stringify({ ...JSON.parse(before), format: 99 }));
+    const newer = readFileSync(join(dir, "installation.json"), "utf8");
+    const a = manager(dir, stub.url).m;
+    expect(await a.installationRevoked(installationId)).toBe("absent");
+    expect(readFileSync(join(dir, "installation.json"), "utf8")).toBe(newer); // untouched, not deleted
+  });
+});
+
+/**
+ * RFC-017 P1 gap: `readInstallation` (and so `this.installation()`) reads a newer
+ * format's installation.json the SAME as no installation at all — so every caller that
+ * only checks "is there one" (configError's "not signed in", enrolFromKeyIfNeeded's and
+ * completeLogin's own guards) would otherwise go on to WRITE, overwriting a newer
+ * window's credential from a stale one. Each of the three call sites below refuses
+ * instead, before any of key.json/state/installation.json is touched.
+ */
+describe("RFC-017 D8 P1 gap: a newer-format installation.json is never mistaken for 'not signed in'", () => {
+  async function newerFormatProfile(stub: { url: string; enrolDirect: (jwk: any) => { installation_id: string; join_state: string } }, dir: string) {
+    const installationId = await enrolledProfile(stub, dir);
+    const before = readFileSync(join(dir, "installation.json"), "utf8");
+    writeFileSync(join(dir, "installation.json"), JSON.stringify({ ...JSON.parse(before), format: 99 }));
+    return { installationId, snapshot: () => readFileSync(join(dir, "installation.json"), "utf8") };
+  }
+
+  test("configError names the D8 message, not 'not signed in'", async () => {
+    const { stub, dir } = setup();
+    await newerFormatProfile(stub, dir);
+    const { m } = manager(dir, stub.url);
+    expect(m.configError()).toBe("this profile was signed in by a newer Bridge plugin — /reload-plugins to use it");
+    expect(m.configError()).not.toMatch(/not signed in/);
+  });
+
+  test("enrolFromKeyIfNeeded refuses: the newer file is byte-identical afterward, and nothing was enrolled", async () => {
+    const { stub, dir } = setup();
+    const { snapshot } = await newerFormatProfile(stub, dir);
+    const before = snapshot();
+    const { m, events } = manager(dir, stub.url, { enrolmentKey: stub.mintEnrolmentKey(5) });
+    await m.enrolFromKeyIfNeeded();
+    expect(snapshot()).toBe(before); // byte-identical — never touched
+    expect(stub.stats.enrols).toBe(1); // only the ORIGINAL enrolment from newerFormatProfile
+    expect(events.notices.join()).toBe(""); // headless: never through chat, log only
+  });
+
+  test("a /bridge:login run in the stale window refuses to overwrite it: the newer file survives, the new grant is revoked, and the person is told", async () => {
+    const { stub, dir } = setup();
+    const { snapshot } = await newerFormatProfile(stub, dir);
+    const before = snapshot();
+    const { m, events } = manager(dir, stub.url);
+    const url = (await m.login("browser")).match(/https?:\/\/\S+/)![0];
+    const toCallback = await fetch(url, { redirect: "manual" });
+    const done = await fetch(toCallback.headers.get("location")!, { redirect: "manual" });
+    expect(done.headers.get("location")).toBe(`${stub.url}/connect/done?result=error`);
+    expect(snapshot()).toBe(before); // byte-identical — the login never wrote to it
+    expect(readKey(dir)).not.toBeNull(); // the OLD key.json (part of the same newer unit) survives too
+    expect(events.notices.join()).toContain("this profile was signed in by a newer Bridge plugin");
+    // The grant this login DID mint server-side (before ever touching disk) must not be
+    // left live and unusable — same "revoke what nobody will keep" rule as a cancelled login.
+    expect(stub.stats.revokes).toHaveLength(1);
+  });
+});
+
+describe("RFC-017 P5: too_old (the server's minimum/blocked refuses THIS build's version)", () => {
+  test("stops minting until the process restarts, keeps every file, parses <min> from the description — and never retries even far past every backoff", async () => {
+    const { stub, dir } = setup({ tooOldMints: 1 });
+    await enrolledProfile(stub, dir);
+    let now = Date.now();
+    const { m } = manager(dir, stub.url, { now: () => now });
+    const err = (await m.accessToken().catch((x) => x)) as CredentialError;
+    expect(err).toBeInstanceOf(CredentialError);
+    expect(err.kind).toBe("too_old");
+    expect(err.message).toBe("this plugin (9.9.9) is older than Bridge accepts (>= 0.26.0) — /plugin update bridge, then /reload-plugins");
+    expect(readInstallation(dir)).not.toBeNull(); // not a credential problem: files kept
+    expect(readKey(dir)).not.toBeNull();
+    expect(readState(dir)).not.toBeNull();
+    expect(stub.stats.mints).toBe(0); // refused before the grant transaction (S4)
+    expect(stub.stats.tokenRequests.client_credentials).toBe(1);
+    // A fake clock advanced past every conceivable backoff (server.ts's slowest schedule
+    // is minutes, not a day): still refuses locally, no second network request.
+    now += 24 * 60 * 60 * 1000;
+    const err2 = (await m.accessToken().catch((x) => x)) as CredentialError;
+    expect(err2.kind).toBe("too_old");
+    expect(stub.stats.tokenRequests.client_credentials).toBe(1);
+  });
+
+  test("a description with no `>= x.y.z` in it (client_blocked's own shape, D6/S1) falls back gracefully — no minimum in the message, never a crash", async () => {
+    const { stub, dir } = setup({ tooOldMints: 1, tooOldReason: "client_blocked: bridge-claude-plugin 9.9.9 is withdrawn — /plugin update bridge" });
+    await enrolledProfile(stub, dir);
+    const { m } = manager(dir, stub.url);
+    const err = (await m.accessToken().catch((x) => x)) as CredentialError;
+    expect(err.kind).toBe("too_old");
+    expect(err.message).toBe("this plugin (9.9.9) is older than Bridge accepts — /plugin update bridge, then /reload-plugins");
   });
 });
 

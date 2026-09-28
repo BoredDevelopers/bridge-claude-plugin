@@ -85,6 +85,16 @@ export interface StubOptions {
   rejectAssertions?: boolean;
   /** Revoke answers `{}` instead of C11's `{"ok":true}`. */
   revokeBodyEmpty?: boolean;
+  /**
+   * RFC-017 S4/P5: the first N mints answer 400 `unauthorized_client` / `tooOldReason`
+   * WITHOUT touching the chain — same shape as `rateLimitMints` (a refusal before the
+   * grant transaction, C5's guard). The plugin repo has no server checkout to run the
+   * real `verdict()`/`refuseTooOldClient` against, so this is the minimal stand-in this
+   * repo's own manager.ts tests need.
+   */
+  tooOldMints?: number;
+  /** The `error_description` `tooOldMints` answers with. Default: a `client_too_old:` one WITH a `>= x.y.z`; set to a `client_blocked:` one (which names none) to test the no-minimum fallback. */
+  tooOldReason?: string;
 }
 
 type Revoked = null | "installation_revoked" | "installation_locked" | "agent_deactivated";
@@ -508,6 +518,12 @@ export function createAuthCore(opts: StubOptions = {}) {
         case "client_credentials": {
           if (opts.mintDelayMs) await Bun.sleep(opts.mintDelayMs);
           stats.mintBodies.push({ ...b, client_assertion: "…" });
+          // RFC-017 S4: refused BEFORE the grant transaction — like rateLimitMints,
+          // nothing below this line runs (no chain read, no lock, no session).
+          if ((opts.tooOldMints ?? 0) > 0) {
+            opts.tooOldMints!--;
+            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: bridge-claude-plugin >= 0.26.0 required — /plugin update bridge", 400);
+          }
           if ((opts.rateLimitMints ?? 0) > 0) {
             opts.rateLimitMints!--;
             return refuse(where, "rate_limited", undefined, 429, { "Retry-After": "1" });

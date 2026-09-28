@@ -515,6 +515,53 @@ describe("plugin on key credentials (RFC-016)", () => {
     }
   }, 40_000);
 
+  test("RFC-017 D3: after a takeover, the module-level `superseded` flag does not stay stuck — a later installation revoke + re-login elsewhere still reconnects via the credential watch", async () => {
+    const stub = startAuthStub();
+    await withPlugin(
+      stub,
+      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      async (client, dir, notices) => {
+        // Auth #1 is refused exactly like a live holder taking over elsewhere would —
+        // sets the module-level `superseded` flag (server.ts's close handler, cls
+        // "superseded").
+        stub.rejectNextWsAuths(
+          1,
+          4008,
+          "session superseded: a newer Bridge plugin took over in another window of this session"
+        );
+        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("/bridge:connect takeover")), 5_000)).toBe(true);
+        // D3: a plain connect must not resume it — only takeover:true does.
+        await client.callTool({ name: "connect", arguments: {} });
+        await Bun.sleep(300);
+        expect(stub.stats.authTokens).toHaveLength(1);
+        await client.callTool({ name: "connect", arguments: { takeover: true } });
+        expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
+        expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
+
+        // Now an installation revoke — a DIFFERENT close class (cls "revoked", not
+        // "superseded"), reached through a path that never touches `superseded` at all
+        // (unlike disconnect/logout, which resets it unconditionally). This is the
+        // pin: without `if (takeover) superseded = false` in the connect tool handler,
+        // the flag is stuck `true` from auth #1 forever, and every later AUTOMATIC
+        // reconnect — including this one — is dead on arrival.
+        const installationId = readInstallation(dir)!.installationId;
+        stub.revokeInstallation(installationId);
+        expect(await until(() => notices().some((n) => n.includes("/bridge:login")), 5_000)).toBe(true);
+        expect(readInstallation(dir)).toBeNull();
+
+        // Another session on this machine logs in — the credential watch notices the
+        // files reappear and reconnects WITHOUT a /bridge:connect (same shape as
+        // "locked by ANOTHER process" above). If `superseded` never got cleared, this
+        // call is `connectUnlessDuplicate()` with no `takeover` — it returns
+        // immediately and this assertion times out.
+        await enrolledProfile(stub, dir);
+        expect(await until(() => stub.stats.authTokens.length >= 3, 5_000)).toBe(true);
+      },
+      enrolledIn(stub)
+    );
+  }, 40_000);
+
   test("an HTTP 401 mints once and retries, with a DPoP proof on each request", async () => {
     const stub = startAuthStub();
     await withPlugin(

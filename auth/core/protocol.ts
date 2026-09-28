@@ -212,6 +212,15 @@ export interface TokenClientOptions {
   fetch?: FetchLike;
   /** How long discovered metadata is reused (default METADATA_TTL_MS). */
   metadataTtlMs?: number;
+  /**
+   * RFC-017 D5: this runtime's own identity, sent on EVERY grant request (enrolment key,
+   * authorization_code, device code, client_credentials) — not just `mint`'s existing
+   * `platform`/`clientVersion` (those feed `agent_grants.client_version`, unrelated to
+   * this). Optional: an SDK consumer that omits it simply sends neither field, and the
+   * server's `resolveSoftware` falls back to a bare `client_version` for that case (D5).
+   */
+  softwareId?: string;
+  softwareVersion?: string;
 }
 
 export class TokenClient {
@@ -223,6 +232,8 @@ export class TokenClient {
   private readonly clientId: string;
   private readonly f: FetchLike;
   private readonly ttlMs: number;
+  private readonly softwareId?: string;
+  private readonly softwareVersion?: string;
 
   constructor(o: TokenClientOptions) {
     if (typeof o.clientId !== "string" || o.clientId === "") throw new Error("TokenClient needs the runtime's public clientId");
@@ -230,6 +241,16 @@ export class TokenClient {
     this.clientId = o.clientId;
     this.f = o.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.ttlMs = o.metadataTtlMs ?? METADATA_TTL_MS;
+    this.softwareId = o.softwareId;
+    this.softwareVersion = o.softwareVersion;
+  }
+
+  /** RFC-017 D5: spread into every grant's body — `{}` when this client was not given an identity. */
+  private identityFields(): Record<string, string> {
+    return {
+      ...(this.softwareId ? { software_id: this.softwareId } : {}),
+      ...(this.softwareVersion ? { software_version: this.softwareVersion } : {}),
+    };
   }
 
   /**
@@ -364,6 +385,7 @@ export class TokenClient {
           enrolment_key: p.enrolmentKey,
           installation_name: p.installationName,
           key_storage: signer.keyStorage,
+          ...this.identityFields(),
         }),
         false,
         o.signal
@@ -383,6 +405,7 @@ export class TokenClient {
           redirect_uri: p.redirectUri,
           client_id: this.clientId,
           key_storage: signer.keyStorage,
+          ...this.identityFields(),
         }),
         false,
         o.signal
@@ -395,7 +418,7 @@ export class TokenClient {
       await this.postDpop(
         m.token_endpoint,
         signer,
-        async () => ({ grant_type: GRANT_DEVICE_CODE, device_code: deviceCode, client_id: this.clientId, key_storage: signer.keyStorage }),
+        async () => ({ grant_type: GRANT_DEVICE_CODE, device_code: deviceCode, client_id: this.clientId, key_storage: signer.keyStorage, ...this.identityFields() }),
         false,
         o.signal
       )
@@ -418,6 +441,7 @@ export class TokenClient {
         ...(p.reconnect ? { reconnect: "true" } : {}),
         ...(p.platform ? { platform: p.platform } : {}),
         ...(p.clientVersion ? { client_version: p.clientVersion } : {}),
+        ...this.identityFields(),
       }),
       true,
       o.signal

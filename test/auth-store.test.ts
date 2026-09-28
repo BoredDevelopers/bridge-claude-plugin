@@ -433,3 +433,84 @@ describe("a stale 0.24 process in the same profile (cross-version safety)", () =
     }
   });
 });
+
+/**
+ * RFC-017 D8/C7: installation.json declaring a `format` this build does not know. The
+ * four files are one unit (this store's header) — a newer plugin's credential must
+ * survive completely untouched, not just have installation.json spared.
+ */
+describe("D8: a format newer than this build knows", () => {
+  async function newerFormatProfile(dir: string): Promise<void> {
+    const { privateJwk, signer } = await generateSoftwareKey();
+    store.writeKey(dir, privateJwk);
+    store.writeState(dir, makeJoinState(2));
+    writeFileSync(
+      join(dir, "installation.json"),
+      JSON.stringify({ format: 99, apiUrl: "https://b.example", installationId: "newer-plugin-id", jkt: signer.jkt, keyStorage: "software" }, null, 2) + "\n"
+    );
+    await store.createOrReadAttempt(dir);
+  }
+
+  test("readInstallation reads it as no installation — never the wrong one, never a crash", async () => {
+    const dir = tmp();
+    try {
+      await newerFormatProfile(dir);
+      expect(store.readInstallation(dir)).toBeNull();
+      expect(store.isNewerInstallation(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("deleteInstallationFiles refuses the WHOLE delete — every file byte-identical afterward (C7)", async () => {
+    const dir = tmp();
+    try {
+      await newerFormatProfile(dir);
+      const before = Object.fromEntries(
+        ["installation.json", "key.json", "state", "attempt"].map((f) => [f, readFileSync(join(dir, f), "utf8")])
+      );
+      store.deleteInstallationFiles(dir);
+      for (const [f, content] of Object.entries(before)) expect(readFileSync(join(dir, f), "utf8")).toBe(content);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("sweepOrphanTemps still removes debris temp files — they are never the canonical credential, at any format", async () => {
+    const dir = tmp();
+    try {
+      await newerFormatProfile(dir);
+      const stray = "key.json.4242.1758000000000.AbCd.tmp";
+      writeFileSync(join(dir, stray), "debris");
+      const t = new Date(Date.now() - store.ORPHAN_TMP_AGE_MS - 5_000);
+      utimesSync(join(dir, stray), t, t);
+      const before = readFileSync(join(dir, "installation.json"), "utf8");
+      expect(store.sweepOrphanTemps(dir)).toBe(1);
+      expect(existsSync(join(dir, stray))).toBe(false);
+      expect(readFileSync(join(dir, "installation.json"), "utf8")).toBe(before); // C7
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * RFC-017 P0/C8: test/fixtures/v025/ is REAL 0.25 output (test/fixtures/generate-v025.ts,
+ * itself calling this store's writers before this file changed — `git show
+ * 0e7ec8d:auth/node/store.ts`). This build must still read every one of them.
+ */
+describe("C8: every v025 fixture loads", () => {
+  const V025_PROFILE = fileURLToPath(new URL("./fixtures/v025/profile", import.meta.url));
+
+  test("installation.json", () => {
+    const inst = store.readInstallation(V025_PROFILE);
+    expect(inst).not.toBeNull();
+    expect(inst!.installationId).toBe("11111111-1111-1111-1111-111111111111");
+    expect(inst!.apiUrl).toBe("https://bridge-api.example.com");
+    expect(store.isNewerInstallation(V025_PROFILE)).toBe(false); // it has no `format` field at all — format 0
+  });
+
+  test("state", () => {
+    expect(store.readState(V025_PROFILE)).toStartWith("brg_js_3_");
+  });
+});

@@ -59,17 +59,22 @@ const UPDATE_REQUIRED =
 
 const SESSION_REVOKED = "this session was revoked in Bridge — /bridge:connect starts a new one";
 
+/** D8 (RFC-017 P1 gap): a newer plugin's installation.json — never "not signed in". */
+const NEWER_INSTALLATION_MESSAGE = "this profile was signed in by a newer Bridge plugin — /reload-plugins to use it";
+
 /**
  * Why no access token can be produced — the text is shown to the model as-is.
  * - not_logged_in / profile / api_url / logged_out: needs a login (possibly in another
  *   session — server.ts watches for the files to appear).
  * - session_revoked / session_limit: this SESSION stops; /bridge:connect retries.
+ * - too_old (RFC-017 D5): this BUILD is refused by the server's minimum/blocked — stop
+ *   minting until the process restarts (a newer plugin, not a new sign-in, fixes it).
  * - refused: the server said no for a reason retrying will not fix; files kept.
  * - network: retry later (the attempt, if any, stays on disk for the replay).
  */
 export class CredentialError extends Error {
   constructor(
-    readonly kind: "not_logged_in" | "profile" | "api_url" | "logged_out" | "session_revoked" | "session_limit" | "refused" | "network",
+    readonly kind: "not_logged_in" | "profile" | "api_url" | "logged_out" | "session_revoked" | "session_limit" | "too_old" | "refused" | "network",
     message: string
   ) {
     super(message);
@@ -180,7 +185,11 @@ export class CredentialManager {
     this.now = d.now ?? Date.now;
     this.random = d.random ?? Math.random;
     this.clock = new Clock(this.now);
-    this.tokens = new TokenClient({ clock: this.clock, clientId: PLUGIN_CLIENT_ID });
+    // RFC-017 D5: PLUGIN_CLIENT_ID doubles as this build's `software_id` — the plugin has
+    // no separate identifier for the two namespaces (OAuth client id vs. RFC-017 software
+    // id), so reusing the one constant here is simpler than inventing a second that would
+    // always equal it in practice.
+    this.tokens = new TokenClient({ clock: this.clock, clientId: PLUGIN_CLIENT_ID, softwareId: PLUGIN_CLIENT_ID, softwareVersion: d.clientVersion });
     this.openProfile();
   }
 
@@ -242,6 +251,11 @@ export class CredentialManager {
       return `BRIDGE_API_URL is unusable: ${errDetail(e)} — fix it with /bridge:configure`;
     }
     if (this.source() === "none") {
+      // RFC-017 D8 (P1 gap): `installation()` also reads null for a NEWER plugin's
+      // installation.json — never "not signed in" for that case, or a headless
+      // enrolment / a stale-window /bridge:login would go on to OVERWRITE it (see
+      // enrolFromKeyIfNeeded / completeLogin below, both refuse on the same check).
+      if (store.isNewerInstallation(p.dir)) return NEWER_INSTALLATION_MESSAGE;
       // The marker (after retirement) — or the RFC-014 files themselves, in the moment
       // before startup retires them.
       if (store.readUpgradeMarker(p.dir) || store.hasLegacyCredentials(p.dir)) {
@@ -375,7 +389,10 @@ export class CredentialManager {
       // Everything that is not a known terminal state is retryable: discovery 5xx
       // during a deploy, the lock wait cap, a timeout, a failed state write.
       const err = this.networkError(e);
-      if (err instanceof CredentialError && (err.kind === "refused" || err.kind === "session_limit")) {
+      // too_old joins refused/session_limit: RFC-017 P5 — nothing on THIS machine's disk
+      // changes what the server thinks of this build, so retrying (the ticker, an
+      // on-demand use) would only repeat the same refusal to the network for nothing.
+      if (err instanceof CredentialError && (err.kind === "refused" || err.kind === "session_limit" || err.kind === "too_old")) {
         this.stopped = { err, installationId: this.mintingFor };
       }
       throw err;
@@ -474,6 +491,16 @@ export class CredentialManager {
         return new CredentialError("refused", "this machine's Bridge state file is damaged (corrupt_state) — run /bridge:login to re-enrol");
       case "update_required":
         return new CredentialError("refused", `${UPDATE_REQUIRED} (${detail})`);
+      case "too_old": {
+        // RFC-017 D5: `client_too_old: <software_id> >= <minimum> required — …` — the
+        // minimum is parsed out for the message; a description this build cannot parse
+        // (e.g. `client_blocked: …`, which names no minimum at all) falls back gracefully.
+        const min = isOAuthError(e) ? e.description?.match(/>=\s*(\d+\.\d+\.\d+)/)?.[1] : undefined;
+        return new CredentialError(
+          "too_old",
+          `this plugin (${this.d.clientVersion}) is older than Bridge accepts${min ? ` (>= ${min})` : ""} — /plugin update bridge, then /reload-plugins`
+        );
+      }
       case "rate_limited":
         this.mintNotBefore = this.now() + a.retryAfterS * 1000;
         return new CredentialError("network", `Bridge sign-in is rate-limited — retrying in ${a.retryAfterS}s`);
@@ -564,6 +591,11 @@ export class CredentialManager {
    * elsewhere revokes the old one), switch to it quietly. Unknown which one the socket
    * used: try again — a dead installation is refused at the next mint. "deleted": this
    * call deleted the files; "absent": there were none left to delete.
+   *
+   * D8: also "absent" when installation.json is a newer format than this build knows —
+   * `readInstallation` reads that the same as no installation, so this never reaches
+   * `deleteInstallationFiles` for a newer window's credential (which refuses it again
+   * anyway; this is belt-and-suspenders, not the only guard).
    */
   async installationRevoked(revokedId: string | null): Promise<"switched" | "deleted" | "absent"> {
     if (revokedId === null || this.access?.installationId === revokedId) this.access = null;
@@ -866,6 +898,16 @@ export class CredentialManager {
       p.dir,
       async ({ signal }) => {
         if (cancelled()) return { cancelled: true as const };
+        // RFC-017 D8 (P1 gap): a newer plugin's installation.json reads as "no
+        // installation" (readInstallation), so without this check a /bridge:login run in
+        // a STALE window would fall straight through to deleteInstallationFiles +
+        // writeEnrolment below and OVERWRITE a newer window's credential. Checked here,
+        // under the lock, right before those writes begin — never earlier, so a race
+        // landing between the tool call and the lock is still caught.
+        if (store.isNewerInstallation(p.dir)) {
+          this.endLogin(mine);
+          return { cancelled: true as const, newerFormat: true as const };
+        }
         const prevInst = store.readInstallation(p.dir);
         const old = prevInst
           ? { inst: prevInst, jwk: store.readKey(p.dir), state: store.readState(p.dir), attempt: store.readAttempt(p.dir) }
@@ -917,6 +959,7 @@ export class CredentialManager {
     if (outcome.cancelled) {
       // A write failure already revoked it (under the lock); a cancel has not.
       if (!("abandoned" in outcome)) await this.revokeNew(meta, key.signer, g);
+      if ("newerFormat" in outcome) this.d.notify(`Bridge: ${NEWER_INSTALLATION_MESSAGE}`);
       return false;
     }
     return true;
@@ -1021,6 +1064,14 @@ export class CredentialManager {
     const enrolmentKey = this.d.enrolmentKey.trim();
     const apiUrl = this.d.envApiUrl;
     if (!p || !enrolmentKey || !apiUrl || this.installation()) return;
+    // RFC-017 D8 (P1 gap): `this.installation()` above reads null for a NEWER plugin's
+    // installation.json too — without this, headless enrolment would go on to OVERWRITE
+    // it (store.writeInstallation is not itself format-guarded; every OTHER writer gates
+    // on readInstallation returning something first). Never through chat: log only.
+    if (store.isNewerInstallation(p.dir)) {
+      this.d.log(`bridge auth: not enrolling with BRIDGE_ENROLMENT_KEY — ${NEWER_INSTALLATION_MESSAGE}`);
+      return;
+    }
     if (store.hasLoggedOutMarker(p.dir)) {
       this.d.log("bridge auth: signed out with /bridge:logout — not re-enrolling from BRIDGE_ENROLMENT_KEY (run /bridge:login)");
       return;
@@ -1031,7 +1082,10 @@ export class CredentialManager {
       await withInstallationLock(
         p.dir,
         async ({ signal }) => {
-          if (store.readInstallation(p.dir)) return;
+          // Re-checked INSIDE the lock, same shape as the readInstallation re-check right
+          // below it: a sibling's login (or another enrolment) can land between the outer
+          // check above and this callback actually running.
+          if (store.readInstallation(p.dir) || store.isNewerInstallation(p.dir)) return;
           const meta = await this.tokens.discover(apiUrl, signal);
           if (!supportsKeyCredentials(meta)) throw new Error(SERVER_TOO_OLD);
           const name = this.installationName();
