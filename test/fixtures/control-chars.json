@@ -107,6 +107,21 @@
       "output": "a\nb"
     },
     {
+      "name": "class boundaries: 0x08, 0x0B, 0x1F, 0x7F, 0x80 and 0x9C are removed",
+      "input": "a\bb\u000bc\u001fd\u007fe\u0080f\u009cg",
+      "output": "abcdefg"
+    },
+    {
+      "name": "class boundaries: 0x9F at the end of the text is removed",
+      "input": "a\u009f",
+      "output": "a"
+    },
+    {
+      "name": "class boundaries: space, tilde and NBSP (0xA0) are kept",
+      "input": "a b~c\u00a0d",
+      "output": "a b~c\u00a0d"
+    },
+    {
       "name": "literal bracket text with no ESC is content",
       "input": "[32m is how green is written",
       "output": "[32m is how green is written"
