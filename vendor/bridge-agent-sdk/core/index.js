@@ -27,6 +27,7 @@ import {
   MINT_TIMEOUT_MS,
   OAuthError,
   TAIL_MAX_MESSAGES,
+  TAIL_SELECT_BG,
   TAIL_SGR,
   TokenClient,
   TransportError,
@@ -46,6 +47,7 @@ import {
   clockOf,
   closeOutcome,
   createRenderCache,
+  createTailInputParser,
   dateSeparator,
   dayKey,
   deadline,
@@ -90,7 +92,7 @@ import {
   userAgent,
   viewport,
   wsHtu
-} from "../index-h8ffc6pv.js";
+} from "../index-ags5za24.js";
 export {
   ADDRESSED_REASONS,
   ASSERTION_TTL_S,
@@ -120,6 +122,7 @@ export {
   MINT_TIMEOUT_MS,
   OAuthError,
   TAIL_MAX_MESSAGES,
+  TAIL_SELECT_BG,
   TAIL_SGR,
   TokenClient,
   TransportError,
@@ -139,6 +142,7 @@ export {
   clockOf,
   closeOutcome,
   createRenderCache,
+  createTailInputParser,
   dateSeparator,
   dayKey,
   deadline,

@@ -143,7 +143,8 @@ bridge() { [ "$1" = tail ] && shift; "$HOME/.claude/channels/bridge/bin/bridge-t
 ```
 
 - Incoming messages sit left with a green bar, outgoing right with a blue bar.
-- `j`/`k` move, `enter` folds a message, `e` folds all, `q` quits.
+- Click a message to fold it; the wheel moves the selection. Keys: `j`/`k` move, `enter` folds, `e` folds all, `q` quits.
+- Copying text needs Option-drag (macOS) or Shift-drag while click support is on; `--no-mouse` turns it off.
 - Read-only, and nothing is written to disk: the session keeps recent messages in
   memory and serves them over a local socket only your user can open.
 - `/bridge:tail` in Claude prints the launcher path for this machine.

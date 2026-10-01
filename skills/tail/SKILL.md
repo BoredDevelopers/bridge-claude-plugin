@@ -43,8 +43,12 @@ Arguments passed: `$ARGUMENTS`
 
 ## Keys, if they ask
 
-`j`/`k` or arrows move · `enter` folds or unfolds a message (a long one opens
-fully first) · `e` folds or unfolds all · `g`/`G` first/last · `q` quits.
+Click a message to fold or unfold it (a long one opens fully first); the mouse
+wheel moves the selection. Keys: `j`/`k` or arrows move · `enter` does what a click
+does · `e` folds or unfolds all · `g`/`G` first/last · `q` quits.
+
+With click support on, the terminal sends clicks to tail, so copying text needs
+Option-drag (macOS) or Shift-drag. `--no-mouse` turns click support off.
 
 ## Notes
 

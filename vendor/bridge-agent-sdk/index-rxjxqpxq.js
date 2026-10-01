@@ -9,6 +9,7 @@ import {
   cleanText,
   clipRow,
   createRenderCache,
+  createTailInputParser,
   dateSeparator,
   dayKey,
   deadline,
@@ -18,14 +19,13 @@ import {
   isFeedError,
   messageKey,
   parseServerFrame,
-  parseTailInput,
   renderFooter,
   renderHeader,
   renderMessage,
   renderTranscript,
   tailReduce,
   viewport
-} from "./index-h8ffc6pv.js";
+} from "./index-ags5za24.js";
 
 // src/node/proc-start.ts
 import { execFile } from "node:child_process";
@@ -241,8 +241,16 @@ async function listProcs(dir, excludePid, options = {}) {
 }
 
 // src/node/tail.ts
-var TAIL_ENTER = "\x1B[?1049h\x1B[?25l\x1B[?1004h\x1B[?7l";
-var TAIL_LEAVE = "\x1B[?7h\x1B[?1004l\x1B[?25h\x1B[?1049l\x1B]2;\x07";
+var MOUSE_ON = "\x1B[?1000h\x1B[?1006h";
+var MOUSE_OFF = "\x1B[?1006l\x1B[?1000l";
+function tailEnter(mouse) {
+  return "\x1B[?1049h\x1B[?25l\x1B[?1004h\x1B[?7l" + (mouse ? MOUSE_ON : "");
+}
+function tailLeave(mouse) {
+  return (mouse ? MOUSE_OFF : "") + "\x1B[?7h\x1B[?1004l\x1B[?25h\x1B[?1049l\x1B]2;\x07";
+}
+var TAIL_ENTER = tailEnter(true);
+var TAIL_LEAVE = tailLeave(true);
 var DEFAULT_POLL_MS = 1000;
 var DEFAULT_REPLAY = 500;
 var PROBE_TTL_MS = 1e4;
@@ -277,13 +285,23 @@ async function runTail(options = {}) {
   let renderTimer;
   const read = options.listProcs ?? ((d) => listProcs(d, undefined, { sweep: false, skipCheck: (r) => typeof r.feed === "string" && attached.has(r.feed) }));
   const rawKeys = tty && stdin.isTTY === true && typeof stdin.setRawMode === "function";
+  const mouse = rawKeys && options.mouse !== false;
+  const parser = createTailInputParser();
+  let hit = [];
   let entered = false;
   let restored = false;
   let top = 0;
   let lastTitle = "";
   const onData = (chunk) => {
-    for (const ev of parseTailInput(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)))
-      dispatch(ev);
+    for (const ev of parser.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk))) {
+      if (ev.type !== "click")
+        dispatch(ev);
+      else {
+        const key = hit[ev.y - 2];
+        if (key)
+          dispatch({ type: "activate", key });
+      }
+    }
   };
   const onResize = () => {
     const s = sizeNow();
@@ -291,7 +309,7 @@ async function runTail(options = {}) {
   };
   function enter() {
     entered = true;
-    stdout.write(TAIL_ENTER);
+    stdout.write(tailEnter(mouse));
     if (rawKeys) {
       stdin.setRawMode(true);
       stdin.setEncoding?.("utf8");
@@ -310,11 +328,12 @@ async function runTail(options = {}) {
       stdin.setRawMode(false);
       stdin.pause?.();
     }
-    stdout.write(TAIL_LEAVE);
+    stdout.write(tailLeave(mouse));
   }
   function draw() {
     const { cols } = state.size;
     const rows = Math.max(1, state.size.rows);
+    hit = [];
     const lines = [renderHeader({ handle: state.agent ?? undefined, label: state.label ?? undefined, state: state.connection }, cols, color)];
     if (rows >= 2) {
       const bodyH = rows - 2;
@@ -322,6 +341,7 @@ async function runTail(options = {}) {
         const t = renderTranscript(state.messages, { fold: (k) => state.fold.get(k) ?? "open", selectedKey: state.selected, unreadFromKey: state.unreadFrom }, { width: cols, color, showSession: all, cache });
         const vp = viewport(t, bodyH, { selectedKey: state.selected, follow: state.follow, prevTop: top });
         top = vp.top;
+        hit = vp.keys;
         lines.push(...vp.rows);
         while (lines.length < rows - 1)
           lines.push("");
@@ -330,7 +350,7 @@ async function runTail(options = {}) {
       for (const m of state.messages)
         if (m.dir === "in")
           ins++;
-      lines.push(renderFooter({ total: state.messages.length, ins, outs: state.messages.length - ins }, cols, color));
+      lines.push(renderFooter({ total: state.messages.length, ins, outs: state.messages.length - ins, mouse }, cols, color));
     }
     let frame = "\x1B[H" + lines.slice(0, rows).map((l) => "\x1B[2K" + clipRow(l, cols)).join(`\r
 `);
@@ -588,9 +608,11 @@ var TAIL_USAGE = `usage: bridge-tail (--procs <dir> ... | --socket <path>) [opti
   --session <sel>    pick a session by label, context id, sessionKey prefix or pid
   --all              merge every live session, with a session column
   --no-color         plain text, no colour
+  --no-mouse         no mouse reporting (click-to-fold, wheel); needed for plain terminal text
+                     selection — with the mouse on, copy with Option-drag (macOS) or Shift-drag
   --help             this text
 
-keys: j/k or arrows move, enter folds (opens the rest of a long message), e folds all, g/G first/last, q quits
+keys: j/k, arrows or the wheel move; enter or a click folds (opens the rest of a long message), e folds all, g/G first/last, q quits
 `;
 function parseTailArgs(argv) {
   const out = { procsDirs: [], all: false, help: false };
@@ -623,6 +645,9 @@ function parseTailArgs(argv) {
         break;
       case "--no-color":
         out.color = false;
+        break;
+      case "--no-mouse":
+        out.mouse = false;
         break;
       case "--help":
       case "-h":
@@ -676,7 +701,7 @@ ${TAIL_USAGE}`);
   proc.on("unhandledRejection", onFatal);
   let result;
   try {
-    result = await runTail({ ...io, procsDirs: args.procsDirs, socket: args.socket, session: args.session, all: args.all, color: args.color, signal: stop.signal });
+    result = await runTail({ ...io, procsDirs: args.procsDirs, socket: args.socket, session: args.session, all: args.all, color: args.color, mouse: args.mouse, signal: stop.signal });
   } finally {
     proc.off("uncaughtException", onFatal);
     proc.off("unhandledRejection", onFatal);
@@ -691,4 +716,4 @@ ${TAIL_USAGE}`);
   return result.reason === "signal" ? SIGNAL_EXIT[result.signal] ?? 1 : 0;
 }
 
-export { procStartOf, legacyProcStartOf, procStartMatches, pidAlive, feedClient, TAIL_ENTER, TAIL_LEAVE, runTail, TAIL_USAGE, parseTailArgs, tailMain };
+export { procStartOf, legacyProcStartOf, procStartMatches, pidAlive, feedClient, tailEnter, tailLeave, TAIL_ENTER, TAIL_LEAVE, runTail, TAIL_USAGE, parseTailArgs, tailMain };
