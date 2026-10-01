@@ -68,6 +68,7 @@ import { CredentialManager, CredentialError } from "./auth/manager";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
 import { assertNever, deadline } from "./auth/core";
 import { localIso } from "./local-time";
+import { sanitizeChannelParams } from "./control-chars";
 import { procStartOf, procStartMatches } from "./proc-start";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -2319,6 +2320,22 @@ const mcp = new Server(
     ].join("\n"),
   }
 );
+
+// RFC-022 D2 — THE ONE CHOKE POINT for text that reaches the host's terminal.
+// Every `notifications/claude/channel` goes out through `mcp.notification`, so the
+// strip is applied here rather than at each call site: a site added later is
+// covered without anyone remembering to. The host renders escape sequences in
+// channel content (measured 2026-10-01), and message text is written by other
+// people; `test/control-chars.test.ts` proves a stored OSC 52 payload arrives
+// stripped.
+{
+  const send = mcp.notification.bind(mcp);
+  mcp.notification = ((n: any, ...rest: any[]) =>
+    send(
+      n?.method === "notifications/claude/channel" ? { ...n, params: sanitizeChannelParams(n.params ?? {}) } : n,
+      ...rest
+    )) as typeof mcp.notification;
+}
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [

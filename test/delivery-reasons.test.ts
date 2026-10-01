@@ -171,6 +171,36 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
     expect(out).toContain('"thread_id":"thr-1"');
   }, 30_000);
 
+  test("RFC-022 D2: control sequences in a message are stripped before the host sees them", async () => {
+    // The stub plays a server that did NOT strip at write time (an older server, or a
+    // row stored before the server learned to). The host renders escape sequences in
+    // channel content, so what matters is the notification on stdout.
+    const ESC = "\x1b";
+    stub.send({
+      type: "message",
+      data: message("msg-ansi-1", {
+        // OSC 52 clipboard write, a colour code, and a bare CR that would overwrite the line.
+        content: `${ESC}]52;c;aGVsbG8=\x07${ESC}[31mAlert${ESC}[0m: deploy failed\rFAKE`,
+        agentName: `${ESC}[8maio${ESC}[28m`,
+      }),
+      deliveryReasons: ["mention"],
+    });
+    expect(await surfaced("msg-ansi-1")).toBe(true);
+    // Wait for the COMPLETE JSON-RPC line, then read the payload the host receives.
+    let notification: any = null;
+    const deadline = Date.now() + 2500;
+    while (!notification && Date.now() < deadline) {
+      const line = out.split("\n").find((l) => l.includes("msg-ansi-1") && l.trimEnd().endsWith("}"));
+      try { if (line) notification = JSON.parse(line); } catch { /* partial line, keep waiting */ }
+      if (!notification) await Bun.sleep(25);
+    }
+    expect(notification?.method).toBe("notifications/claude/channel");
+    expect(notification.params.content).toBe("Alert: deploy failed\nFAKE");
+    expect(notification.params.meta.sender).toBe("aio");
+    // JSON writes ESC as \u001b and BEL as \u0007 — neither may be anywhere in the frame.
+    expect(JSON.stringify(notification)).not.toMatch(/\\u001b|\\u0007/);
+  }, 30_000);
+
   test("a mention in a filtered channel SURFACES", async () => {
     stub.send({
       type: "message",
