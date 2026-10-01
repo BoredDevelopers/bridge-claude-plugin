@@ -1,0 +1,140 @@
+{
+  "_about": "RFC-022 D2/D9 \u2014 vectors for stripControlChars. Consumed by packages/agent-sdk (src/core/control-chars.ts) AND packages/api (src/control-chars.ts): two copies of one rule, held together by this file. Hand-written; `output` is what BOTH must return for `input`.",
+  "vectors": [
+    {
+      "name": "plain text is untouched",
+      "input": "Hello, world. 100% plain \u2014 with \u00fcn\u00efc\u00f6d\u00e9 and \ud83d\udfe2 emoji.",
+      "output": "Hello, world. 100% plain \u2014 with \u00fcn\u00efc\u00f6d\u00e9 and \ud83d\udfe2 emoji."
+    },
+    {
+      "name": "newline and tab are kept",
+      "input": "a\n\tb",
+      "output": "a\n\tb"
+    },
+    {
+      "name": "SGR colour codes go as whole sequences",
+      "input": "\u001b[38;5;201mMAGENTA\u001b[0m \u001b[32mGREEN\u001b[39m \u001b[1mBOLD\u001b[0m",
+      "output": "MAGENTA GREEN BOLD"
+    },
+    {
+      "name": "OSC 2 title set, BEL-terminated",
+      "input": "before\u001b]2;PWNED\u0007after",
+      "output": "beforeafter"
+    },
+    {
+      "name": "OSC 52 clipboard write, ST-terminated",
+      "input": "x\u001b]52;c;aGVsbG8=\u001b\\y",
+      "output": "xy"
+    },
+    {
+      "name": "OSC 8 hyperlink keeps its visible text",
+      "input": "\u001b]8;;https://evil.example\u001b\\click\u001b]8;;\u001b\\",
+      "output": "click"
+    },
+    {
+      "name": "an unterminated OSC stops at the newline",
+      "input": "\u001b]0;title\nreal message",
+      "output": "\nreal message"
+    },
+    {
+      "name": "cursor movement and erase",
+      "input": "line\u001b[2K\u001b[1A\u001b[Gover",
+      "output": "lineover"
+    },
+    {
+      "name": "SGR conceal and reverse",
+      "input": "\u001b[8mhidden\u001b[28m \u001b[7minv\u001b[27m",
+      "output": "hidden inv"
+    },
+    {
+      "name": "two-character escapes",
+      "input": "a\u001bcb\u001b7c\u001b(Bd",
+      "output": "abcd"
+    },
+    {
+      "name": "DCS string",
+      "input": "a\u001bPq#0;2;0;0;0\u001b\\b",
+      "output": "ab"
+    },
+    {
+      "name": "C1 CSI (single byte 0x9B)",
+      "input": "a\u009b31mred\u009b0m",
+      "output": "ared"
+    },
+    {
+      "name": "C1 OSC (0x9D) with C1 ST (0x9C)",
+      "input": "a\u009d2;t\u009cb",
+      "output": "ab"
+    },
+    {
+      "name": "a lone ESC is removed",
+      "input": "a\u001b",
+      "output": "a"
+    },
+    {
+      "name": "ESC [ with no final byte",
+      "input": "a\u001b[",
+      "output": "a"
+    },
+    {
+      "name": "CRLF becomes LF",
+      "input": "a\r\nb",
+      "output": "a\nb"
+    },
+    {
+      "name": "a lone CR becomes LF, so it cannot overwrite the line",
+      "input": "real text\rFAKE",
+      "output": "real text\nFAKE"
+    },
+    {
+      "name": "NUL, BEL, backspace, VT, FF, DEL",
+      "input": "a\u0000b\u0007c\bd\u000be\ff\u007fg",
+      "output": "abcdefg"
+    },
+    {
+      "name": "C1 controls incl. NEL",
+      "input": "a\u0085b\u0080c\u008fd",
+      "output": "abcd"
+    },
+    {
+      "name": "nested escapes cannot rebuild a sequence",
+      "input": "\u001b\u001b[0m[31mtext",
+      "output": "[31mtext"
+    },
+    {
+      "name": "an unterminated C1 APC (0x9F) swallows to the end of its line only",
+      "input": "a\u009fhidden\nb",
+      "output": "a\nb"
+    },
+    {
+      "name": "class boundaries: 0x08, 0x0B, 0x1F, 0x7F, 0x80 and 0x9C are removed",
+      "input": "a\bb\u000bc\u001fd\u007fe\u0080f\u009cg",
+      "output": "abcdefg"
+    },
+    {
+      "name": "class boundaries: 0x9F at the end of the text is removed",
+      "input": "a\u009f",
+      "output": "a"
+    },
+    {
+      "name": "class boundaries: space, tilde and NBSP (0xA0) are kept",
+      "input": "a b~c\u00a0d",
+      "output": "a b~c\u00a0d"
+    },
+    {
+      "name": "literal bracket text with no ESC is content",
+      "input": "[32m is how green is written",
+      "output": "[32m is how green is written"
+    },
+    {
+      "name": "only control characters leaves nothing",
+      "input": "\u001b[0m\u0007\u0000",
+      "output": ""
+    },
+    {
+      "name": "empty stays empty",
+      "input": "",
+      "output": ""
+    }
+  ]
+}
