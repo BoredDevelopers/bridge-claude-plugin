@@ -195,11 +195,14 @@ describe("sweepStaleFeedSockets", () => {
 const SERVER = join(import.meta.dir, "..", "server.ts");
 const ENROLMENT_KEY = mintAgentToken("ek");
 
-type Stub = { port: number; send: (frame: unknown) => void; connected: () => boolean; stop: () => void; posted: any[]; drop: (code: number, reason: string) => void; auths: () => number };
+type Stub = { port: number; send: (frame: unknown) => void; connected: () => boolean; stop: () => void; posted: any[]; drop: (code: number, reason: string) => void; auths: () => number; channelHits: () => number; holdChannels: () => void; releaseChannels: () => void };
 
 function startStub(): Stub {
   let socket: any = null;
   let auths = 0;
+  let channelHits = 0;
+  let release: (() => void) | null = null;
+  let held: Promise<void> | null = null;
   const posted: any[] = [];
   const agentAuth = createAgentAuthRoutes();
   agentAuth.addEnrolmentKey(ENROLMENT_KEY);
@@ -211,6 +214,8 @@ function startStub(): Stub {
       if (auth) return auth;
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/api/channels") {
+        channelHits++;
+        if (held) await held;
         return Response.json({ channels: [{ id: "chan-dev-id", name: "dev" }] });
       }
       if (req.method === "POST" && url.pathname === "/api/messages") {
@@ -234,7 +239,7 @@ function startStub(): Stub {
       close() { socket = null; },
     },
   });
-  return { port: server.port!, send: (f) => socket?.send(JSON.stringify(f)), connected: () => socket !== null, stop: () => server.stop(true), posted, drop: (code, reason) => socket?.close(code, reason), auths: () => auths };
+  return { port: server.port!, send: (f) => socket?.send(JSON.stringify(f)), connected: () => socket !== null, stop: () => server.stop(true), posted, drop: (code, reason) => socket?.close(code, reason), auths: () => auths, channelHits: () => channelHits, holdChannels: () => { held = new Promise<void>((r) => (release = r)); }, releaseChannels: () => { release?.(); held = null; } };
 }
 
 async function until<T>(what: string, fn: () => T | undefined | null | false, ms = 15_000): Promise<T> {
@@ -373,6 +378,25 @@ describe("a running plugin serves its feed", () => {
       { data: { id: "skip-other-context", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "for the other window", metadata: JSON.stringify({ contextId: "ctx-other", contextAgentId: "bellman-id" }) }, deliveryReasons: ["mention"] },
     ]);
     expect(seen).toEqual(["msg-barrier"]);
+  }, 30_000);
+
+  test("the feed keeps arrival order, and asks for channel names only when a message needs one", async () => {
+    await boot();
+    const { frames } = await attach();
+    // Connected, no messages yet: serving a feed costs the API nothing.
+    expect(stub.channelHits()).toBe(0);
+    const now = () => new Date().toISOString();
+    // The first message needs the name (one fetch); the second arrives while that fetch
+    // is in flight and must not overtake it.
+    stub.holdChannels();
+    stub.send({ type: "message", data: { id: "ord-1", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "first", createdAt: now() }, deliveryReasons: ["mention"] });
+    stub.send({ type: "message", data: { id: "ord-2", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "second", createdAt: now() }, deliveryReasons: ["mention"] });
+    await until("the channel-name request", () => stub.channelHits() === 1);
+    stub.releaseChannels();
+    const first = await nextMessage(frames, "ord-1");
+    const second = await nextMessage(frames, "ord-2"); // would time out if ord-2 had gone first: nextMessage skips past it
+    expect([first.channel.name, second.channel.name]).toEqual(["dev", "dev"]);
+    expect(stub.channelHits()).toBe(1);
   }, 30_000);
 
   test("a channel outside BRIDGE_CHANNELS is filtered from the feed exactly as from the host", async () => {

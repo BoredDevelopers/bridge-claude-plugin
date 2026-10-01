@@ -1002,15 +1002,24 @@ function channelNameOf(channelId: string): string {
  * map is only loaded eagerly for sessions with a filter, and a channel can post-date it
  * — refresh first (rate-limited, shared with the filter path) so a tail shows `#dev`,
  * not a uuid. Best-effort and detached: the message path never waits on this.
+ *
+ * LAZY on purpose. Loading the map at `authenticated` for every session would be one more
+ * request per connect — and, against a credential the API refuses, one more 401 and
+ * re-mint — for a feed nobody may be reading. A message is what makes the name worth
+ * fetching. (The server sending the name on the frame removes the fetch: RFC-022 S3.1.)
+ *
+ * SERIALISED so the feed keeps arrival order: a message in a known channel must not
+ * overtake an earlier one still waiting on the fetch.
  */
+let feedQueue: Promise<void> = Promise.resolve();
 function feedWithChannelName(channelId: string, publish: (channelName: string) => void): void {
   // `path()` is "" for an inert tap (the feed could not open): no reader, so no fetch.
   if (!feedTap?.path()) return;
-  const known = channelNameOf(channelId);
-  if (known || !channelId) return publish(known);
-  ensureChannelMap()
+  feedQueue = feedQueue
+    .then(() => (channelId && !channelNameOf(channelId) ? ensureChannelMap() : undefined))
     .catch(() => {})
-    .then(() => publish(channelNameOf(channelId)));
+    .then(() => publish(channelNameOf(channelId)))
+    .catch(() => {});
 }
 
 // Single in-flight load, rate-limited. Resolves once the map is as fresh as
@@ -1828,10 +1837,6 @@ function handleWsMessage(data: any): void {
           `\n`
       );
       feedStatus("connected");
-      // RFC-022: load the channel map for every session that serves a feed (it used to be
-      // loaded only for sessions with a filter), so a tail shows `#dev` from the first
-      // message and the feed publishes in arrival order instead of behind a fetch.
-      if (feedTap?.path() && CHANNELS_FILTER.length === 0) ensureChannelMap().catch(() => {});
       // Load channel name→id map for name-based filtering. Only needed when a
       // filter is configured; inbound delivery awaits this when it must.
       if (CHANNELS_FILTER.length > 0) {
