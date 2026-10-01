@@ -69,6 +69,7 @@ import { PLUGIN_CLIENT_ID } from "./auth/client-id";
 import { assertNever, deadline } from "./auth/core";
 import { localIso } from "./local-time";
 import { sanitizeChannelParams } from "./control-chars";
+import { startFeedTap, sweepStaleFeedSockets, writeLauncher, launcherPath, type FeedTap } from "./feed-tap";
 import { procStartOf, procStartMatches } from "./proc-start";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -710,6 +711,9 @@ function testKnob(name: string, valid: (n: number) => boolean): number | undefin
 }
 let agentId = "";
 let agentName = "";
+// The agent's @handle, from the `authenticated` frame — what a tail shows for this
+// session's own messages. "" against a server that predates the field.
+let agentHandle = "";
 let myContextId = ""; // this connection's context ID (from the authenticated payload)
 /**
  * This session's SEND credential, from the `authenticated` frame.
@@ -966,6 +970,58 @@ async function loadChannelMap(): Promise<void> {
   }
 }
 
+// RFC-022: this session's local feed (`tail` reads it). Null until boot opens it, and
+// inert if it could not open — nothing on the message path depends on it (feed-tap.ts).
+let feedTap: FeedTap | null = null;
+
+/**
+ * Tell an attached tail what this session's link to Bridge is doing. Published from the
+ * places that DECIDE — `authenticated`, scheduleReconnect (a retry is armed, or it is
+ * not coming back), stopConnection, a supersession — never inferred at the socket's
+ * close handler: the liveness watchdog and credentialFailure detach the socket before
+ * closing it, so that handler never sees the very outages a status exists to show.
+ * Deduped: a retry loop re-arms every backoff step and must not flood the feed.
+ */
+let lastFeedStatus = "";
+function feedStatus(state: "connected" | "reconnecting" | "stopped", reason?: string): void {
+  const key = `${state}\n${reason ?? ""}`;
+  if (key === lastFeedStatus) return;
+  lastFeedStatus = key;
+  feedTap?.status(state, reason);
+}
+
+/** A channel's name for the feed, or "" when the map has not got it (yet). */
+function channelNameOf(channelId: string): string {
+  if (!channelNameToId) return "";
+  for (const [name, id] of channelNameToId) if (id === channelId) return name;
+  return "";
+}
+
+/**
+ * Run `publish` with the channel's name, for the feed. When the name is not known — the
+ * map is only loaded eagerly for sessions with a filter, and a channel can post-date it
+ * — refresh first (rate-limited, shared with the filter path) so a tail shows `#dev`,
+ * not a uuid. Best-effort and detached: the message path never waits on this.
+ *
+ * LAZY on purpose. Loading the map at `authenticated` for every session would be one more
+ * request per connect — and, against a credential the API refuses, one more 401 and
+ * re-mint — for a feed nobody may be reading. A message is what makes the name worth
+ * fetching. (The server sending the name on the frame removes the fetch: RFC-022 S3.1.)
+ *
+ * SERIALISED so the feed keeps arrival order: a message in a known channel must not
+ * overtake an earlier one still waiting on the fetch.
+ */
+let feedQueue: Promise<void> = Promise.resolve();
+function feedWithChannelName(channelId: string, publish: (channelName: string) => void): void {
+  // `path()` is "" for an inert tap (the feed could not open): no reader, so no fetch.
+  if (!feedTap?.path()) return;
+  feedQueue = feedQueue
+    .then(() => (channelId && !channelNameOf(channelId) ? ensureChannelMap() : undefined))
+    .catch(() => {})
+    .then(() => publish(channelNameOf(channelId)))
+    .catch(() => {});
+}
+
 // Single in-flight load, rate-limited. Resolves once the map is as fresh as
 // it is going to get.
 function ensureChannelMap(): Promise<void> {
@@ -1218,6 +1274,9 @@ function connectWs(): void {
     // NEW socket's "authenticated" frame arrives (handleWsMessage). The "superseded"
     // branch just below sets its own, more specific state instead.
     if (cls !== "superseded") updateProcState(STATE_DIR, process.pid, "disconnected");
+    // RFC-022: a supersession stops here and nothing reconnects by itself, so nothing
+    // downstream would say so. Every other close is reported by scheduleReconnect.
+    if (cls === "superseded") feedStatus("stopped", "another window took over this session");
     // RFC-016 §3.4: 4009 = the access token ran out before a reauth — drop it so the
     // reconnect's auth frame carries a fresh one. C14: 4001 = the token (or its proof)
     // was refused — a DPoP token dies with its installation or session, so the next
@@ -1340,7 +1399,10 @@ function scheduleReconnect(immediate = false): void {
   // a single guard here covers every caller (WebSocket creation failure, the
   // close handler, the liveness watchdog) rather than needing one at each
   // call site.
-  if (!wantConnected) return;
+  if (!wantConnected) {
+    feedStatus("stopped", "disconnected");
+    return;
+  }
   if (reconnectTimer) return;
   // C14's immediate re-mint is not a backoff step: the next slow retry starts at attempt 1.
   if (!immediate) reconnectAttempt++;
@@ -1350,9 +1412,12 @@ function scheduleReconnect(immediate = false): void {
     // Revoked: this token will never work again. Only /bridge:connect (after
     // /bridge:configure) tries again.
     nextReconnectAt = null;
-    process.stderr.write(`bridge channel: not reconnecting — ${describeClose(lastClose.cls, lastClose.code, lastClose.reason, { supersededBy: lastClose.supersededBy, myVersion: PLUGIN_VERSION })}\n`);
+    const why = describeClose(lastClose.cls, lastClose.code, lastClose.reason, { supersededBy: lastClose.supersededBy, myVersion: PLUGIN_VERSION });
+    process.stderr.write(`bridge channel: not reconnecting — ${why}\n`);
+    feedStatus("stopped", why);
     return;
   }
+  feedStatus("reconnecting");
   nextReconnectAt = Date.now() + delay;
   process.stderr.write(
     `bridge channel: reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})\n`
@@ -1530,6 +1595,7 @@ function restartConnection(): void {
 /** Close the socket and cancel every pending reconnect (disconnect, logout). */
 function stopConnection(): void {
   wantConnected = false;
+  feedStatus("stopped", "disconnected");
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -1699,6 +1765,7 @@ function handleWsMessage(data: any): void {
     case "authenticated":
       agentId = data.data?.agentId ?? "";
       agentName = data.data?.agentName ?? "";
+      agentHandle = typeof data.data?.handle === "string" ? data.data.handle : "";
       {
         const newContextId = data.data?.contextId ?? "";
         // A DIFFERENT context id means this is not our old session resumed —
@@ -1769,6 +1836,7 @@ function handleWsMessage(data: any): void {
           (myContextId ? ` context ${myContextId}` : "") +
           `\n`
       );
+      feedStatus("connected");
       // Load channel name→id map for name-based filtering. Only needed when a
       // filter is configured; inbound delivery awaits this when it must.
       if (CHANNELS_FILTER.length > 0) {
@@ -2120,6 +2188,10 @@ function routeInbound(
       // ack every message we surface. Older servers silently drop acks for
       // types they don't track, so this is backward-compatible.
       if (msg.id) sendReceiptAck(msg.id);
+      // RFC-022 D8: the feed gets exactly what the host was handed — after the channel
+      // filter, the own-message skip and context targeting above, and only once the
+      // notification was accepted. Nothing reaches a tail that did not reach the host.
+      feedWithChannelName(channelId, (channelName) => feedTap?.inbound(msg, { channelName, targeted: addressedToUs }));
     })
     .catch((err) => {
       process.stderr.write(
@@ -2808,6 +2880,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (result.id) {
           rememberOwnSend(result.id);
           rememberSentMessage(result.id, type);
+        }
+        // RFC-022 D8: an accepted send goes to the feed — the host shows a reply as
+        // `Called plugin:bridge:bridge` with no text, so `tail` is where it can be read.
+        {
+          // The server's id for the channel: a reply names only its thread, and a root
+          // may have been addressed by channel NAME.
+          const sentChannelId = String(result.channelId ?? channelId ?? "");
+          feedWithChannelName(sentChannelId, (channelName) =>
+            feedTap?.outbound({
+              id: String(result.id ?? ""),
+              channelId: sentChannelId,
+              channelName,
+              threadId: threadId ?? "",
+              resultThreadId: String(result.threadId ?? ""),
+              title: title ?? "",
+              type,
+              text,
+              self: { id: agentId, handle: agentHandle || agentName },
+              broadcast: forceBroadcast,
+              targetContextId: typeof result.contextId === "string" && !result.contextFallback ? result.contextId : "",
+            })
+          );
         }
         const targetNote = result.contextFallback
           ? `, target session ${result.requestedContextId} gone — delivered untargeted`
@@ -3738,6 +3832,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                   // server's suffixed "Name · #id" form — same distinction
                   // persistLabel's own comment draws.
                   label: sessionLabel || null,
+                  // RFC-022 D10: run this in a split terminal to read messages in full.
+                  tail: feedTap?.path() && existsSync(launcherPath(STATE_DIR)) ? launcherPath(STATE_DIR) : null,
                 },
                 null,
                 2
@@ -4197,6 +4293,9 @@ function shutdown(): void {
   if (lockRetryTimer) clearTimeout(lockRetryTimer);
   releaseSessionLock();
   removeProc(STATE_DIR, process.pid); // RFC-017 D2
+  // RFC-022: tell an attached tail the session is going, and remove the socket file.
+  // Detached — the exit below does not wait on a feed client.
+  void feedTap?.stop();
   try {
     ws?.close();
   } catch {}
@@ -4264,6 +4363,36 @@ process.stderr.write(
 // at startup only, and the session lock record (P3) reuses this exact same identity.
 // Initial `state` is "disconnected": acquireSessionLock() below decides connected vs
 // standby, and updates it. Best-effort: writeProc() never throws.
+// RFC-022 D5/D10: open this session's local feed and (re)write the launcher BEFORE the
+// record below, so the record can advertise the socket and a waiting `tail` attaches to
+// a session that is already serving. The socket is named for the PROCESS, not the
+// session key: a standby window of the same session is a different process with its own
+// (idle) feed, and must not collide with the holder's. Never fatal — startFeedTap
+// resolves to an inert tap if the socket cannot open.
+sweepStaleFeedSockets(STATE_DIR, pidAlive, (line) => process.stderr.write(line + "\n"));
+feedTap = await startFeedTap({
+  stateDir: STATE_DIR,
+  sessionKey: `p${process.pid}`,
+  hello: () => ({
+    software_id: PLUGIN_CLIENT_ID,
+    software_version: PLUGIN_VERSION,
+    agent: { id: agentId, handle: agentHandle || agentName },
+    context_id: myContextId || SESSION_KEY,
+    ...(sessionLabel ? { label: sessionLabel } : {}),
+    ...(process.env.CLAUDE_PROJECT_DIR ? { cwd: process.env.CLAUDE_PROJECT_DIR } : {}),
+  }),
+  log: (line) => process.stderr.write(line + "\n"),
+});
+// A shutdown that arrived during the await above found `feedTap` null and closed nothing.
+if (shuttingDown) void feedTap.stop();
+// Only a CURRENT copy writes the launcher. An old window restarting from an orphaned
+// plugin root (a newer version is installed; this directory is on its deletion clock)
+// would otherwise point the launcher back at a directory that is about to disappear.
+try {
+  if (!CLAUDE_PLUGIN_ROOT || readOrphanedAt(CLAUDE_PLUGIN_ROOT) === null) writeLauncher(STATE_DIR, import.meta.dir);
+} catch (err) {
+  process.stderr.write(`bridge channel: could not write the tail launcher: ${err instanceof Error ? err.message : String(err)}\n`);
+}
 {
   const id = myIdentity();
   const proc: ProcInfo = {
@@ -4278,6 +4407,7 @@ process.stderr.write(
     termProgram: id.termProgram,
     cwd: id.cwd,
     state: "disconnected",
+    ...(feedTap.path() ? { feed: feedTap.path() } : {}),
   };
   writeProc(STATE_DIR, proc);
 }

@@ -10,7 +10,7 @@
  * "installation locked", 0.23 retirement at boot, …).
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, cpSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, cpSync, lstatSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -22,6 +22,17 @@ import { joinStateSeq } from "../auth/core/join-state";
 import { enrolledProfile } from "./key-fixtures";
 import { CredentialManager } from "../auth/manager";
 import { resolveProfile } from "../auth/profile";
+
+/**
+ * A copy of a state directory, as a thief or a backup tool would take it. A live plugin
+ * now keeps a unix socket in there (`feed/p<pid>.sock`, RFC-022), and `cpSync` refuses a
+ * socket outright where `cp -R` and rsync skip it — so the copy skips it too. A socket
+ * is not a credential, and a copied socket file would be dead anyway.
+ */
+function copyStateDir(from: string, to: string): void {
+  cpSync(from, to, { recursive: true, filter: (src) => !lstatSync(src).isSocket() });
+}
+
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
 const SESSION = "11111111-2222-3333-4444-555555555555";
@@ -428,7 +439,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         {},
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-          cpSync(dir, loot, { recursive: true });
+          copyStateDir(dir, loot);
           const thief = otherManager(stub, loot, "thief");
           await thief.accessToken();
           thief.stop();
@@ -461,7 +472,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         {},
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-          cpSync(dir, loot, { recursive: true }); // the copy: state at seq 1
+          copyStateDir(dir, loot); // the copy: state at seq 1
           stub.expireAccess();
           await client.callTool({ name: "list_channels", arguments: {} }); // this machine moves on to seq 2
           expect(stub.stats.mints).toBe(2);
@@ -494,7 +505,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-          cpSync(dir, loot, { recursive: true });
+          copyStateDir(dir, loot);
           const thief = otherManager(stub, loot, "thief");
           await thief.accessToken();
           thief.stop();

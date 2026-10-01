@@ -34,7 +34,7 @@
  * `bun test` shares one process across files, and the API's db module binds its pool at import.
  */
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, cpSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, cpSync, lstatSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -62,6 +62,17 @@ import { resolveProfile } from "../auth/profile";
 import { PLUGIN_CLIENT_ID } from "../auth/client-id";
 import { startAuthStub } from "./agent-auth-stub";
 import pkg from "../package.json" with { type: "json" };
+
+/**
+ * A copy of a state directory, as a thief or a backup tool would take it. A live plugin
+ * now keeps a unix socket in there (`feed/p<pid>.sock`, RFC-022), and `cpSync` refuses a
+ * socket outright where `cp -R` and rsync skip it — so the copy skips it too. A socket
+ * is not a credential, and a copied socket file would be dead anyway.
+ */
+function copyStateDir(from: string, to: string): void {
+  cpSync(from, to, { recursive: true, filter: (src) => !lstatSync(src).isSocket() });
+}
+
 
 /** RFC-017 P9: this build's own reported version — never a hardcoded string that
  * drifts from the next bump. */
@@ -798,8 +809,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
           reconnect: false,
         });
       try {
-        cpSync(dir, loot, { recursive: true });
-        cpSync(dir, stale, { recursive: true });
+        copyStateDir(dir, loot);
+        copyStateDir(dir, stale);
         expect((await mintFrom(loot, "thief")).token_type).toBe("DPoP");
         // The legitimate machine's next mint presents the now-stale state: refused AND locked.
         // (Minted from a copy, not by a second plugin process: that process would delete the
