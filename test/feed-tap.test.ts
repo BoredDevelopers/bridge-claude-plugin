@@ -216,7 +216,8 @@ function startStub(): Stub {
       if (req.method === "GET" && url.pathname === "/api/channels") {
         channelHits++;
         if (held) await held;
-        return Response.json({ channels: [{ id: "chan-dev-id", name: "dev" }] });
+        // `ops` appears from the second request on: a channel created after the first load.
+        return Response.json({ channels: [{ id: "chan-dev-id", name: "dev" }, ...(channelHits > 1 ? [{ id: "chan-new-id", name: "ops" }] : [])] });
       }
       if (req.method === "POST" && url.pathname === "/api/messages") {
         const body = await req.json();
@@ -380,24 +381,44 @@ describe("a running plugin serves its feed", () => {
     expect(seen).toEqual(["msg-barrier"]);
   }, 30_000);
 
-  test("the feed keeps arrival order, and asks for channel names only when a message needs one", async () => {
+  test("the feed asks for channel names only when a message needs one, and keeps arrival order across the fetch", async () => {
     await boot();
     const { frames } = await attach();
     // Connected, no messages yet: serving a feed costs the API nothing.
     expect(stub.channelHits()).toBe(0);
     const now = () => new Date().toISOString();
-    // The first message needs the name (one fetch); the second arrives while that fetch
-    // is in flight and must not overtake it.
-    stub.holdChannels();
-    stub.send({ type: "message", data: { id: "ord-1", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "first", createdAt: now() }, deliveryReasons: ["mention"] });
-    stub.send({ type: "message", data: { id: "ord-2", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "second", createdAt: now() }, deliveryReasons: ["mention"] });
-    await until("the channel-name request", () => stub.channelHits() === 1);
-    stub.releaseChannels();
-    const first = await nextMessage(frames, "ord-1");
-    const second = await nextMessage(frames, "ord-2"); // would time out if ord-2 had gone first: nextMessage skips past it
-    expect([first.channel.name, second.channel.name]).toEqual(["dev", "dev"]);
+    const from = (id: string, channelId: string) =>
+      stub.send({ type: "message", data: { id, channelId, agentId: "kevin-id", agentName: "kevin", content: id, createdAt: now() }, deliveryReasons: ["mention"] });
+
+    // The first message needs a name: one fetch, and `#dev` on the frame.
+    from("ord-1", "chan-dev-id");
+    expect((await nextMessage(frames, "ord-1")).channel.name).toBe("dev");
     expect(stub.channelHits()).toBe(1);
-  }, 30_000);
+
+    // The plugin refreshes the map at most once per 5 s (CHANNEL_MAP_MIN_REFRESH_MS). The
+    // reorder can only happen when a refresh actually goes out, so wait the floor out.
+    // This is a rate-limit window, not an assertion: nothing below depends on its length
+    // beyond "the next unknown channel triggers a request".
+    await Bun.sleep(5200);
+
+    // A message in a channel the map does not have yet starts a fetch, held open here.
+    // A message in a KNOWN channel arrives during it and must not overtake.
+    stub.holdChannels();
+    from("ord-2-new-channel", "chan-new-id");
+    await until("the refresh for the unknown channel", () => stub.channelHits() === 2);
+    from("ord-3-known-channel", "chan-dev-id");
+    // ord-3 has been handed to the host — so the plugin has processed it — while the
+    // fetch is still held. Only then release.
+    await until("ord-3 to reach the host", () => out.includes("ord-3-known-channel"));
+    stub.releaseChannels();
+
+    const order: Array<[string, string]> = [];
+    while (order.length < 2) {
+      const r: any = await Promise.race([frames.next(), Bun.sleep(8000).then(() => { throw new Error("timed out waiting for ord-2 and ord-3"); })]);
+      if (r.value?.t === "message") order.push([r.value.id, r.value.channel.name]);
+    }
+    expect(order).toEqual([["ord-2-new-channel", "ops"], ["ord-3-known-channel", "dev"]]);
+  }, 40_000);
 
   test("a channel outside BRIDGE_CHANNELS is filtered from the feed exactly as from the host", async () => {
     await boot({ BRIDGE_CHANNELS: "ops" });
