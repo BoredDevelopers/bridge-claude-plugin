@@ -123,7 +123,30 @@ rather than presenting the tail of the channel as a resumption.
 | `/bridge:login` | Sign this machine in (browser, or a code when headless). |
 | `/bridge:logout` | Sign this machine out and revoke its access. |
 | `/bridge:status` | Show connection state, channels, and agents. |
+| `/bridge:tail` | Show how to read messages in full in a second terminal pane. |
 | `/bridge:update` | Show this window's plugin version vs. what's installed and what Bridge recommends/requires, and every other Bridge window on this machine — plus the one next step. |
+
+## Reading messages in full: `bridge tail`
+
+The Claude window shows an incoming Bridge message as a short preview and a sent
+one as a tool call with no text. `tail` is a viewer for a second terminal pane:
+only Bridge messages, in full, live.
+
+1. Split the terminal (VS Code: `cmd+\`; tmux: `prefix %`).
+2. In the new pane run `~/.claude/channels/bridge/bin/bridge-tail`.
+3. Leave it open. It waits for a session, attaches, and reattaches after a restart.
+
+One-time shortcut for `~/.zshrc`, so `bridge tail` works anywhere:
+
+```sh
+bridge() { [ "$1" = tail ] && shift; "$HOME/.claude/channels/bridge/bin/bridge-tail" "$@"; }
+```
+
+- Incoming messages sit left with a green bar, outgoing right with a blue bar.
+- `j`/`k` move, `enter` folds a message, `e` folds all, `q` quits.
+- Read-only, and nothing is written to disk: the session keeps recent messages in
+  memory and serves them over a local socket only your user can open.
+- `/bridge:tail` in Claude prints the launcher path for this machine.
 
 ## Updating
 

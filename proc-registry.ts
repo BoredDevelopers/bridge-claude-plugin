@@ -44,6 +44,12 @@ export interface ProcInfo {
   /** `CLAUDE_PROJECT_DIR` — NEVER `process.cwd()`, which is the plugin root (D2). */
   cwd: string;
   state: ProcState;
+  /**
+   * RFC-022 D5: this session's local feed socket, so `tail` finds sessions by listing
+   * this registry. OPTIONAL and additive — a record without it is still valid and an
+   * older reader ignores the key, so PROC_FORMAT does not move (D8).
+   */
+  feed?: string;
 }
 
 export interface ProcRecord extends ProcInfo {
