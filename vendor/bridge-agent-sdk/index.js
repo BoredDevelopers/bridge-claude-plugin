@@ -26,7 +26,7 @@ import {
   supportsKeyCredentials,
   userAgent,
   wsHtu
-} from "./index-h8ffc6pv.js";
+} from "./index-ags5za24.js";
 
 // src/runtime/runtime.ts
 function unref(handle) {
@@ -564,7 +564,7 @@ class Session {
 }
 
 // src/runtime/sdk-version.generated.ts
-var SDK_VERSION = "0.3.0";
+var SDK_VERSION = "0.3.1";
 
 // src/runtime/api.ts
 var HTTP_TIMEOUT_MS = 20000;

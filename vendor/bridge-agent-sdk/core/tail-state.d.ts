@@ -59,6 +59,11 @@ export type TailEvent =
 } | {
     type: "key";
     key: TailKey;
+}
+/** A click on a message: select it and apply the `enter` action. (The app maps the screen row to the key.) */
+ | {
+    type: "activate";
+    key: string;
 } | {
     type: "focus";
     focused: boolean;
@@ -82,5 +87,22 @@ export type TailEvent =
 export declare function messageKey(m: Pick<FeedMessage, "id">, session?: string): string;
 export declare function hasMessage(state: TailState, key: string): boolean;
 export declare function tailReduce(s: TailState, ev: TailEvent): TailState;
-/** Raw terminal input to events: arrows, enter, ctrl-c, focus in/out, and single keys. */
-export declare function parseTailInput(chunk: string): TailEvent[];
+/** What the terminal can tell us: the reducer's events, plus a click at a screen position (1-based). */
+export type TailInputEvent = TailEvent | {
+    type: "click";
+    x: number;
+    y: number;
+};
+export interface TailInputParser {
+    push(chunk: string): TailInputEvent[];
+}
+/**
+ * Raw terminal input to events — arrows, enter, ctrl-c, focus in/out, single keys, and SGR
+ * mouse reports (left press = click; wheel = up/down; everything else — release, drag,
+ * motion, other buttons, modified clicks — is dropped). Stateful: a sequence cut by a chunk
+ * boundary is HELD and finished by the next chunk, so the digits and `M` of a split mouse
+ * report can never reach the keymap as `G`/`g`/`q`/`e`/`j`/`k` actions.
+ */
+export declare function createTailInputParser(): TailInputParser;
+/** One-shot, stateless form of `createTailInputParser` (a sequence split across calls is not rejoined). */
+export declare function parseTailInput(chunk: string): TailInputEvent[];

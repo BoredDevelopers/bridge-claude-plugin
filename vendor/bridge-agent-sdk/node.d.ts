@@ -22,5 +22,5 @@ export { readVersioned } from "./node/format-guard";
 export { hostname } from "./node/hostname";
 export { feedServer, resolveFeedSocketPath, type FeedServer, type FeedServerOptions, type FeedPathOptions, type FeedHelloInfo, type FeedHistoryHandler, type FeedHistoryResult, } from "./node/feed-server";
 export { feedClient, type FeedClient, type FeedClientOptions } from "./node/feed-client";
-export { runTail, TAIL_ENTER, TAIL_LEAVE, type TailOptions, type TailResult, type TailInput, type TailOutput, type TailProcess, } from "./node/tail";
+export { runTail, TAIL_ENTER, tailEnter, tailLeave, TAIL_LEAVE, type TailOptions, type TailResult, type TailInput, type TailOutput, type TailProcess, } from "./node/tail";
 export { tailMain, parseTailArgs, TAIL_USAGE, type TailArgs } from "./node/tail-main";

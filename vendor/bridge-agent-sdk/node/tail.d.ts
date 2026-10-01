@@ -42,6 +42,12 @@ export interface TailOptions {
     process?: TailProcess;
     /** Default: stdout is a TTY and `NO_COLOR` is unset. */
     color?: boolean;
+    /**
+     * Mouse reporting (click a message to fold it, wheel to scroll). Default true on a TTY.
+     * While it is on a terminal's own text selection needs a modifier (Option-drag on macOS,
+     * Shift-drag elsewhere); `false` writes no mouse sequence at all.
+     */
+    mouse?: boolean;
     /** Registry poll interval. Default 1000 ms. */
     pollIntervalMs?: number;
     /** Row width when stdout has no `columns` (piped). Default 100. */
@@ -64,10 +70,16 @@ export type TailResult = {
 };
 /**
  * Alternate screen, hidden cursor, focus reporting (so the title can count what arrived
- * while you were elsewhere), and autowrap OFF: any row a width miscount lets through is
- * clipped at the edge instead of wrapping and scrolling the whole screen.
+ * while you were elsewhere), autowrap OFF (any row a width miscount lets through is clipped
+ * at the edge instead of wrapping and scrolling the whole screen) and, unless `mouse` is
+ * false, SGR mouse reporting.
  */
-export declare const TAIL_ENTER = "\u001B[?1049h\u001B[?25l\u001B[?1004h\u001B[?7l";
-/** The inverse of `TAIL_ENTER`, plus clearing the title it set. */
-export declare const TAIL_LEAVE = "\u001B[?7h\u001B[?1004l\u001B[?25h\u001B[?1049l\u001B]2;\u0007";
+export declare function tailEnter(mouse: boolean): string;
+/**
+ * The inverse of `tailEnter`, plus clearing the title it set. Mouse reporting goes off FIRST:
+ * a tail that leaves it on makes the user's shell print garbage on every click.
+ */
+export declare function tailLeave(mouse: boolean): string;
+export declare const TAIL_ENTER: string;
+export declare const TAIL_LEAVE: string;
 export declare function runTail(options?: TailOptions): Promise<TailResult>;

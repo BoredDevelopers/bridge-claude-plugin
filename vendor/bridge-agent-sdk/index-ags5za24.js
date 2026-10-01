@@ -500,12 +500,20 @@ var TAIL_SGR = {
   greenHalf: "38;5;29",
   blueHalf: "38;5;25"
 };
-function paint(segs, color) {
+var TAIL_SELECT_BG = "48;5;237";
+function paint(segs, color, bg = false) {
   let out = "";
   for (const [style, text] of segs) {
     if (text === "")
       continue;
-    out += color && style !== "none" ? `\x1B[${TAIL_SGR[style]}m${text}\x1B[0m` : text;
+    if (!color)
+      out += text;
+    else if (style === "none" && !bg)
+      out += text;
+    else {
+      const codes = [style === "none" ? "" : TAIL_SGR[style], bg ? TAIL_SELECT_BG : ""].filter(Boolean).join(";");
+      out += `\x1B[${codes}m${text}\x1B[0m`;
+    }
   }
   return out;
 }
@@ -924,8 +932,16 @@ function renderMessage(m, o) {
   const { indent, content } = messageLayout(m.dir, o.width);
   const lk = look(m);
   const barChar = o.selected ? "┃" : "│";
-  const prefix = () => [["none", " ".repeat(indent)], [lk.bar, barChar], ["none", " "]];
-  const row = (segs) => paint([...prefix(), ...segs], o.color);
+  const row = (segs, hdr = false) => {
+    const mark = o.selected === true && hdr;
+    const all = [["none", " ".repeat(indent)], [lk.bar, barChar], ["none", mark && !o.color ? "›" : " "], ...segs];
+    if (mark && o.color) {
+      const pad = o.width - segsWidth(all);
+      if (pad > 0)
+        all.push(["none", " ".repeat(pad)]);
+    }
+    return paint(all, o.color, mark && o.color);
+  };
   const rows = [];
   const parts = headerParts(m, o, fold === "folded");
   if (fold === "folded") {
@@ -949,15 +965,15 @@ function renderMessage(m, o) {
       segs.push(["none", " "], [lk.text, truncateTo(first, left)]);
     if (suffix !== "")
       segs.push(["dim", suffix]);
-    rows.push(row(segs));
+    rows.push(row(segs, true));
     return rows;
   }
   const head = headerSegs(parts, content, 0);
   if (segsWidth(head) <= content)
-    rows.push(row(head));
+    rows.push(row(head, true));
   else
     for (const r of wrapSegs(head, content))
-      rows.push(row(r));
+      rows.push(row(r, true));
   const body = bodyRows(m, content);
   const capped = fold === "open" && body.length > BODY_CAP_ROWS;
   for (const line of capped ? body.slice(0, BODY_CAP_ROWS) : body)
@@ -1011,6 +1027,7 @@ function createRenderCache() {
 }
 function renderTranscript(messages, view, o) {
   const rows = [];
+  const rowKeys = [];
   const spans = [];
   let day = null;
   for (const m of messages) {
@@ -1018,10 +1035,13 @@ function renderTranscript(messages, view, o) {
     const d = dayKey(m.ts);
     if (d !== "" && d !== day) {
       rows.push(dateSeparator(m.ts, o.width, o.color));
+      rowKeys.push(null);
       day = d;
     }
-    if (view.unreadFromKey != null && m.key === view.unreadFromKey)
+    if (view.unreadFromKey != null && m.key === view.unreadFromKey) {
       rows.push(newDivider(o.width, o.color));
+      rowKeys.push(null);
+    }
     const fold = view.fold?.(m.key) ?? "open";
     const selected = m.key === view.selectedKey;
     const ck = `${m.key}|${o.width}|${fold}|${selected ? 1 : 0}|${o.color ? 1 : 0}|${o.showSession ? 1 : 0}`;
@@ -1038,9 +1058,11 @@ function renderTranscript(messages, view, o) {
       }
     }
     rows.push(...mrows);
+    for (let i = 0;i < mrows.length; i++)
+      rowKeys.push(m.key);
     spans.push({ key: m.key, start, end: rows.length - 1 });
   }
-  return { rows, spans };
+  return { rows, rowKeys, spans };
 }
 function viewport(t, height, o) {
   const h = Math.max(1, height);
@@ -1058,7 +1080,7 @@ function viewport(t, height, o) {
       top = Math.min(top, maxTop);
     }
   }
-  return { rows: t.rows.slice(top, top + h), top };
+  return { rows: t.rows.slice(top, top + h), keys: t.rowKeys.slice(top, top + h), top };
 }
 var STATE_TEXT = {
   waiting: ["waiting for a Bridge session…", "dim"],
@@ -1079,11 +1101,14 @@ function renderHeader(info, width, color) {
   return paint(truncateSegs(segs, w), color);
 }
 var HINTS = "j/k move · enter fold · e fold all · q quit";
+var HINTS_MOUSE = "j/k move · enter fold · click fold · e fold all · q quit";
+var COPY_HINT = "Opt/Shift-drag copies";
 function renderFooter(info, width, color) {
   const w = Math.max(MIN_WIDTH, width);
   const counts = `${info.total} ${info.total === 1 ? "message" : "messages"} · ${info.ins} in · ${info.outs} out`;
-  const full = `${counts} · ${HINTS}`;
-  return paint([["dim", stringWidth(full) <= w ? full : truncateTo(counts, w)]], color);
+  const tiers = info.mouse ? [`${counts} · ${HINTS_MOUSE} · ${COPY_HINT}`, `${counts} · ${HINTS_MOUSE}`] : [`${counts} · ${HINTS}`];
+  const fit = tiers.find((t) => stringWidth(t) <= w);
+  return paint([["dim", fit ?? truncateTo(counts, w)]], color);
 }
 // src/core/tail-state.ts
 var TAIL_MAX_MESSAGES = 2000;
@@ -1175,6 +1200,16 @@ function setFold(s, key, f) {
     fold.set(key, f);
   return { ...s, fold };
 }
+function toggleFold(s, m) {
+  if (!m)
+    return s;
+  const f = s.fold.get(m.key) ?? "open";
+  if (f === "folded")
+    return setFold(s, m.key, "open");
+  if (f === "open" && isCapped(m, s.size.cols))
+    return setFold(s, m.key, "full");
+  return setFold(s, m.key, "folded");
+}
 function onKey(s0, key) {
   const s = clearUnread({ ...s0, focused: true });
   const idx = s.messages.findIndex((m) => m.key === s.selected);
@@ -1189,17 +1224,8 @@ function onKey(s0, key) {
       return move(s, 0);
     case "G":
       return move(s, s.messages.length - 1);
-    case "enter": {
-      const m = s.messages[idx];
-      if (!m)
-        return s;
-      const f = s.fold.get(m.key) ?? "open";
-      if (f === "folded")
-        return setFold(s, m.key, "open");
-      if (f === "open" && isCapped(m, s.size.cols))
-        return setFold(s, m.key, "full");
-      return setFold(s, m.key, "folded");
-    }
+    case "enter":
+      return toggleFold(s, s.messages[idx]);
     case "e": {
       const anyOpen = s.messages.some((m) => (s.fold.get(m.key) ?? "open") !== "folded");
       const fold = new Map;
@@ -1227,6 +1253,12 @@ function tailReduce(s, ev) {
     }
     case "key":
       return onKey(s, ev.key);
+    case "activate": {
+      const i = s.messages.findIndex((m) => m.key === ev.key);
+      if (i < 0)
+        return s;
+      return toggleFold(move(clearUnread({ ...s, focused: true }), i), s.messages[i]);
+    }
     case "focus":
       return ev.focused ? clearUnread({ ...s, focused: true }) : s.focused ? { ...s, focused: false } : s;
     case "resize":
@@ -1240,35 +1272,65 @@ function tailReduce(s, ev) {
   }
 }
 var ESCAPE = /^\x1b(?:\[[0-?]*[ -\/]*[@-~]|O[@-~])/;
-function parseTailInput(chunk) {
-  const out = [];
-  let rest = chunk;
-  while (rest !== "") {
-    const esc = ESCAPE.exec(rest);
-    if (esc) {
-      const seq = esc[0];
-      rest = rest.slice(seq.length);
-      if (seq === "\x1B[A" || seq === "\x1BOA")
-        out.push({ type: "key", key: "up" });
-      else if (seq === "\x1B[B" || seq === "\x1BOB")
-        out.push({ type: "key", key: "down" });
-      else if (seq === "\x1B[I")
-        out.push({ type: "focus", focused: true });
-      else if (seq === "\x1B[O")
-        out.push({ type: "focus", focused: false });
-      continue;
-    }
-    const ch = String.fromCodePoint(rest.codePointAt(0));
-    rest = rest.slice(ch.length);
-    if (ch === "\x03")
-      out.push({ type: "key", key: "ctrl-c" });
-    else if (ch === "\r" || ch === `
+var ESCAPE_PREFIX = /^\x1b(?:\[[0-?]*[ -\/]*|O)?$/;
+var MOUSE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+function createTailInputParser() {
+  let held = "";
+  return {
+    push(chunk) {
+      const out = [];
+      let rest = held + chunk;
+      held = "";
+      while (rest !== "") {
+        if (rest[0] === "\x1B") {
+          const esc = ESCAPE.exec(rest);
+          if (!esc) {
+            if (ESCAPE_PREFIX.test(rest)) {
+              held = rest;
+              break;
+            }
+            rest = rest.slice(1);
+            continue;
+          }
+          const seq = esc[0];
+          rest = rest.slice(seq.length);
+          const mouse = MOUSE.exec(seq);
+          if (mouse) {
+            const b = Number(mouse[1]);
+            if (mouse[4] === "M") {
+              if (b === 0)
+                out.push({ type: "click", x: Number(mouse[2]), y: Number(mouse[3]) });
+              else if (b === 64)
+                out.push({ type: "key", key: "up" });
+              else if (b === 65)
+                out.push({ type: "key", key: "down" });
+            }
+          } else if (seq === "\x1B[A" || seq === "\x1BOA")
+            out.push({ type: "key", key: "up" });
+          else if (seq === "\x1B[B" || seq === "\x1BOB")
+            out.push({ type: "key", key: "down" });
+          else if (seq === "\x1B[I")
+            out.push({ type: "focus", focused: true });
+          else if (seq === "\x1B[O")
+            out.push({ type: "focus", focused: false });
+          continue;
+        }
+        const ch = String.fromCodePoint(rest.codePointAt(0));
+        rest = rest.slice(ch.length);
+        if (ch === "\x03")
+          out.push({ type: "key", key: "ctrl-c" });
+        else if (ch === "\r" || ch === `
 `)
-      out.push({ type: "key", key: "enter" });
-    else if (ch !== "\x1B")
-      out.push({ type: "key", key: ch });
-  }
-  return out;
+          out.push({ type: "key", key: "enter" });
+        else
+          out.push({ type: "key", key: ch });
+      }
+      return out;
+    }
+  };
+}
+function parseTailInput(chunk) {
+  return createTailInputParser().push(chunk);
 }
 // src/core/b64url.ts
 function b64url(bytes) {
@@ -1844,4 +1906,4 @@ class TokenClient {
 function isKeyAlreadyEnrolled(e) {
   return isOAuthError(e) && e.error === "invalid_dpop_proof" && e.description === "key_already_enrolled";
 }
-export { ADDRESSED_REASONS, BROADCAST_REASONS, isAddressed, WS_CLOSE_CODES, classifyClose, reconnectDelay, closeOutcome, DEFAULT_HOLDER_VERSION, decideLock, KNOWN_FORMAT, classifyVersioned, isNewerFormat, userAgent, identityTokenClientOptions, Dedupe, MAX_REPLAY_AGE_MS, sinceParam, advanceCursor, stripControlChars, FEED_PROTOCOL_VERSION, FEED_SERVER_FRAME_KINDS, FEED_CLIENT_FRAME_KINDS, FeedError, isFeedError, encodeFrame, FEED_MAX_LINE, FeedLineDecoder, parseServerFrame, parseClientFrame, FEED_RING_MAX_EVENTS, FEED_RING_MAX_BYTES, FeedRing, BODY_CAP_ROWS, TAIL_SGR, cleanText, cleanLine, charWidth, stringWidth, truncateTo, bodyRows, messageLayout, isCapped, clockOf, dayKey, renderMessage, clipRow, dateSeparator, newDivider, createRenderCache, renderTranscript, viewport, renderHeader, renderFooter, TAIL_MAX_MESSAGES, initialTailState, messageKey, hasMessage, tailReduce, parseTailInput, randomB64url, isP256PublicJwk, isP256PrivateJwk, jwkThumbprint, softwareSigner, generateSoftwareKey, deadline, normalizeHtu, apiOrigin, httpHtu, wsHtu, dpopProof, CLIENT_ASSERTION_TYPE, ASSERTION_TTL_S, clientAssertion, MAX_CLOCK_OFFSET_MS, Clock, isJoinState, joinStateSeq, OAuthError, isOAuthError, TransportError, DiscoveryError, AbortedError, GONE_REASONS, assertNever, classifyTokenError, MINT_TIMEOUT_MS, MINT_BUDGET_MS, METADATA_TTL_MS, supportsKeyCredentials, TokenClient, isKeyAlreadyEnrolled };
+export { ADDRESSED_REASONS, BROADCAST_REASONS, isAddressed, WS_CLOSE_CODES, classifyClose, reconnectDelay, closeOutcome, DEFAULT_HOLDER_VERSION, decideLock, KNOWN_FORMAT, classifyVersioned, isNewerFormat, userAgent, identityTokenClientOptions, Dedupe, MAX_REPLAY_AGE_MS, sinceParam, advanceCursor, stripControlChars, FEED_PROTOCOL_VERSION, FEED_SERVER_FRAME_KINDS, FEED_CLIENT_FRAME_KINDS, FeedError, isFeedError, encodeFrame, FEED_MAX_LINE, FeedLineDecoder, parseServerFrame, parseClientFrame, FEED_RING_MAX_EVENTS, FEED_RING_MAX_BYTES, FeedRing, BODY_CAP_ROWS, TAIL_SGR, TAIL_SELECT_BG, cleanText, cleanLine, charWidth, stringWidth, truncateTo, bodyRows, messageLayout, isCapped, clockOf, dayKey, renderMessage, clipRow, dateSeparator, newDivider, createRenderCache, renderTranscript, viewport, renderHeader, renderFooter, TAIL_MAX_MESSAGES, initialTailState, messageKey, hasMessage, tailReduce, createTailInputParser, parseTailInput, randomB64url, isP256PublicJwk, isP256PrivateJwk, jwkThumbprint, softwareSigner, generateSoftwareKey, deadline, normalizeHtu, apiOrigin, httpHtu, wsHtu, dpopProof, CLIENT_ASSERTION_TYPE, ASSERTION_TTL_S, clientAssertion, MAX_CLOCK_OFFSET_MS, Clock, isJoinState, joinStateSeq, OAuthError, isOAuthError, TransportError, DiscoveryError, AbortedError, GONE_REASONS, assertNever, classifyTokenError, MINT_TIMEOUT_MS, MINT_BUDGET_MS, METADATA_TTL_MS, supportsKeyCredentials, TokenClient, isKeyAlreadyEnrolled };

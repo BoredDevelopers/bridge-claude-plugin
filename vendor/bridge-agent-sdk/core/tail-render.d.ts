@@ -16,6 +16,11 @@ export type TailStyle = "none" | "dim" | "mute" | "bright" | "amber" | "green" |
  * rather than SGR 2 (faint), which terminals disagree about.
  */
 export declare const TAIL_SGR: Record<Exclude<TailStyle, "none">, string>;
+/**
+ * The selected header's background: a dark grey that reads as a bar on both dark and light
+ * themes without reverse video (which flips every colour on the row).
+ */
+export declare const TAIL_SELECT_BG = "48;5;237";
 /** Free text: control characters out (again), plus the bidi overrides and unpaired surrogates. */
 export declare function cleanText(s: string): string;
 /** A name-like field: cleaned, and a newline or tab becomes a space so it stays on one row. */
@@ -87,6 +92,8 @@ export interface RenderCache {
 export declare function createRenderCache(): RenderCache;
 export interface Transcript {
     rows: string[];
+    /** Per row, the message it belongs to — `null` for a date line or the `new` divider. What a click lands on. */
+    rowKeys: (string | null)[];
     /** Per message, the rows it owns (its date line and `new` divider included) — what the viewport keeps in sight. */
     spans: {
         key: string;
@@ -111,6 +118,7 @@ export interface ViewportOptions {
  */
 export declare function viewport(t: Transcript, height: number, o: ViewportOptions): {
     rows: string[];
+    keys: (string | null)[];
     top: number;
 };
 export type TailConnection = "waiting" | "connected" | "reconnecting" | "stopped" | "ended";
@@ -125,6 +133,8 @@ export interface FooterInfo {
     total: number;
     ins: number;
     outs: number;
+    /** Mouse reporting is on: say what a click does, and how to copy text anyway. */
+    mouse?: boolean;
 }
-/** `N messages · X in · Y out`, with the key hints when they fit. */
+/** `N messages · X in · Y out`, with the key hints (longest that fits). */
 export declare function renderFooter(info: FooterInfo, width: number, color: boolean): string;

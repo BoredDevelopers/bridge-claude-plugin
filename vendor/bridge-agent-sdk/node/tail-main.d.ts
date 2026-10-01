@@ -1,11 +1,12 @@
 import { type TailOptions } from "./tail";
-export declare const TAIL_USAGE = "usage: bridge-tail (--procs <dir> ... | --socket <path>) [options]\n\n  --procs <dir>      proc-registry state dir to find sessions in (repeatable)\n  --socket <path>    attach to this feed socket directly\n  --session <sel>    pick a session by label, context id, sessionKey prefix or pid\n  --all              merge every live session, with a session column\n  --no-color         plain text, no colour\n  --help             this text\n\nkeys: j/k or arrows move, enter folds (opens the rest of a long message), e folds all, g/G first/last, q quits\n";
+export declare const TAIL_USAGE = "usage: bridge-tail (--procs <dir> ... | --socket <path>) [options]\n\n  --procs <dir>      proc-registry state dir to find sessions in (repeatable)\n  --socket <path>    attach to this feed socket directly\n  --session <sel>    pick a session by label, context id, sessionKey prefix or pid\n  --all              merge every live session, with a session column\n  --no-color         plain text, no colour\n  --no-mouse         no mouse reporting (click-to-fold, wheel); needed for plain terminal text\n                     selection \u2014 with the mouse on, copy with Option-drag (macOS) or Shift-drag\n  --help             this text\n\nkeys: j/k, arrows or the wheel move; enter or a click folds (opens the rest of a long message), e folds all, g/G first/last, q quits\n";
 export interface TailArgs {
     procsDirs: string[];
     socket?: string;
     session?: string;
     all: boolean;
     color?: boolean;
+    mouse?: boolean;
     help: boolean;
 }
 /** Throws a plain `Error` whose message is the whole complaint. */

@@ -9,8 +9,10 @@ import {
   procStartMatches,
   procStartOf,
   runTail,
+  tailEnter,
+  tailLeave,
   tailMain
-} from "./index-sj1dj0nx.js";
+} from "./index-rxjxqpxq.js";
 import"./index-0nd9zcgb.js";
 import {
   FEED_PROTOCOL_VERSION,
@@ -28,7 +30,7 @@ import {
   isP256PrivateJwk,
   parseClientFrame,
   randomB64url
-} from "./index-h8ffc6pv.js";
+} from "./index-ags5za24.js";
 
 // src/node/store.ts
 import { readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
@@ -920,6 +922,8 @@ export {
   sessionLock,
   sweepLockTombstones,
   sweepOrphanTemps,
+  tailEnter,
+  tailLeave,
   tailMain,
   withInstallationLock
 };
