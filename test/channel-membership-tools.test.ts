@@ -28,6 +28,11 @@ const SECRET = "01a11c21-175f-7000-9449-f0a07118354b";
 const GONE = "01a11c21-175f-7000-9449-f0a07118354c";
 const OLD = "01a11c21-175f-7000-9449-f0a07118354d";
 const TASK = "01a11c21-175f-7000-9449-f0a0711835aa";
+const MINE = "01a11c21-175f-7000-9449-f0a07118354e"; // private, this agent is in it (its last owner)
+const OPS_UPPER = "01a11c21-175f-7000-9449-f0a071183501"; // "Ops"
+const OPS_LOWER = "01a11c21-175f-7000-9449-f0a071183502"; // "ops" — names differ only in case
+const DUP_A = "01a11c21-175f-7000-9449-f0a071183503"; // "Dup"
+const DUP_B = "01a11c21-175f-7000-9449-f0a071183504"; // "dUp"
 
 type Call = { method: string; path: string };
 
@@ -50,20 +55,31 @@ function startStub() {
         if (srv.upgrade(req)) return;
       }
       calls.push({ method: req.method, path: url.pathname });
+      /**
+       * As the real server lists them: PUBLIC channels and the private ones this agent
+       * is in — never a private channel it is not in (SECRET) — and archived ones
+       * only when asked (`includeArchived=true`).
+       */
       if (req.method === "GET" && url.pathname === "/api/channels") {
-        return Response.json({
-          channels: [
-            { id: GENERAL, name: "general" },
-            { id: SECRET, name: "secret" },
-            { id: GONE, name: "gone" },
-            { id: OLD, name: "old" },
-          ],
-        });
+        const channels = [
+          { id: GENERAL, name: "general" },
+          { id: MINE, name: "mine" },
+          { id: GONE, name: "gone" },
+          { id: OPS_UPPER, name: "Ops" },
+          { id: OPS_LOWER, name: "ops" },
+          { id: DUP_A, name: "Dup" },
+          { id: DUP_B, name: "dUp" },
+        ];
+        if (url.searchParams.get("includeArchived") === "true") channels.push({ id: OLD, name: "old" });
+        return Response.json({ channels });
       }
       const m = url.pathname.match(/^\/api\/channels\/([^/]+)\/join$/);
       if (req.method === "POST" && m) {
         const id = m[1];
-        if (id === SECRET) return Response.json({ error: "invite_only" }, { status: 403 });
+        // The read gate runs first: a private channel the agent is NOT in is a plain
+        // 403 Forbidden; `invite_only` only for one it can read — it is already in it.
+        if (id === SECRET) return Response.json({ error: "Forbidden" }, { status: 403 });
+        if (id === MINE) return Response.json({ error: "invite_only" }, { status: 403 });
         if (id === GONE) return Response.json({ error: "removed_from_channel" }, { status: 403 });
         if (id === OLD) return Response.json({ error: "channel_archived" }, { status: 409 });
         if (id === GENERAL) {
@@ -77,14 +93,15 @@ function startStub() {
       if (req.method === "POST" && leave) {
         const id = leave[1];
         if (id === GENERAL) return Response.json({ ok: true, channelId: id, left: true, releasedTasks: 2, agentsRemoved: [] });
-        if (id === SECRET) return Response.json({ error: "last_owner" }, { status: 409 });
+        if (id === MINE) return Response.json({ error: "last_owner" }, { status: 409 });
+        if (id === OPS_UPPER || id === OPS_LOWER) return Response.json({ ok: true, channelId: id, left: true, releasedTasks: 0, agentsRemoved: [] });
         if (id === OLD) return Response.json({ error: "channel_archived" }, { status: 409 });
         return Response.json({ error: "Not a member of this channel" }, { status: 404 });
       }
       const aud = url.pathname.match(/^\/api\/channels\/([^/]+)\/audience$/);
       if (req.method === "GET" && aud) {
         if (aud[1] === GENERAL) return Response.json({ visibility: "public", workspace: { people: 3, agents: 2 } });
-        if (aud[1] === SECRET) {
+        if (aud[1] === MINE) {
           return Response.json({
             visibility: "private",
             entries: [
@@ -232,10 +249,15 @@ describe("join_channel", () => {
   });
 
   test("each refusal says what the agent can do about it", async () => {
-    const priv = await call("join_channel", { channel_id: "secret" });
+    // A private channel it is not in: not listed, so by id — the server's plain Forbidden.
+    const priv = await call("join_channel", { channel_id: SECRET });
     expect(priv.isError).toBe(true);
     expect(priv.text).toContain("private");
-    expect(priv.text).toContain("ask an owner");
+    expect(priv.text).toContain("an owner must add");
+    // A private channel it IS in: `invite_only` means nothing to do, not a refusal.
+    const mine = await call("join_channel", { channel_id: "mine" });
+    expect(mine.isError, mine.text).toBe(false);
+    expect(mine.text).toContain("already a member of #mine");
     const removed = await call("join_channel", { channel_id: "gone" });
     expect(removed.text).toContain("removed");
     const archived = await call("join_channel", { channel_id: "old" });
@@ -265,7 +287,7 @@ describe("join_channel", () => {
   });
 
   test("leave_channel: each refusal says what the agent can do", async () => {
-    expect((await call("leave_channel", { channel_id: "secret" })).text).toContain("last owner");
+    expect((await call("leave_channel", { channel_id: "mine" })).text).toContain("last owner");
     expect((await call("leave_channel", { channel_id: "old" })).text).toContain("archived");
     const notMember = await call("leave_channel", { channel_id: "gone" });
     expect(notMember.isError).toBe(true);
@@ -273,7 +295,7 @@ describe("join_channel", () => {
   });
 
   test("who_can_see: a private channel lists each reader with why", async () => {
-    const r = await call("who_can_see", { channel_id: "secret" });
+    const r = await call("who_can_see", { channel_id: "mine" });
     expect(r.isError, r.text).toBe(false);
     const body = JSON.parse(r.text);
     expect(body.visibility).toBe("private");
@@ -289,7 +311,7 @@ describe("join_channel", () => {
   });
 
   test("who_can_see: a task-only reader is told the channel's readers are counted, not named", async () => {
-    const body = JSON.parse((await call("who_can_see", { task_id: TASK })).text);
+    const body = JSON.parse((await call("who_can_see", { message_id: TASK })).text);
     expect(body.readers.map((x: any) => x.handle)).toEqual(["atlas"]);
     expect(body.channel_readers_not_named).toEqual({ people: 2, agents: 1 });
     expect(stub.calls).toContainEqual({ method: "GET", path: `/api/tasks/${TASK}/audience` });
@@ -297,9 +319,37 @@ describe("join_channel", () => {
 
   test("who_can_see: exactly one target; and not found reads as not found", async () => {
     expect((await call("who_can_see", {})).text).toContain("exactly one");
-    expect((await call("who_can_see", { channel_id: "general", task_id: TASK })).text).toContain("exactly one");
-    const nf = await call("who_can_see", { task_id: "01a11c21-175f-7000-9449-f0a0711835ff" });
+    expect((await call("who_can_see", { channel_id: "general", message_id: TASK })).text).toContain("exactly one");
+    const nf = await call("who_can_see", { message_id: "01a11c21-175f-7000-9449-f0a0711835ff" });
     expect(nf.isError).toBe(true);
     expect(nf.text).toContain("not found, or not readable");
+  });
+
+  test("names are case-sensitive: an exact match wins, a unique folded match is used, an ambiguous one is refused", async () => {
+    await call("leave_channel", { channel_id: "ops" });
+    expect(stub.calls).toContainEqual({ method: "POST", path: `/api/channels/${OPS_LOWER}/leave` });
+    expect(stub.calls.some((c) => c.path === `/api/channels/${OPS_UPPER}/leave`)).toBe(false);
+    stub.reset();
+    await call("leave_channel", { channel_id: "Ops" });
+    expect(stub.calls).toContainEqual({ method: "POST", path: `/api/channels/${OPS_UPPER}/leave` });
+    stub.reset();
+    expect((await call("join_channel", { channel_id: "GENERAL" })).text).toContain("joined #general");
+    stub.reset();
+    const amb = await call("leave_channel", { channel_id: "DUP" });
+    expect(amb.isError).toBe(true);
+    expect(amb.text).toContain("matches several channels");
+    expect(amb.text).toContain(DUP_A);
+    expect(stub.calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  test("an archived channel resolves by name, so the answer is 'archived', not 'no such channel'", async () => {
+    const r = await call("leave_channel", { channel_id: "old" });
+    expect(r.text).toContain("archived");
+    expect(stub.calls).toContainEqual({ method: "POST", path: `/api/channels/${OLD}/leave` });
+  });
+
+  test("an uppercase id is sent lowercase (the server's id pattern is lowercase)", async () => {
+    await call("join_channel", { channel_id: GENERAL.toUpperCase() });
+    expect(stub.calls).toEqual([{ method: "POST", path: `/api/channels/${GENERAL}/join` }]);
   });
 });
