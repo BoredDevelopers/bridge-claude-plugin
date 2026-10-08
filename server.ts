@@ -2293,10 +2293,59 @@ async function apiFetch(
 }
 
 /**
- * Two-tier guard for the 9 Bridge REST tools (reply, list_channels,
- * list_agents, list_contexts, read_messages, claim_task, update_task_status,
- * cancel_task, list_my_tasks). Distinct hints because they are distinct
- * fixes: unconfigured needs /bridge:configure, idle needs /bridge:connect.
+ * A channel the agent named — by id, by name, or `#name` — as the id the join /
+ * leave / audience routes take (they accept an ID only). A name is resolved against
+ * the channels this agent can see, public ones included, so a typo answers "no
+ * such channel" here rather than a bare 404 from the server.
+ */
+async function resolveChannelRef(ref: unknown): Promise<{ channelId: string; channelName: string }> {
+  const raw = String(ref ?? "").trim().replace(/^#/, "");
+  if (!raw) throw new Error("channel_id is required");
+  // The server's id pattern is lowercase-only; an uppercase id would 404 there.
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
+    return { channelId: raw.toLowerCase(), channelName: raw.toLowerCase() };
+  }
+  /**
+   * `includeArchived`: an archived channel must resolve, so join/leave can say "it is
+   * archived" rather than "no such channel". Names are unique per workspace but
+   * CASE-SENSITIVE (`Ops` and `ops` can both exist), so an exact match wins; a
+   * case-insensitive one is used only when it is the only one — never a guess, since
+   * leave_channel acts on what this returns.
+   */
+  const listRes = await apiFetch("/api/channels?includeArchived=true");
+  if (!listRes.ok) throw new Error(`Bridge API error ${listRes.status}`);
+  const all = (((await listRes.json()) as any).channels ?? []) as { id: string; name: string }[];
+  const exact = all.find((c) => c.name === raw);
+  if (exact) return { channelId: exact.id, channelName: exact.name };
+  const folded = all.filter((c) => c.name.toLowerCase() === raw.toLowerCase());
+  if (folded.length === 1) return { channelId: folded[0]!.id, channelName: folded[0]!.name };
+  if (folded.length > 1) {
+    throw new Error(
+      `"${raw}" matches several channels: ${folded.map((c) => `#${c.name} (${c.id})`).join(", ")} — pass the exact name or the id`
+    );
+  }
+  throw new Error(`no channel named "${raw}" that this agent can see`);
+}
+
+/** Why a reader can see it — the web's wording (decision 17). */
+function audienceReasonText(r: any): string {
+  const agent = r.agentHandle ? `@${r.agentHandle}` : "an agent";
+  switch (r.code) {
+    case "owner": return "owner";
+    case "member": return "member";
+    case "assignee": return "holds this task";
+    case "manages_member": return `manages ${agent}, a member`;
+    case "manages_assignee": return `manages ${agent}, who holds this task`;
+    default: return String(r.code);
+  }
+}
+
+/**
+ * Two-tier guard for the Bridge REST tools (reply, list_channels,
+ * join_channel, leave_channel, who_can_see, list_agents, list_contexts,
+ * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks,
+ * …). Distinct hints because they are distinct fixes: unconfigured needs
+ * /bridge:configure, idle needs /bridge:connect.
  *
  * Gated on `wantConnected` (INTENT), not on whether the socket has actually
  * finished its handshake — a session mid-reconnect still intends to be
@@ -2382,7 +2431,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: if a reply fails with join_required, call join_channel(channel_id) and send again. who_can_see(channel_id) tells you who will read what you post.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -2476,6 +2525,50 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      name: "join_channel",
+      description:
+        "Join a PUBLIC Bridge channel as this session's agent. Posting in any channel needs membership — a reply " +
+        "into a channel you are not in fails with join_required. Joining is a deliberate step: you become a member, " +
+        "visible in the channel's roster and in who can see it. A PRIVATE channel cannot be joined; an owner must add " +
+        "you. Joining a public channel you are already in is a no-op.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Channel ID or name (from list_channels)." },
+        },
+        required: ["channel_id"],
+      },
+    },
+    {
+      name: "leave_channel",
+      description:
+        "Leave a Bridge channel as this session's agent. Your open tasks in it go back to the queue. A private " +
+        "channel cannot be rejoined by yourself afterwards — an owner must add you again. The last owner cannot " +
+        "leave, and nobody leaves the workspace's default channel.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Channel ID or name." },
+        },
+        required: ["channel_id"],
+      },
+    },
+    {
+      name: "who_can_see",
+      description:
+        "Who can read a channel or a task, and why — check this before posting anything sensitive. Pass exactly one " +
+        "of channel_id or message_id (a task's message ID, as claim_task takes it). Threads and messages have their channel's (or task's) audience. A public channel " +
+        "is readable by the whole workspace (counts only). If you can see only the task, the channel's own readers " +
+        "are counted, not named.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Channel ID or name." },
+          message_id: { type: "string", description: "The task's message ID (as for claim_task), not its thread ID." },
+        },
       },
     },
     {
@@ -2873,7 +2966,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         if (!res.ok) {
           const err = await res.text();
-          throw new Error(`Bridge API error ${res.status}: ${err}`);
+          // Posting needs membership (server 5a-2): say how to get it, not just that it failed.
+          const hint = res.status === 403 && err.includes("join_required")
+            ? " — this agent is not a member of that public channel: call join_channel(channel_id) and send again."
+            : "";
+          throw new Error(`Bridge API error ${res.status}: ${err}${hint}`);
         }
 
         const result = (await res.json()) as any;
@@ -2921,6 +3018,134 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             },
           ],
         };
+      }
+
+      case "join_channel": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const { channelId, channelName } = await resolveChannelRef(args.channel_id);
+        const res = await apiFetch(`/api/channels/${encodeURIComponent(channelId)}/join`, {
+          method: "POST",
+          body: "{}",
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          let code = "";
+          try { code = String((JSON.parse(text) as any).error ?? ""); } catch {}
+          // Each refusal says what the agent can do about it.
+          /**
+           * The server runs its READ gate before anything else, so a private channel
+           * this agent is not in answers a plain 403 `Forbidden` — and `invite_only`
+           * comes back only for a private channel it can already read, i.e. one it is
+           * already in. Read as "nothing to do", not as a refusal. (Rare race: a
+           * channel made private mid-join answers the same — hence the wording.)
+           */
+          if (code === "invite_only") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `#${channelName} (${channelId}) is private: already a member — or it just became private, and then an owner must add this agent`,
+                },
+              ],
+            };
+          }
+          const why: Record<string, string> = {
+            Forbidden: "it is private (or not visible to this agent) — an owner must add this agent",
+            removed_from_channel: "this agent was removed from it — only an owner can add it back",
+            channel_archived: "it is archived",
+            "Channel not found": "no such channel",
+          };
+          throw new Error(
+            why[code] ? `cannot join #${channelName}: ${why[code]}` : `Bridge API error ${res.status}: ${text}`
+          );
+        }
+        const result = (await res.json()) as { joined?: boolean };
+        return {
+          content: [
+            {
+              type: "text",
+              text: result.joined
+                ? `joined #${channelName} (${channelId}) — you can post there now`
+                : `already a member of #${channelName} (${channelId})`,
+            },
+          ],
+        };
+      }
+
+      case "leave_channel": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const { channelId, channelName } = await resolveChannelRef(args.channel_id);
+        const res = await apiFetch(`/api/channels/${encodeURIComponent(channelId)}/leave`, {
+          method: "POST",
+          body: "{}",
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          let code = "";
+          try { code = String((JSON.parse(text) as any).error ?? ""); } catch {}
+          const why: Record<string, string> = {
+            last_owner: "this agent is its last owner — make someone else an owner first",
+            workspace_default_channel: "it is the workspace's default channel, which nobody leaves",
+            channel_archived: "it is archived",
+            "Not a member of this channel": "this agent is not a member",
+            Forbidden: "it is private and this agent cannot see it",
+            "Channel not found": "no such channel",
+          };
+          throw new Error(
+            why[code] ? `cannot leave #${channelName}: ${why[code]}` : `Bridge API error ${res.status}: ${text}`
+          );
+        }
+        const result = (await res.json()) as { releasedTasks?: number };
+        const released = Number(result.releasedTasks ?? 0);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `left #${channelName} (${channelId})` +
+                (released > 0 ? ` — ${released} open task${released === 1 ? "" : "s"} went back to the queue` : ""),
+            },
+          ],
+        };
+      }
+
+      case "who_can_see": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const hasChannel = args.channel_id != null && String(args.channel_id).trim() !== "";
+        const hasTask = args.message_id != null && String(args.message_id).trim() !== "";
+        if (hasChannel === hasTask) throw new Error("pass exactly one of channel_id or message_id");
+        let path: string;
+        let subject: string;
+        if (hasTask) {
+          const taskId = String(args.message_id).trim().toLowerCase();
+          path = `/api/tasks/${encodeURIComponent(taskId)}/audience`;
+          subject = `task ${taskId}`;
+        } else {
+          const { channelId, channelName } = await resolveChannelRef(args.channel_id);
+          path = `/api/channels/${encodeURIComponent(channelId)}/audience`;
+          subject = `#${channelName}`;
+        }
+        const res = await apiFetch(path);
+        // The server answers every refusal exactly like a missing channel / task.
+        if (res.status === 404) throw new Error(`${subject}: not found, or not readable by this agent`);
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${await res.text()}`);
+        const a = (await res.json()) as any;
+        const body =
+          a.visibility === "public"
+            ? { subject, visibility: "public", readers: "everyone in the workspace", workspace: a.workspace }
+            : {
+                subject,
+                visibility: "private",
+                readers: (a.entries ?? []).map((e: any) => ({
+                  name: e.name ?? null,
+                  handle: e.handle ?? null,
+                  kind: e.kind,
+                  why: (e.reasons ?? []).map(audienceReasonText),
+                  last_spoke_at: e.lastSpokeAt ?? null,
+                })),
+                ...(a.channelReaders ? { channel_readers_not_named: a.channelReaders } : {}),
+              };
+        return { content: [{ type: "text", text: JSON.stringify(body, null, 2) }] };
       }
 
       case "list_channels": {
