@@ -2343,8 +2343,9 @@ function audienceReasonText(r: any): string {
 /**
  * Two-tier guard for the Bridge REST tools (reply, list_channels,
  * join_channel, leave_channel, who_can_see, list_agents, list_contexts,
- * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks, …). Distinct hints because they are distinct
- * fixes: unconfigured needs /bridge:configure, idle needs /bridge:connect.
+ * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks,
+ * …). Distinct hints because they are distinct fixes: unconfigured needs
+ * /bridge:configure, idle needs /bridge:connect.
  *
  * Gated on `wantConnected` (INTENT), not on whether the socket has actually
  * finished its handshake — a session mid-reconnect still intends to be
@@ -2430,7 +2431,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: join a public channel with join_channel first; who_can_see(channel_id) tells you who will read what you post.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: if a reply fails with join_required, call join_channel(channel_id) and send again. who_can_see(channel_id) tells you who will read what you post.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -3035,10 +3036,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
            * The server runs its READ gate before anything else, so a private channel
            * this agent is not in answers a plain 403 `Forbidden` — and `invite_only`
            * comes back only for a private channel it can already read, i.e. one it is
-           * already in. Read as "nothing to do", not as a refusal.
+           * already in. Read as "nothing to do", not as a refusal. (Rare race: a
+           * channel made private mid-join answers the same — hence the wording.)
            */
           if (code === "invite_only") {
-            return { content: [{ type: "text", text: `already a member of #${channelName} (${channelId}), a private channel` }] };
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `#${channelName} (${channelId}) is private: already a member — or it just became private, and then an owner must add this agent`,
+                },
+              ],
+            };
           }
           const why: Record<string, string> = {
             Forbidden: "it is private (or not visible to this agent) — an owner must add this agent",

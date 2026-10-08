@@ -257,7 +257,8 @@ describe("join_channel", () => {
     // A private channel it IS in: `invite_only` means nothing to do, not a refusal.
     const mine = await call("join_channel", { channel_id: "mine" });
     expect(mine.isError, mine.text).toBe(false);
-    expect(mine.text).toContain("already a member of #mine");
+    expect(mine.text).toContain("#mine");
+    expect(mine.text).toContain("already a member");
     const removed = await call("join_channel", { channel_id: "gone" });
     expect(removed.text).toContain("removed");
     const archived = await call("join_channel", { channel_id: "old" });
