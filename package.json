@@ -1,6 +1,6 @@
 {
   "name": "claude-channel-bridge",
-  "version": "0.28.0",
+  "version": "0.28.1",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -11,7 +11,8 @@
   "scripts": {
     "start": "bun install --no-summary && bun server.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.core.json",
-    "test": "bun test"
+    "test": "bun test",
+    "release": "bun scripts/release.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
