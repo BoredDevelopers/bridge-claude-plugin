@@ -5,7 +5,7 @@
  * silently.
  */
 import { test, expect, describe } from "bun:test";
-import { ciVerdict, pinListing, releaseVersion } from "../scripts/release";
+import { ciVerdict, peeled, pinListing, releaseVersion, tagAction } from "../scripts/release";
 
 const SHA = "f4d0019c0ffee0000000000000000000000000ab";
 const LISTING = JSON.stringify(
@@ -49,6 +49,9 @@ describe("ciVerdict", () => {
     expect(ciVerdict([ok, { name: "Plugin (Bun 1.4)", status: "completed", conclusion: "failure" }])).toMatch(/Bun 1\.4.*failure/);
     expect(ciVerdict([{ name: "Plugin (Bun 1.3)", status: "in_progress", conclusion: null }])).toMatch(/in_progress/);
   });
+  test("a skipped check is not proof", () => {
+    expect(ciVerdict([ok, { name: "Plugin (Bun 1.4)", status: "completed", conclusion: "skipped" }])).toMatch(/skipped/);
+  });
 });
 
 describe("pinListing", () => {
@@ -79,5 +82,28 @@ describe("pinListing", () => {
     expect(() => pinListing(none, "0.28.1", SHA)).toThrow(/found 0/);
     const two = JSON.stringify({ plugins: [{ name: "bridge" }, { name: "bridge" }] });
     expect(() => pinListing(two, "0.28.1", SHA)).toThrow(/found 2/);
+  });
+});
+
+describe("resumable tagging", () => {
+  const HEAD = SHA;
+  const OTHER = "0".repeat(40);
+  test("absent → create; local on HEAD → push; remote on HEAD → done", () => {
+    expect(tagAction(null, null, HEAD, "v0.28.1")).toBe("create");
+    expect(tagAction(null, HEAD, HEAD, "v0.28.1")).toBe("push");
+    expect(tagAction(HEAD, HEAD, HEAD, "v0.28.1")).toBe("done");
+    expect(tagAction(HEAD, null, HEAD, "v0.28.1")).toBe("done");
+  });
+  test("a published tag on another commit refuses — never move a released tag", () => {
+    expect(() => tagAction(OTHER, null, HEAD, "v0.28.1")).toThrow(/already published at 0000000/);
+  });
+  test("a stray local tag on another commit refuses, and says how to clear it", () => {
+    expect(() => tagAction(null, OTHER, HEAD, "v0.28.1")).toThrow(/git tag -d v0\.28\.1/);
+  });
+  test("peeled: the commit behind an annotated tag, else the lightweight one, else none", () => {
+    const annotated = `aaaa\trefs/tags/v0.28.1\n${HEAD}\trefs/tags/v0.28.1^{}\n`;
+    expect(peeled(annotated)).toBe(HEAD);
+    expect(peeled(`${HEAD}\trefs/tags/v0.28.1\n`)).toBe(HEAD);
+    expect(peeled("")).toBeNull();
   });
 });
