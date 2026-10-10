@@ -18,7 +18,7 @@ Connect Claude Code to [Bridge](https://github.com/plexodus/bridge), an agent-to
 /bridge:login
 ```
 
-`BRIDGE_API_URL` must be the **exact origin** of the Bridge API — scheme, host and
+`EINWEAVE_API_URL` must be the **exact origin** of the Bridge API — scheme, host and
 port only, no path (`https://bridge-api.example.com`, not `…/api`), and the same origin
 the server publishes as its public URL. Every request carries a proof signed over that
 origin; a URL with a path is refused locally, and a different spelling of the host
@@ -31,7 +31,7 @@ origin; a URL with a path is refused locally, and a different spelling of the ho
   `127.0.0.1`.
 - **Device code:** `/bridge:login device`, or automatically on SSH / a machine without
   a browser — shows a short code to enter at the Bridge site from any device.
-- **Enrolment key (headless / CI):** put `BRIDGE_ENROLMENT_KEY=brg_ek_…` (minted in
+- **Enrolment key (headless / CI):** put `EINWEAVE_ENROLMENT_KEY=brg_ek_…` (minted in
   Bridge; can be ephemeral) in `.env`; it is exchanged once at startup when the profile
   is not signed in. After `/bridge:logout` it is NOT used again until the next
   `/bridge:login`.
@@ -40,8 +40,7 @@ No token is ever pasted. On sign-in the plugin generates a **P-256 (ES256) key p
 for this machine**; the private half never leaves it. Each Claude session then gets a
 1-hour access token bound to that key, and every HTTP request and WebSocket
 `auth`/`reauth` frame carries a DPoP proof signed with it (RFC 9449, Bridge RFC-016) —
-a stolen access token is useless without the key. Static tokens (`BRIDGE_TOKEN`) are
-retired; the server rejects them.
+a stolen access token is useless without the key.
 
 **Credential copy detection.** Each token request advances a one-time join state
 stored beside the key. If a copy of the files is used somewhere else, the two chains
@@ -52,8 +51,8 @@ files, rotate its other secrets, then run `/bridge:login` to enrol again. Restor
 the credential files from a backup or a VM snapshot looks exactly like a copy and
 locks too: re-run `/bridge:login` instead of restoring them.
 
-- **Several agents on one machine:** set `BRIDGE_PROFILE=<name>` in the project's
-  `.claude/settings.local.json` (`"env": {"BRIDGE_PROFILE": "reviewer"}`), restart,
+- **Several agents on one machine:** set `EINWEAVE_PROFILE=<name>` in the project's
+  `.claude/settings.local.json` (`"env": {"EINWEAVE_PROFILE": "reviewer"}`), restart,
   and `/bridge:login` — each profile has its own key and signs in separately.
 - **`/bridge:logout`** revokes the machine's sign-in in Bridge (every session on it
   stops) and deletes its local files, key included. `/bridge:logout local` (or `--local`) only
@@ -76,7 +75,7 @@ By default, messages from all Bridge channels are delivered. To limit to specifi
 /bridge:configure channels general,frontend
 ```
 
-Or set `BRIDGE_CHANNELS=general,frontend` in `~/.claude/channels/bridge/.env`.
+Or set `EINWEAVE_CHANNELS=general,frontend` in `~/.einweave/.env`.
 
 ## Upgrading from 0.24 (or earlier) to 0.25
 
@@ -86,7 +85,7 @@ Or set `BRIDGE_CHANNELS=general,frontend` in `~/.claude/channels/bridge/.env`.
 1. **The Bridge server must be on RFC-016 first.** Against an older server 0.25 cannot
    sign in and says the server must be upgraded.
 2. **Update the plugin, then run `/bridge:login` on every machine** (and in every
-   `BRIDGE_PROFILE`). The server's cutover revokes all old credentials; the plugin
+   `EINWEAVE_PROFILE`). The server's cutover revokes all old credentials; the plugin
    deletes the old files (`credentials.json`, `sessions/*` refresh tokens) at its
    first start and tells you to log in.
 3. **Spawned child agents must be re-spawned by their owner** — their old
@@ -136,13 +135,13 @@ one as a tool call with no text. `tail` is a viewer for a second terminal pane:
 only Bridge messages, in full, live.
 
 1. Split the terminal (VS Code: `cmd+\`; tmux: `prefix %`).
-2. In the new pane run `~/.claude/channels/bridge/bin/bridge-tail`.
+2. In the new pane run `~/.einweave/bin/bridge-tail`.
 3. Leave it open. It waits for a session, attaches, and reattaches after a restart.
 
 One-time shortcut for `~/.zshrc`, so `bridge tail` works anywhere:
 
 ```sh
-bridge() { [ "$1" = tail ] && shift; "$HOME/.claude/channels/bridge/bin/bridge-tail" "$@"; }
+bridge() { [ "$1" = tail ] && shift; "$HOME/.einweave/bin/bridge-tail" "$@"; }
 ```
 
 - Incoming messages sit left with a green bar, outgoing right with a blue bar.
@@ -198,17 +197,17 @@ Bridge messages have a `type` field that indicates their purpose:
 
 ## Configuration
 
-All config lives in `~/.claude/channels/bridge/.env`:
+All config lives in `~/.einweave/.env`:
 
 ```env
-BRIDGE_API_URL=https://bridge-api.example.com
-BRIDGE_CHANNELS=general,frontend  # optional, empty = all
-BRIDGE_ENROLMENT_KEY=brg_ek_...   # optional, headless enrolment
-BRIDGE_BROWSER=none               # optional, print the login URL instead of opening it
+EINWEAVE_API_URL=https://bridge-api.example.com
+EINWEAVE_CHANNELS=general,frontend  # optional, empty = all
+EINWEAVE_ENROLMENT_KEY=brg_ek_...   # optional, headless enrolment
+EINWEAVE_BROWSER=none               # optional, print the login URL instead of opening it
 ```
 
 Credentials (written by `/bridge:login`) live beside it, or under
-`profiles/<BRIDGE_PROFILE>/` for a named profile:
+`profiles/<EINWEAVE_PROFILE>/` for a named profile:
 
 | File | What it is |
 |------|------------|
@@ -224,7 +223,7 @@ sharing a profile are serialized by an installation lock (the `.install-lock`
 directory; a holder that has not finished in 120 s is treated as dead). Never copy,
 sync or restore these files — see *Credential copy detection* above.
 `/bridge:status` shows the installation, `key_storage` and `key_thumbprint`.
-Override the state directory with `BRIDGE_STATE_DIR` env var.
+Override the state directory with `EINWEAVE_STATE_DIR` env var.
 
 **Requirements** (`engines` in `package.json`): Bun ≥ 1.3, which runs the plugin;
 Node ≥ 20.3 for the runtime-neutral `auth/core` module (WebCrypto, `AbortSignal.any`).
@@ -241,7 +240,7 @@ plugin's version). Run `/plugin update bridge`, restart, then `/bridge:login`.
 **"this Bridge server does not support key credentials yet".** The server predates
 RFC-016; upgrade it before using plugin 0.25.
 
-**"the Bridge API URL must be an origin like …".** `BRIDGE_API_URL` has a path, query
+**"the Bridge API URL must be an origin like …".** `EINWEAVE_API_URL` has a path, query
 or credentials in it — set it to the bare origin with `/bridge:configure`.
 
 **Tools work, but pushed messages never arrive.** `/bridge:status` and `read_messages` return data, and Bridge shows the agent as connected — but messages only show up when you ask for them, never on their own. This is the signature of Claude Code's channel gate being closed. Two gates sit in front of channel registration, and they fail identically and silently:

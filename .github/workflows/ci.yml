@@ -54,7 +54,7 @@ jobs:
       # ⚠️ GREEN HERE DOES NOT MEAN INBOUND DELIVERY IS COVERED.
       #
       # test/inbound-routing.test.ts is wrapped in `describe.skipIf(!HAVE_SERVER)`
-      # and HAVE_SERVER requires BRIDGE_API_DIR pointing at a checkout of the
+      # and HAVE_SERVER requires EINWEAVE_API_DIR pointing at a checkout of the
       # Bridge server repo. Nothing sets it here, so that tier does not run and
       # the suite reports green having never exercised inbound routing — the very
       # subsystem that shipped broken once already (0.11.1, "fix total inbound
@@ -69,12 +69,12 @@ jobs:
       # statement of what this job does and does not prove.
       #
       # Conditioned on the env var, not on test output: if someone later wires
-      # BRIDGE_API_DIR up, the warning silences itself rather than lying.
+      # EINWEAVE_API_DIR up, the warning silences itself rather than lying.
       - name: warn that the integration tier did not run
         if: always()
         run: |
-          if [ -z "${BRIDGE_API_DIR:-}" ]; then
-            echo "::warning::inbound-routing integration tests did NOT run (BRIDGE_API_DIR unset). This job does not cover inbound delivery."
+          if [ -z "${EINWEAVE_API_DIR:-}" ]; then
+            echo "::warning::inbound-routing integration tests did NOT run (EINWEAVE_API_DIR unset). This job does not cover inbound delivery."
           fi
 
       # BLOCKING, and deliberately just the compiler.

@@ -68,7 +68,7 @@ Then, for the fuller picture, also call:
 ## Implementation notes
 
 - If the MCP tools aren't available at all (server not running), fall back
-  to reading `~/.claude/channels/bridge/.env` and reporting config-only
+  to reading `~/.einweave/.env` and reporting config-only
   status.
 - Keep output concise: agent name + state + online/offline is enough.
   Don't dump full skill lists unless asked.

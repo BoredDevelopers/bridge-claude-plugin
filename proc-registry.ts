@@ -1,6 +1,6 @@
 /**
  * The process registry (RFC-017 D2): every Bridge plugin process on the machine writes
- * `~/.claude/channels/bridge/procs/<pid>.json` describing itself, so a person (or a
+ * `~/.einweave/procs/<pid>.json` describing itself, so a person (or a
  * future `status` / `/bridge:update`, D9) can answer "where is the other window" — the
  * question the RFC-016 rollout could not answer (see the RFC's §1, item 3).
  *

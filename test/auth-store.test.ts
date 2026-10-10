@@ -53,7 +53,7 @@ describe("files", () => {
   test("deleteInstallationFiles removes all four; nothing else in the directory", async () => {
     const dir = tmp();
     try {
-      writeFileSync(join(dir, ".env"), "BRIDGE_API_URL=x\n");
+      writeFileSync(join(dir, ".env"), "EINWEAVE_API_URL=x\n");
       const { privateJwk } = await generateSoftwareKey();
       store.writeKey(dir, privateJwk);
       store.writeState(dir, makeJoinState(0));

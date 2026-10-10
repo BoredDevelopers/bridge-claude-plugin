@@ -6,15 +6,15 @@
  * forwards inbound messages to Claude Code, and exposes tools
  * for sending messages, listing channels, and listing agents.
  *
- * Config lives in ~/.claude/channels/bridge/.env:
- *   BRIDGE_API_URL=https://bridge-api.example.com
- *   BRIDGE_CHANNELS=general,dev (optional, empty = all)
+ * Config lives in ~/.einweave/.env (EINWEAVE_STATE_DIR overrides; 0.30.0 moved it
+ * from ~/.claude/channels/bridge once, see state-dir.ts):
+ *   EINWEAVE_API_URL=https://bridge-api.example.com
+ *   EINWEAVE_CHANNELS=general,dev (optional, empty = all)
  * Credentials come from /bridge:login (RFC-016): a per-machine P-256 key and
  * join state in <state>/{key.json,state,installation.json} (or
- * <state>/profiles/<BRIDGE_PROFILE>/). Every Claude session mints its own 1 h
+ * <state>/profiles/<EINWEAVE_PROFILE>/). Every Claude session mints its own 1 h
  * DPoP-bound access token from them; every HTTP request and WS auth/reauth
- * frame carries a fresh DPoP proof. The static BRIDGE_TOKEN is retired — a
- * leftover one is surfaced as a hint only (CredentialManager.staleStaticTokenPresent).
+ * frame carries a fresh DPoP proof.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -24,7 +24,7 @@ import pkg from "./package.json" with { type: "json" };
 /**
  * Single source of truth for the version reported over MCP.
  *
- * TEST-ONLY override: BRIDGE_TEST=1 and a well-formed BRIDGE_TEST_PLUGIN_VERSION let a
+ * TEST-ONLY override: EINWEAVE_TEST=1 and a well-formed EINWEAVE_TEST_PLUGIN_VERSION let a
  * process built from THIS SAME codebase claim an older version — RFC-017 D3's
  * version-aware takeover needs two live processes on genuinely different versions, and
  * spinning up a second checkout for every test is not that. A stray variable in a real
@@ -32,8 +32,8 @@ import pkg from "./package.json" with { type: "json" };
  * `testKnob`, just not numeric).
  */
 const PLUGIN_VERSION: string =
-  (process.env.BRIDGE_TEST === "1" && process.env.BRIDGE_TEST_PLUGIN_VERSION && /^\d+\.\d+\.\d+$/.test(process.env.BRIDGE_TEST_PLUGIN_VERSION)
-    ? process.env.BRIDGE_TEST_PLUGIN_VERSION
+  (process.env.EINWEAVE_TEST === "1" && process.env.EINWEAVE_TEST_PLUGIN_VERSION && /^\d+\.\d+\.\d+$/.test(process.env.EINWEAVE_TEST_PLUGIN_VERSION)
+    ? process.env.EINWEAVE_TEST_PLUGIN_VERSION
     : undefined) ?? pkg.version;
 /** RFC-017 D2/D3: this process's own "since", stamped once at the top of the module (not
  * re-read from the clock at whatever later moment happens to write it) — the session
@@ -71,18 +71,32 @@ import { localIso } from "./local-time";
 import { sanitizeChannelParams } from "./control-chars";
 import { startFeedTap, sweepStaleFeedSockets, writeLauncher, launcherPath, type FeedTap } from "./feed-tap";
 import { procStartOf, procStartMatches } from "./proc-start";
+import { resolveStateDir, migrateLegacyState } from "./state-dir";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const DEFAULT_STATE_DIR = join(homedir(), ".claude", "channels", "bridge");
-const STATE_DIR = process.env.BRIDGE_STATE_DIR ?? DEFAULT_STATE_DIR;
+const DEFAULT_STATE_DIR = resolveStateDir({});
+const STATE_DIR = resolveStateDir();
+
+// The one-time move from ~/.claude/channels/bridge (state-dir.ts). Only for the
+// default location: an explicit EINWEAVE_STATE_DIR (tests, a second setup) must
+// never be filled from this user's real old profile. Before the .env load below,
+// which reads the moved file.
+if (!process.env.EINWEAVE_STATE_DIR) {
+  const moved = migrateLegacyState(STATE_DIR);
+  if (moved.kind === "migrated") {
+    process.stderr.write(`bridge channel: moved ${moved.profiles} credential profile(s)${moved.env ? " and .env" : ""} to ${STATE_DIR}\n`);
+  } else if (moved.kind === "failed") {
+    process.stderr.write(`bridge channel: could not move the old state to ${STATE_DIR} (${moved.error}); sign in again with /bridge:login\n`);
+  }
+}
 const ENV_FILE = join(STATE_DIR, ".env");
 
 // Captured from the *real* environment, before the .env load below folds
 // ENV_FILE into process.env. ENV_FILE is machine-global: a single
-// BRIDGE_SESSION_KEY line in it would silently collapse every session on this
+// EINWEAVE_SESSION_KEY line in it would silently collapse every session on this
 // box into one shared Bridge context. Only a per-process env var may override.
-const SESSION_KEY_OVERRIDE = (process.env.BRIDGE_SESSION_KEY ?? "").trim();
+const SESSION_KEY_OVERRIDE = (process.env.EINWEAVE_SESSION_KEY ?? "").trim();
 
 // Same real-env-before-.env rule as SESSION_KEY_OVERRIDE: ENV_FILE is
 // machine-global, so a label there would name every session on the box the
@@ -92,12 +106,12 @@ const SESSION_KEY_OVERRIDE = (process.env.BRIDGE_SESSION_KEY ?? "").trim();
 // label file (SESSION_KEY-keyed, see label-store.ts) > "" (no label; the
 // server derives one). Settled into module-scope `sessionLabel` once
 // SESSION_KEY is resolved, near the bottom of this file.
-const SESSION_LABEL_OVERRIDE = (process.env.BRIDGE_SESSION_LABEL ?? "").trim();
+const SESSION_LABEL_OVERRIDE = (process.env.EINWEAVE_SESSION_LABEL ?? "").trim();
 
 // Same real-env-before-.env rule: the profile picks WHICH agent this session is,
 // so it comes from the session's own environment (per project via
 // .claude/settings.local.json), never from the machine-global .env.
-const PROFILE = resolveProfile(STATE_DIR, process.env.BRIDGE_PROFILE);
+const PROFILE = resolveProfile(STATE_DIR, process.env.EINWEAVE_PROFILE);
 
 // Resolved once SESSION_KEY is (see bottom of file); read by
 // minimalSessionInfo(). Mutable because the set_session_label tool updates it
@@ -106,7 +120,7 @@ const PROFILE = resolveProfile(STATE_DIR, process.env.BRIDGE_PROFILE);
 let sessionLabel = "";
 
 // Master switch for the startup connect (Task 3, connect-on-demand):
-// persisted per-session intent (connect-store.ts) wins, else BRIDGE_AUTOCONNECT.
+// persisted per-session intent (connect-store.ts) wins, else EINWEAVE_AUTOCONNECT.
 // Resolved once SESSION_KEY is (see bottom of file); the `connect`/`disconnect`
 // tools update it in place, the same way sessionLabel does.
 let wantConnected = false;
@@ -136,8 +150,8 @@ try {
   }
 } catch {}
 
-const ENV_API_URL = (process.env.BRIDGE_API_URL ?? "").replace(/\/+$/, "");
-const CHANNELS_FILTER = (process.env.BRIDGE_CHANNELS ?? "")
+const ENV_API_URL = (process.env.EINWEAVE_API_URL ?? "").replace(/\/+$/, "");
+const CHANNELS_FILTER = (process.env.EINWEAVE_CHANNELS ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -342,7 +356,7 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
   // An explicit operator override wins over anything discovered. Read from the
   // real environment only (see SESSION_KEY_OVERRIDE).
   if (SESSION_KEY_REGEX.test(SESSION_KEY_OVERRIDE)) {
-    return { key: SESSION_KEY_OVERRIDE, source: "BRIDGE_SESSION_KEY override" };
+    return { key: SESSION_KEY_OVERRIDE, source: "EINWEAVE_SESSION_KEY override" };
   }
 
   // The hook and this process start concurrently in unspecified order, so a
@@ -403,8 +417,7 @@ const creds = new CredentialManager({
   envApiUrl: ENV_API_URL,
   // Presence only — never the value. Powers a "that's retired" hint when
   // there is no real credential; the token itself is never read or sent.
-  staleStaticTokenPresent: !!process.env.BRIDGE_TOKEN,
-  enrolmentKey: process.env.BRIDGE_ENROLMENT_KEY ?? "",
+  enrolmentKey: process.env.EINWEAVE_ENROLMENT_KEY ?? "",
   sessionKey: () => SESSION_KEY,
   sessionKeyReady: () => sessionKeyReady ?? Promise.resolve(),
   platform: `${process.platform}-${process.arch}`,
@@ -685,7 +698,7 @@ let reconnectAttempt = 0;
 // survived that long was usable, and a flap costs at most one mint per 30 s.
 let remintedAfter4001 = false;
 /** TEST-ONLY override (ms) of the re-arm window; default 30 s. */
-const REMINT_REARM_MS = testKnob("BRIDGE_TEST_REMINT_REARM_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
+const REMINT_REARM_MS = testKnob("EINWEAVE_TEST_REMINT_REARM_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
 /** When the current socket completed its auth (null while it has not). */
 let authenticatedAt: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -698,14 +711,14 @@ let nextReconnectAt: number | null = null;
 // NAT/tunnel timeout) is silent forever and never fires `close`.
 let livenessTimer: ReturnType<typeof setInterval> | null = null;
 /** TEST-ONLY override (ms); default 90 s. The check runs every third of it (30 s by default). */
-const LIVENESS_TIMEOUT_MS = testKnob("BRIDGE_TEST_LIVENESS_MS", (n) => Number.isInteger(n) && n >= 300) ?? 90000;
+const LIVENESS_TIMEOUT_MS = testKnob("EINWEAVE_TEST_LIVENESS_MS", (n) => Number.isInteger(n) && n >= 300) ?? 90000;
 
 /**
- * A TEST-ONLY timing knob: honoured only when BRIDGE_TEST=1, so a stray variable in a
+ * A TEST-ONLY timing knob: honoured only when EINWEAVE_TEST=1, so a stray variable in a
  * real environment can never change production timing. undefined = use the default.
  */
 function testKnob(name: string, valid: (n: number) => boolean): number | undefined {
-  if (process.env.BRIDGE_TEST !== "1") return undefined;
+  if (process.env.EINWEAVE_TEST !== "1") return undefined;
   const n = Number(process.env[name]);
   return process.env[name] && valid(n) ? n : undefined;
 }
@@ -1041,7 +1054,7 @@ function ensureChannelMap(): Promise<void> {
  * message (`deliveryReasons`). The addressed tier means the server picked us
  * specifically; the broadcast tier means we matched a standing subscription.
  *
- * BRIDGE_CHANNELS is a subscription preference and may narrow the broadcast
+ * EINWEAVE_CHANNELS is a subscription preference and may narrow the broadcast
  * tier only. It must never suppress the addressed tier — that is the bug this
  * exists to close: a thread reply the server routed here was binned because its
  * CHANNEL was not in the list, while the receipt still read `delivered`, so the
@@ -1072,7 +1085,7 @@ type ChannelDecision = "deliver" | "drop" | "unknown";
  * `{agentId}-tasks` on connect, and the existing ones are archived. Keeping the
  * branch would mean a filtered session went on force-delivering an ARCHIVED
  * channel — and, worse, that any channel an agent could get named `<its-id>-tasks`
- * silently outranked the operator's BRIDGE_CHANNELS setting.
+ * silently outranked the operator's EINWEAVE_CHANNELS setting.
  *
  * Nothing is lost, because the exemption was never what protected addressed
  * traffic. `isAddressed()` above is: `mention`, `thread`, `target` and
@@ -1200,7 +1213,7 @@ function connectWs(): void {
           sessionInfo,
           // Re-present our credential to prove we are the SAME session
           // reconnecting, not a sibling claiming this session key. Under
-          // BRIDGE_CONTEXT_CLAIM_MODE=enforce a claim on a live context without
+          // EINWEAVE_CONTEXT_CLAIM_MODE=enforce a claim on a live context without
           // it is refused and we are renamed to a connection id — we keep
           // working, but lose our stable identity until the old row expires.
           // Empty on a first connect, which is correct: there is nothing to
@@ -1392,7 +1405,7 @@ function connectWs(): void {
  * TEST-ONLY: scales every reconnect delay (default 1). Lets an e2e test reach the slow
  * credential schedule's first retry in about a second; the schedule's SHAPE is unchanged.
  */
-const BACKOFF_SCALE = testKnob("BRIDGE_TEST_BACKOFF_SCALE", (n) => n > 0 && n <= 1) ?? 1;
+const BACKOFF_SCALE = testKnob("EINWEAVE_TEST_BACKOFF_SCALE", (n) => n > 0 && n <= 1) ?? 1;
 
 function scheduleReconnect(immediate = false): void {
   // The `disconnect` tool (and a persisted "0" at startup) sets this false —
@@ -1520,7 +1533,7 @@ function waitFor(err: CredentialError): typeof waitingFor {
  * TEST-ONLY override of the watch period (ms). Default 10 s. A lower value only makes
  * the watch notice files sooner; it cannot make a stopped session mint.
  */
-const CREDENTIAL_WATCH_MS = testKnob("BRIDGE_TEST_CREDENTIAL_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 10_000;
+const CREDENTIAL_WATCH_MS = testKnob("EINWEAVE_TEST_CREDENTIAL_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 10_000;
 const credentialWatch = setInterval(() => {
   if (waitingFor === null || !wantConnected || shuttingDown || creds.configError()) return;
   if (waitingFor === "stop-lift" && creds.refreshStop() !== null) return;
@@ -1536,7 +1549,7 @@ credentialWatch.unref?.();
 // versioned plugin directory for Claude Code to orphan in the first place.
 const CLAUDE_PLUGIN_ROOT = (process.env.CLAUDE_PLUGIN_ROOT ?? "").trim();
 /** TEST-ONLY override (ms); default 60 s. */
-const STALE_WATCH_MS = testKnob("BRIDGE_TEST_STALE_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 60_000;
+const STALE_WATCH_MS = testKnob("EINWEAVE_TEST_STALE_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 60_000;
 let staleWatchState: StaleWatchState = INITIAL_STALE_WATCH_STATE;
 /** P8: when this copy became orphaned — `null` until the first detection. Sticky once set. */
 let staleSince: number | null = null;
@@ -2025,7 +2038,7 @@ function handleInboundMessage(msg: any, deliveryReasons?: unknown): void {
    *
    * `targetsThisSession` already covered explicit context targeting, and it was
    * the only bypass — so `mention` and `thread` had none, which is exactly how
-   * an in-thread reply in a channel outside BRIDGE_CHANNELS was received and
+   * an in-thread reply in a channel outside EINWEAVE_CHANNELS was received and
    * dropped. On a batch the reason rides on each message; on a live frame it is
    * a sibling of the message, so both spellings are read here.
    *
@@ -4156,7 +4169,7 @@ await mcp.connect(new StdioServerTransport());
 // hands over rather than stranding the session.
 const LOCK_DIR = join(STATE_DIR, "locks");
 /** TEST-ONLY override (ms); default 30 s. */
-const LOCK_RETRY_MS = testKnob("BRIDGE_TEST_LOCK_RETRY_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
+const LOCK_RETRY_MS = testKnob("EINWEAVE_TEST_LOCK_RETRY_MS", (n) => Number.isInteger(n) && n > 0) ?? 30_000;
 // A holder renews while it lives, so this only expires a process that is alive
 // but wedged. Generous against a renew interval of 30s: a reconnect loop is a
 // legitimate holder and must not be evicted mid-backoff.
@@ -4603,14 +4616,14 @@ sweepLabelFiles(STATE_DIR, labelFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MA
 
 // Same precedence idea as sessionLabel above: whatever the connect/disconnect
 // tools persisted on a previous launch of THIS session key wins; else
-// BRIDGE_AUTOCONNECT decides. Swept on the same age-based, never-current-file
+// EINWEAVE_AUTOCONNECT decides. Swept on the same age-based, never-current-file
 // terms as cursors and labels. Guarded on intentExplicitlySet: a
 // connect/disconnect already answered in the pre-settle window set
 // wantConnected (and persisted it under the now-resolved SESSION_KEY via the
 // same sessionKeyReady await) — this must not clobber that with a stale read.
 if (!intentExplicitlySet) {
   wantConnected = readConnectState(STATE_DIR, SESSION_KEY)
-    ?? (process.env.BRIDGE_AUTOCONNECT === "1");
+    ?? (process.env.EINWEAVE_AUTOCONNECT === "1");
 }
 sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), CURSOR_SWEEP_MAX_AGE_MS);
 // The one line someone debugging a lost context will need.
@@ -4678,7 +4691,7 @@ try {
 // A 0.23 / 0.24 profile (RFC-014 files) is retired first, so it reads "run
 // /bridge:login", not "not signed in" — store.retireLegacy touches RFC-014 files
 // only, never a 0.25 installation. Headless machines enrol once from
-// BRIDGE_ENROLMENT_KEY (never through chat) — which also re-enrols a retired
+// EINWEAVE_ENROLMENT_KEY (never through chat) — which also re-enrols a retired
 // headless machine.
 try {
   await creds.retireLegacyCredentials();

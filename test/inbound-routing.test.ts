@@ -14,7 +14,7 @@
  *
  * WHAT IT PINS
  *   A  subscribed channel,   untargeted   -> surfaces
- *   B  other channel,       untargeted    -> filtered (BRIDGE_CHANNELS honoured)
+ *   B  other channel,       untargeted    -> filtered (EINWEAVE_CHANNELS honoured)
  *   C  other channel,       TARGETED      -> surfaces anyway
  *   D  our own `me-tasks`,  untargeted    -> filtered, like any other channel
  *   E  other channel,       @MENTION      -> surfaces anyway
@@ -32,8 +32,8 @@
  * Two things are required, and the test SKIPS rather than passing vacuously if
  * either is missing:
  *
- *   BRIDGE_API_DIR            <bridge>/packages/api
- *   BRIDGE_TEST_PG_ADMIN_URL  a Postgres 18 to create scratch databases in.
+ *   EINWEAVE_API_DIR            <bridge>/packages/api
+ *   EINWEAVE_TEST_PG_ADMIN_URL  a Postgres 18 to create scratch databases in.
  *                             Defaults to the server repo's test container
  *                             (`docker compose -f docker-compose.test.yml up -d`
  *                             in that repo, or `bun run test` there).
@@ -57,13 +57,13 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const API_DIR = process.env.BRIDGE_API_DIR ?? "";
+const API_DIR = process.env.EINWEAVE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
 
 // Same default as the server repo's scripts/run-tests.ts, so a developer who
 // has that suite working already has this one working.
 const ADMIN_URL =
-  process.env.BRIDGE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+  process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
 
 /** Is there actually a Postgres behind ADMIN_URL? Probe, don't assume. */
 async function pgReachable(): Promise<boolean> {
@@ -130,7 +130,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       ]);
       // Agents have NO static token (bridge 0048). Seat both in the
       // 'default' workspace and mint each an enrolment key through the API's OWN
-      // credential module — `me` (the plugin) enrols from BRIDGE_ENROLMENT_KEY at
+      // credential module — `me` (the plugin) enrols from EINWEAVE_ENROLMENT_KEY at
       // boot; `other` enrols over HTTP below to post as a second agent.
       await api.pool.query(`UPDATE principals SET tenant_id = 'default' WHERE id IN ('me', 'other')`);
       // …and give each its @handle there (identity chain PR-1: mentions resolve through
@@ -165,11 +165,11 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
        * case D arrive via the `owner` delivery reason (the only broadcast-tier
        * reason a card-less agent got in its own task channel). The server has
        * since dropped `channels.owner_agent_id` entirely, and `schema` here is
-       * the LIVE API schema — imported from BRIDGE_API_DIR — so that key became
+       * the LIVE API schema — imported from EINWEAVE_API_DIR — so that key became
        * a column the table does not have.
        *
        * It is worth stating how that would have surfaced: this whole file SKIPS
-       * unless BRIDGE_API_DIR is set, so the break would have reported as a
+       * unless EINWEAVE_API_DIR is set, so the break would have reported as a
        * green suite rather than a failure. Same trap the header describes.
        *
        * Case D is unaffected. Every channel below gets an explicit `me` channel
@@ -195,7 +195,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
           ...process.env, DATABASE_URL: dbUrl, PORT,
           // The discovery document advertises endpoints under this origin (RFC 8414):
           // it must be THIS server, or the plugin is sent to the wrong one.
-          BRIDGE_PUBLIC_URL: URL_,
+          EINWEAVE_PUBLIC_URL: URL_,
           FORGE_OIDC_CLIENT_SECRET: "x",
           BETTER_AUTH_SECRET: "test-secret-at-least-32-characters-long",
           NODE_ENV: "test",
@@ -233,10 +233,10 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
         env: {
           ...process.env,
-          BRIDGE_API_URL: URL_, BRIDGE_ENROLMENT_KEY: KEY_ME, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_CHANNELS: "general",          // deliberately NOT other-tasks
-          BRIDGE_SESSION_KEY: "test-session",
-          BRIDGE_STATE_DIR: dir, CLAUDE_PLUGIN_DATA: dir, CLAUDE_PROJECT_DIR: dir,
+          EINWEAVE_API_URL: URL_, EINWEAVE_ENROLMENT_KEY: KEY_ME, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_CHANNELS: "general",          // deliberately NOT other-tasks
+          EINWEAVE_SESSION_KEY: "test-session",
+          EINWEAVE_STATE_DIR: dir, CLAUDE_PLUGIN_DATA: dir, CLAUDE_PROJECT_DIR: dir,
         },
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });

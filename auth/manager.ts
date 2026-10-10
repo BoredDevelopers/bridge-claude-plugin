@@ -48,9 +48,6 @@ import { localIso } from "../local-time";
 
 export type CredentialSource = "installation" | "none";
 
-/** Shown when there is no credential but BRIDGE_TOKEN is still set. Presence check only. */
-const STALE_TOKEN_HINT = "BRIDGE_TOKEN is no longer supported — run /bridge:login";
-
 /** A pre-RFC-016 server: it cannot mint for a key, and a 0.25 plugin cannot use its grants. */
 const SERVER_TOO_OLD =
   "this Bridge server does not support key credentials yet (no client_credentials grant, RFC-016) — it must be upgraded before plugin 0.25 can sign in";
@@ -84,10 +81,8 @@ export class CredentialError extends Error {
 
 export interface ManagerDeps {
   profile: Profile | { error: string };
-  /** BRIDGE_API_URL from the environment / .env, trailing slashes stripped ("" = unset). */
+  /** EINWEAVE_API_URL from the environment / .env, trailing slashes stripped ("" = unset). */
   envApiUrl: string;
-  /** Whether BRIDGE_TOKEN is set. Only a presence check — the value is never read or sent. */
-  staleStaticTokenPresent: boolean;
   enrolmentKey: string;
   sessionKey: () => string;
   /** Resolves once sessionKey() is final — a session keyed by a provisional key would be orphaned. */
@@ -241,15 +236,15 @@ export class CredentialManager {
     const p = this.profile!;
     const inst = this.installation();
     if (inst && this.d.envApiUrl && inst.apiUrl !== this.d.envApiUrl) {
-      return `profile "${profileLabel(p)}" is signed in to ${inst.apiUrl}, but BRIDGE_API_URL is ${this.d.envApiUrl} — its key is never used anywhere else. Run /bridge:login to sign in to ${this.d.envApiUrl}.`;
+      return `profile "${profileLabel(p)}" is signed in to ${inst.apiUrl}, but EINWEAVE_API_URL is ${this.d.envApiUrl} — its key is never used anywhere else. Run /bridge:login to sign in to ${this.d.envApiUrl}.`;
     }
     // Login needs the API URL, so that hint comes first.
-    if (!this.apiUrl()) return "BRIDGE_API_URL is not set — run /bridge:configure, then /bridge:login";
+    if (!this.apiUrl()) return "EINWEAVE_API_URL is not set — run /bridge:configure, then /bridge:login";
     try {
       // Proofs sign the API ORIGIN (§3.4, C16): a URL with a path could never be accepted.
       apiOrigin(this.apiUrl());
     } catch (e) {
-      return `BRIDGE_API_URL is unusable: ${errDetail(e)} — fix it with /bridge:configure`;
+      return `EINWEAVE_API_URL is unusable: ${errDetail(e)} — fix it with /bridge:configure`;
     }
     if (this.source() === "none") {
       // RFC-017 D8 (P1 gap): `installation()` also reads null for a NEWER plugin's
@@ -262,7 +257,6 @@ export class CredentialManager {
       if (store.readUpgradeMarker(p.dir) || store.hasLegacyCredentials(p.dir)) {
         return `${p.name ? `profile "${p.name}": ` : ""}Bridge plugin 0.25 signs in with a per-machine key (RFC-016); the sign-in from plugin 0.24 or earlier (RFC-014) cannot be carried over — run /bridge:login`;
       }
-      if (this.d.staleStaticTokenPresent) return STALE_TOKEN_HINT;
       return p.name ? `profile "${p.name}" is not signed in — run /bridge:login` : "this machine is not signed in to Bridge — run /bridge:login";
     }
     return null;
@@ -657,7 +651,6 @@ export class CredentialManager {
         : {}),
       ...(this.access ? { access_token_expires_at: localIso(this.access.expiresAt) } : {}),
       ...(this.sessionBlocked ? { session: "revoked — /bridge:connect starts a new one" } : {}),
-      ...(src === "none" && this.d.staleStaticTokenPresent ? { hint: STALE_TOKEN_HINT } : {}),
       ...(problem ? { problem } : {}),
       ...(this.pendingLogin ? { login: "waiting for approval in the browser" } : {}),
     };
@@ -678,7 +671,7 @@ export class CredentialManager {
   async login(mode: "auto" | "browser" | "device" = "auto"): Promise<string> {
     if ("error" in this.d.profile) return this.d.profile.error;
     const apiUrl = this.apiUrl();
-    if (!apiUrl) return "BRIDGE_API_URL is not set — run /bridge:configure first.";
+    if (!apiUrl) return "EINWEAVE_API_URL is not set — run /bridge:configure first.";
     let meta: AuthMetadata;
     try {
       meta = await this.tokens.discover(apiUrl);
@@ -1056,7 +1049,7 @@ export class CredentialManager {
   }
 
   /**
-   * Headless enrolment: `BRIDGE_ENROLMENT_KEY` is exchanged once, when the profile has
+   * Headless enrolment: `EINWEAVE_ENROLMENT_KEY` is exchanged once, when the profile has
    * no installation. Under the lock with a re-check, so of several sessions starting
    * together exactly one enrols — and ONE deadline covers discovery + enrol + C6 retry.
    */
@@ -1070,11 +1063,11 @@ export class CredentialManager {
     // it (store.writeInstallation is not itself format-guarded; every OTHER writer gates
     // on readInstallation returning something first). Never through chat: log only.
     if (store.isNewerInstallation(p.dir)) {
-      this.d.log(`bridge auth: not enrolling with BRIDGE_ENROLMENT_KEY — ${NEWER_INSTALLATION_MESSAGE}`);
+      this.d.log(`bridge auth: not enrolling with EINWEAVE_ENROLMENT_KEY — ${NEWER_INSTALLATION_MESSAGE}`);
       return;
     }
     if (store.hasLoggedOutMarker(p.dir)) {
-      this.d.log("bridge auth: signed out with /bridge:logout — not re-enrolling from BRIDGE_ENROLMENT_KEY (run /bridge:login)");
+      this.d.log("bridge auth: signed out with /bridge:logout — not re-enrolling from EINWEAVE_ENROLMENT_KEY (run /bridge:login)");
       return;
     }
     // Set when Bridge DID enrol but the files could not be written: not a key problem.
@@ -1109,18 +1102,18 @@ export class CredentialManager {
             const left = await this.abandonEnrolment(p.dir, meta, key.signer, g, signal);
             saveFailure = `its sign-in could not be saved on this machine (${errDetail(e)})${stillEnrolled(left)}`;
           }
-          this.d.log(`bridge auth: enrolled installation ${g.installation_id} with BRIDGE_ENROLMENT_KEY`);
+          this.d.log(`bridge auth: enrolled installation ${g.installation_id} with EINWEAVE_ENROLMENT_KEY`);
         },
         this.lockOpts()
       );
     } catch (e) {
       const why = errDetail(e);
-      this.d.notify(`Bridge: BRIDGE_ENROLMENT_KEY could not enrol this machine (${why}) — the key may be used up or expired, or Bridge did not answer in time.`);
+      this.d.notify(`Bridge: EINWEAVE_ENROLMENT_KEY could not enrol this machine (${why}) — the key may be used up or expired, or Bridge did not answer in time.`);
       return;
     }
     if (saveFailure) {
       this.d.notify(
-        `Bridge: BRIDGE_ENROLMENT_KEY enrolled this machine, but ${saveFailure}. The key's use is spent; fix the disk problem, then run /bridge:login (or set a new enrolment key).`
+        `Bridge: EINWEAVE_ENROLMENT_KEY enrolled this machine, but ${saveFailure}. The key's use is spent; fix the disk problem, then run /bridge:login (or set a new enrolment key).`
       );
     }
   }

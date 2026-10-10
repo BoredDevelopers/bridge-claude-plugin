@@ -4,7 +4,7 @@
  * API's `db` module binds its pool to DATABASE_URL at import — importing it into the test
  * process would share (and close) one pool across files.
  *
- *   DATABASE_URL=<scratch db> bun test/fixtures/real-api-seed.ts <BRIDGE_API_DIR> <BETTER_AUTH_SECRET>
+ *   DATABASE_URL=<scratch db> bun test/fixtures/real-api-seed.ts <EINWEAVE_API_DIR> <BETTER_AUTH_SECRET>
  *
  * Prints the result as its LAST stdout line (the migration runner logs above it):
  *   { cookie, userId, sessionId, keys: string[] }.
@@ -19,7 +19,7 @@ import { createHmac } from "node:crypto";
 import { join } from "node:path";
 
 const [apiDir, secret] = process.argv.slice(2);
-if (!apiDir || !secret) throw new Error("usage: real-api-seed.ts <BRIDGE_API_DIR> <BETTER_AUTH_SECRET>");
+if (!apiDir || !secret) throw new Error("usage: real-api-seed.ts <EINWEAVE_API_DIR> <BETTER_AUTH_SECRET>");
 
 const api: any = await import(join(apiDir, "src/db/index.ts"));
 await api.runMigrations();

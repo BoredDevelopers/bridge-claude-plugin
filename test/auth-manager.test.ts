@@ -72,13 +72,12 @@ function manager(
   const m = new CredentialManager({
     profile: resolveProfile(dir, profile),
     envApiUrl: apiUrl,
-    staleStaticTokenPresent: false,
     enrolmentKey: "",
     sessionKey: () => key ?? "session-a",
     sessionKeyReady: () => Promise.resolve(),
     platform: "test-os",
     clientVersion: "9.9.9",
-    env: { BRIDGE_BROWSER: "none" },
+    env: { EINWEAVE_BROWSER: "none" },
     onAccessRotated: (f) => events.rotated.push(f),
     onLoggedIn: () => events.loggedIn++,
     onLoggedOut: () => events.loggedOut++,
@@ -565,17 +564,6 @@ describe("profiles and configuration", () => {
     await expect(m.accessToken()).rejects.toThrow(/profile "reviewer" is not signed in/);
   });
 
-  test("BRIDGE_TOKEN alone is not a credential: source is none, and the hint says so", async () => {
-    const { stub, dir } = setup();
-    const { m } = manager(dir, stub.url, { staleStaticTokenPresent: true });
-    expect(m.source()).toBe("none");
-    await expect(m.accessToken()).rejects.toThrow(/BRIDGE_TOKEN is no longer supported — run \/bridge:login/);
-    await enrolledProfile(stub, dir);
-    expect(m.source()).toBe("installation");
-    expect(await m.accessToken()).toStartWith("brg_at_");
-    expect(m.status().hint).toBeUndefined();
-  });
-
   test("opening the profile sweeps what a crash left: old key temps and old lock tombstones — never a fresh one", () => {
     const dir = mkdtempSync(join(tmpdir(), "open-sweep-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -600,10 +588,10 @@ describe("profiles and configuration", () => {
     expect(existsSync(freshTomb)).toBe(true);
   });
 
-  test("a BRIDGE_API_URL with a path is refused up front, with a clear message, and nothing is sent", async () => {
+  test("a EINWEAVE_API_URL with a path is refused up front, with a clear message, and nothing is sent", async () => {
     const { stub, dir } = setup();
     const { m } = manager(dir, `${stub.url}/bridge`);
-    expect(m.configError()).toMatch(/BRIDGE_API_URL .*must be an origin/);
+    expect(m.configError()).toMatch(/EINWEAVE_API_URL .*must be an origin/);
     await expect(m.accessToken()).rejects.toThrow(/must be an origin/);
     expect(await m.login("browser")).toMatch(/must be an origin/);
     expect(stub.stats.discoveryHits).toBe(0);
@@ -619,7 +607,7 @@ describe("profiles and configuration", () => {
     const { stub, dir } = setup();
     await enrolledProfile(stub, dir);
     const { m } = manager(dir, "https://elsewhere.example");
-    await expect(m.accessToken()).rejects.toThrow(/signed in to .* but BRIDGE_API_URL is https:\/\/elsewhere/);
+    await expect(m.accessToken()).rejects.toThrow(/signed in to .* but EINWEAVE_API_URL is https:\/\/elsewhere/);
     expect(stub.stats.mintBodies).toHaveLength(0);
   });
 
@@ -1132,7 +1120,7 @@ describe("logout and enrolment keys", () => {
     expect(readInstallation(dir)).toBeNull();
   });
 
-  test("BRIDGE_ENROLMENT_KEY enrols once, even when several sessions boot together", async () => {
+  test("EINWEAVE_ENROLMENT_KEY enrols once, even when several sessions boot together", async () => {
     const { stub, dir } = setup();
     const ek = stub.mintEnrolmentKey(5);
     const ms = Array.from({ length: 4 }, (_, i) => manager(dir, stub.url, { key: `k${i}`, enrolmentKey: ek }).m);
@@ -1157,7 +1145,7 @@ describe("logout and enrolment keys", () => {
     expect(existsSync(join(dir, "logged-out"))).toBe(false);
   });
 
-  test("C6: BRIDGE_ENROLMENT_KEY answered key_already_enrolled retries ONCE with a fresh key; twice ⇒ reported", async () => {
+  test("C6: EINWEAVE_ENROLMENT_KEY answered key_already_enrolled retries ONCE with a fresh key; twice ⇒ reported", async () => {
     const { stub, dir } = setup({ keyAlreadyEnrolled: 1 });
     const { m } = manager(dir, stub.url, { enrolmentKey: stub.mintEnrolmentKey(5) });
     await m.enrolFromKeyIfNeeded();
@@ -1217,7 +1205,7 @@ describe("logout and enrolment keys", () => {
     expect(stub.stats.enrols).toBe(1);
     expect(stub.stats.revokes).toHaveLength(1);
     expect(stub.isRevoked(stub.stats.revokes[0]!.id)).toBe("installation_revoked");
-    expect(events.notices.join()).toMatch(/BRIDGE_ENROLMENT_KEY enrolled this machine, but its sign-in could not be saved on this machine .*ENOSPC/);
+    expect(events.notices.join()).toMatch(/EINWEAVE_ENROLMENT_KEY enrolled this machine, but its sign-in could not be saved on this machine .*ENOSPC/);
     expect(events.notices.join()).not.toMatch(/used up or expired/); // the key was fine
   });
 
@@ -1248,7 +1236,7 @@ describe("RFC-014 (0.23 / 0.24) → 0.25", () => {
     writeFileSync(join(dir, "sessions", "session-a.json"), JSON.stringify({ sessionId: "s", refreshToken: "brg_rt_old", installationId: "old" }));
   }
 
-  test("0.23 files are retired and the person is told to /bridge:login — even with BRIDGE_API_URL unset", async () => {
+  test("0.23 files are retired and the person is told to /bridge:login — even with EINWEAVE_API_URL unset", async () => {
     const { stub, dir } = setup();
     legacyProfile(dir, stub.url);
     const { m } = manager(dir, "");

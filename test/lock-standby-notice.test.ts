@@ -70,10 +70,10 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
         // Pinned to a zone unlike this machine's AND CI's: `since` renders in LOCAL time, and
         // the holder's procStart (written by THIS process) must still match across zones.
         TZ: "Asia/Kolkata",
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL,
-        BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID,
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+        EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID,
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
     });
@@ -138,13 +138,13 @@ describe("finding 9: the standby dedupe key is pid + procStart, not the holder's
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL,
-        BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID,
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+        EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID,
         CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1",
-        BRIDGE_TEST_LOCK_RETRY_MS: "300", // fast standby-retry loop for this test only
+        EINWEAVE_TEST: "1",
+        EINWEAVE_TEST_LOCK_RETRY_MS: "300", // fast standby-retry loop for this test only
       } as Record<string, string>,
     });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });

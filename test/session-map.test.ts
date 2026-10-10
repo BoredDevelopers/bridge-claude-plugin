@@ -219,9 +219,9 @@ describe("pid correlation", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: "http://127.0.0.1:1",
-        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: "http://127.0.0.1:1",
+        EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
@@ -254,9 +254,9 @@ describe("pid correlation", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: "http://127.0.0.1:1", // closed: we only need the boot log
-        BRIDGE_TOKEN: "test-token", BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: "http://127.0.0.1:1", // closed: we only need the boot log
+        EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", // the per-launch id it must NOT use
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,

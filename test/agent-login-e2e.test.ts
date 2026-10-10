@@ -53,16 +53,15 @@ async function withPlugin<T>(
     env: {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: stub.url,
-      BRIDGE_TOKEN: "",
-      BRIDGE_AUTOCONNECT: "1",
-      BRIDGE_BROWSER: "none",
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: stub.url,
+      EINWEAVE_AUTOCONNECT: "1",
+      EINWEAVE_BROWSER: "none",
       CLAUDE_CODE_SESSION_ID: SESSION,
       CLAUDE_CODE_SSE_PORT: "",
-      // Enables the BRIDGE_TEST_* timing knobs (server.ts testKnob); a test that proves
+      // Enables the EINWEAVE_TEST_* timing knobs (server.ts testKnob); a test that proves
       // they are ignored in production overrides it.
-      BRIDGE_TEST: "1",
+      EINWEAVE_TEST: "1",
       ...env,
     } as Record<string, string>,
     stderr: "pipe",
@@ -102,7 +101,6 @@ function otherManager(stub: ReturnType<typeof startAuthStub>, dir: string, sessi
   return new CredentialManager({
     profile: resolveProfile(dir, undefined),
     envApiUrl: stub.url,
-    staleStaticTokenPresent: false,
     enrolmentKey: "",
     sessionKey: () => sessionKey,
     sessionKeyReady: async () => {},
@@ -133,10 +131,10 @@ async function until(pred: () => boolean | Promise<boolean>, ms: number): Promis
 }
 
 describe("plugin on key credentials (RFC-016)", () => {
-  test("BRIDGE_ENROLMENT_KEY enrols at boot; the socket authenticates with a DPoP token + a proof for GET /ws", async () => {
+  test("EINWEAVE_ENROLMENT_KEY enrols at boot; the socket authenticates with a DPoP token + a proof for GET /ws", async () => {
     const stub = startAuthStub();
     const ek = stub.mintEnrolmentKey();
-    await withPlugin(stub, { BRIDGE_ENROLMENT_KEY: ek }, async (client, dir) => {
+    await withPlugin(stub, { EINWEAVE_ENROLMENT_KEY: ek }, async (client, dir) => {
       expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
       expect(stub.stats.authTokens[0]).toStartWith("brg_at_");
       expect(stub.stats.refusals.filter((r) => r.startsWith("ws:"))).toEqual([]);
@@ -254,7 +252,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_TEST_REMINT_REARM_MS: "1500" },
+      { EINWEAVE_TEST_REMINT_REARM_MS: "1500" },
       async (client) => {
         const connected = async () => (await status(client)).websocket === "connected";
         expect(await until(connected, 5_000)).toBe(true);
@@ -282,7 +280,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_TEST_REMINT_REARM_MS: "1500", BRIDGE_TEST_LIVENESS_MS: "3000" },
+      { EINWEAVE_TEST_REMINT_REARM_MS: "1500", EINWEAVE_TEST_LIVENESS_MS: "3000" },
       async (client) => {
         const connected = async () => (await status(client)).websocket === "connected";
         expect(await until(connected, 5_000)).toBe(true);
@@ -502,7 +500,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     try {
       await withPlugin(
         stub,
-        { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+        { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
           copyStateDir(dir, loot);
@@ -530,7 +528,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
         // Auth #1 is refused exactly like a live holder taking over elsewhere would —
         // sets the module-level `superseded` flag (server.ts's close handler, cls
@@ -785,7 +783,7 @@ describe("plugin on key credentials (RFC-016)", () => {
 
   test("a login done in ANOTHER session is picked up without /bridge:connect here", async () => {
     const stub = startAuthStub();
-    await withPlugin(stub, { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" }, async (client, dir, _n, _p, stderr) => {
+    await withPlugin(stub, { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" }, async (client, dir, _n, _p, stderr) => {
       expect((await status(client)).configured).toBe(false);
       // Past startup (session-key resolution, then the boot's own connect decision): from
       // here only the credential watch can notice the new files.
@@ -837,7 +835,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const told = (notices: () => string[]) => notices().filter((n) => n.includes("must be upgraded")).length;
     await withPlugin(
       stub,
-      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
         expect(await until(() => told(notices) === 1, 5_000)).toBe(true);
         const opens = stub.stats.wsOpens;
@@ -933,7 +931,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub(opts);
     await withPlugin(
       stub,
-      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
         expect(await until(() => notices().some((n) => n.includes("check the system clock")), 10_000)).toBe(true);
         expect(existsSync(join(dir, "key.json"))).toBe(true);
@@ -955,7 +953,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub(opts);
     await withPlugin(
       stub,
-      { BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, _dir, notices, _p, stderr) => {
         expect(await until(() => notices().some((n) => n.includes("check the system clock")), 5_000)).toBe(true);
         opts.rejectAssertions = false;
@@ -974,7 +972,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_TEST_BACKOFF_SCALE: "0.02" }, // the slow credential retry in ~1 s
+      { EINWEAVE_TEST_BACKOFF_SCALE: "0.02" }, // the slow credential retry in ~1 s
       async (_client, _dir, notices) => {
         expect(await until(() => stub.stats.authTokens.length >= 1, 5_000)).toBe(true);
         stub.rejectNextWsAuths(1); // the immediate re-mint's auth: 4001 again → told
@@ -991,7 +989,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_TEST_BACKOFF_SCALE: "0.02" }, // the slow 4003 retry in ~1 s
+      { EINWEAVE_TEST_BACKOFF_SCALE: "0.02" }, // the slow 4003 retry in ~1 s
       async (client, _dir, notices) => {
         const connected = async () => (await status(client)).websocket === "connected";
         const told = () => notices().filter((n) => n.includes("agent deactivated")).length;
@@ -1006,11 +1004,11 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("the BRIDGE_TEST_* timing knobs are ignored unless BRIDGE_TEST=1: production timing stays", async () => {
+  test("the EINWEAVE_TEST_* timing knobs are ignored unless EINWEAVE_TEST=1: production timing stays", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_TEST: "", BRIDGE_TEST_BACKOFF_SCALE: "0.02", BRIDGE_TEST_CREDENTIAL_WATCH_MS: "200" },
+      { EINWEAVE_TEST: "", EINWEAVE_TEST_BACKOFF_SCALE: "0.02", EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client) => {
         expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
         stub.closeAll(4003, "deregistered");
@@ -1027,7 +1025,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { BRIDGE_PROFILE: "reviewer" },
+      { EINWEAVE_PROFILE: "reviewer" },
       async (client) => {
         const s = await status(client);
         expect(s.configured).toBe(false);

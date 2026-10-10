@@ -9,8 +9,8 @@
  * SESSION_KEY here MUST match what resolveSessionKey() actually resolves, or
  * the pre-seeded label file would sit under the wrong name and every
  * resolution assertion would silently test nothing. Per server.ts's
- * resolveSessionKey(): with no BRIDGE_SESSION_KEY override and no session-map
- * hook running (BRIDGE_STATE_DIR/CLAUDE_PLUGIN_DATA point at a throwaway temp
+ * resolveSessionKey(): with no EINWEAVE_SESSION_KEY override and no session-map
+ * hook running (EINWEAVE_STATE_DIR/CLAUDE_PLUGIN_DATA point at a throwaway temp
  * dir with no `sessions/` subdirectory, so the ancestry walk always misses),
  * it falls through to CLAUDE_CODE_SESSION_ID (CLAUDE_CODE_SSE_PORT left "" so
  * the SSE-port path is skipped too) — same fixed id session-label.test.ts
@@ -85,13 +85,13 @@ async function authFrameWithStore(opts: {
   const env: Record<string, string> = {
     ...process.env,
     CLAUDE_PLUGIN_DATA: dir,
-    BRIDGE_STATE_DIR: dir,
-    BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-    BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
+    EINWEAVE_STATE_DIR: dir,
+    EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+    EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
     CLAUDE_CODE_SESSION_ID: SESSION_KEY,
     CLAUDE_CODE_SSE_PORT: "",
   };
-  if (opts.envLabel !== undefined) env.BRIDGE_SESSION_LABEL = opts.envLabel;
+  if (opts.envLabel !== undefined) env.EINWEAVE_SESSION_LABEL = opts.envLabel;
   const plugin = Bun.spawn(["bun", SERVER], {
     env,
     stdin: "pipe",
@@ -116,7 +116,7 @@ describe("session label resolution (SESSION_KEY-keyed store)", () => {
     expect(frame?.sessionInfo?.sessionLabel).toBe("Reviewer");
   }, 30_000);
 
-  test("BRIDGE_SESSION_LABEL env wins over a stored file", async () => {
+  test("EINWEAVE_SESSION_LABEL env wins over a stored file", async () => {
     const frame = await authFrameWithStore({ seedLabel: "Reviewer", envLabel: "FromEnv" });
     expect(frame?.type).toBe("auth");
     expect(frame?.sessionInfo?.sessionLabel).toBe("FromEnv");
@@ -221,9 +221,9 @@ describe("set_session_label tool (best effort — stdio round trip)", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: SESSION_KEY,
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
@@ -285,9 +285,9 @@ describe("set_session_label persists across reconnect (regression: no double-suf
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: SESSION_KEY,
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,

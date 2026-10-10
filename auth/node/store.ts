@@ -416,7 +416,7 @@ function sweep(dir: string, pattern: RegExp, minAgeMs: number): number {
 const loggedOutMarker = (dir: string) => join(dir, "logged-out");
 const upgradeMarker = (dir: string) => join(dir, "upgrade-required.json");
 
-/** Set by /bridge:logout; suppresses BRIDGE_ENROLMENT_KEY until the next login. (Same name as 0.24's: a 0.24 logout is honoured.) */
+/** Set by /bridge:logout; suppresses EINWEAVE_ENROLMENT_KEY until the next login. (Same name as 0.24's: a 0.24 logout is honoured.) */
 export function writeLoggedOutMarker(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   writeFileSync(loggedOutMarker(dir), `${new Date().toISOString()}\n`, { mode: 0o600 });

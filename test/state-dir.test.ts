@@ -96,6 +96,37 @@ describe("migrateLegacyState", () => {
   });
 });
 
+describe("server.ts boot", () => {
+  const SERVER = join(import.meta.dir, "..", "server.ts");
+  async function boot(env: Record<string, string>) {
+    const base = { ...(process.env as Record<string, string>) };
+    for (const k of Object.keys(base)) if (k.startsWith("EINWEAVE_") || k.startsWith("BRIDGE_")) delete base[k];
+    const proc = Bun.spawn(["bun", SERVER], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...base, ...env } });
+    await Bun.sleep(1500);
+    proc.stdin.end();
+    proc.kill();
+    await proc.exited;
+  }
+
+  test("moves the old profile into the DEFAULT ~/.einweave (HOME redirected)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ew-home-"));
+    cleanups.push(home);
+    seedLegacy(join(home, ".claude", "channels", "bridge"));
+    await boot({ HOME: home, CLAUDE_PLUGIN_DATA: join(home, "pd") });
+    expect(readFileSync(join(home, ".einweave", "key.json"), "utf8")).toBe("root key.json");
+  });
+
+  test("NEVER fills an explicit EINWEAVE_STATE_DIR from the user's old profile", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ew-home-"));
+    cleanups.push(home);
+    seedLegacy(join(home, ".claude", "channels", "bridge"));
+    const explicit = join(home, "elsewhere");
+    await boot({ HOME: home, EINWEAVE_STATE_DIR: explicit, CLAUDE_PLUGIN_DATA: join(home, "pd") });
+    expect(existsSync(join(explicit, "key.json"))).toBe(false);
+    expect(existsSync(join(home, ".einweave"))).toBe(false);
+  });
+});
+
 describe("resolveStateDir", () => {
   test("EINWEAVE_STATE_DIR wins; BRIDGE_STATE_DIR is ignored; default ~/.einweave", () => {
     expect(resolveStateDir({ EINWEAVE_STATE_DIR: "/x" })).toBe("/x");

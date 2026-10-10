@@ -90,10 +90,10 @@ async function boot(waitMs = 9000): Promise<{ err: string; declined: boolean; co
     env: {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: CLOSED_PORT_API_URL,
-      BRIDGE_AUTOCONNECT: "1",
-      BRIDGE_SESSION_KEY: SESSION_ID,
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+      EINWEAVE_AUTOCONNECT: "1",
+      EINWEAVE_SESSION_KEY: SESSION_ID,
       CLAUDE_CODE_SSE_PORT: "",
     } as Record<string, string>,
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -141,9 +141,9 @@ describe("single instance per session key", () => {
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -233,9 +233,9 @@ describe("single instance per session key", () => {
       env: {
         ...process.env,
         PATH: `${shimBin}:${process.env.PATH}`, // `ps` resolves to the failing shim
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -277,9 +277,9 @@ describe("single instance per session key", () => {
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -304,9 +304,9 @@ describe("single instance per session key", () => {
       Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       })
@@ -417,10 +417,10 @@ describe("RFC-017 D3: version-aware takeover", () => {
       const p = Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_ENROLMENT_KEY: enrolmentKey,
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -478,10 +478,10 @@ describe("RFC-017 D3: version-aware takeover", () => {
       const p = Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_ENROLMENT_KEY: enrolmentKey,
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -534,10 +534,10 @@ describe("RFC-017 D3: version-aware takeover", () => {
         args: [SERVER],
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_ENROLMENT_KEY: enrolmentKey,
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
       });
       const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
@@ -579,7 +579,7 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
     // real agent-auth+WS stub, one shared installation (B reuses whatever A enrols —
     // enrolFromKeyIfNeeded no-ops once `installation.json` exists), and the SAME
     // on-disk session lock, which is what this test is actually about. A is
-    // deliberately reported as an OLDER version (BRIDGE_TEST_PLUGIN_VERSION) so B's
+    // deliberately reported as an OLDER version (EINWEAVE_TEST_PLUGIN_VERSION) so B's
     // real, unoverridden version wins the lock automatically once it starts. Auth
     // frames are told apart by ORDER (A connects first, at boot; B only after A is
     // already up), not by identity — the server treats every socket the same.
@@ -621,14 +621,14 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
     const pA = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         // A comfortably wide, scaled-down "credential"-class backoff (unscaled 30-60s):
         // wide enough that B's real startup + auth reliably finishes well inside it,
         // narrow enough that the test does not need to wait long.
-        BRIDGE_TEST: "1", BRIDGE_TEST_PLUGIN_VERSION: "0.1.0", BRIDGE_TEST_BACKOFF_SCALE: "0.15",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_PLUGIN_VERSION: "0.1.0", EINWEAVE_TEST_BACKOFF_SCALE: "0.15",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -664,9 +664,9 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
       pB = Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -734,11 +734,11 @@ describe("finding 5: lock renewal never renews a record that no longer names thi
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1", BRIDGE_TEST_LOCK_RETRY_MS: "300",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_LOCK_RETRY_MS: "300",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -807,10 +807,10 @@ describe("finding 11a: a superseded window invalidates its access token and stop
       args: [SERVER],
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
     });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
@@ -900,14 +900,14 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
       stderr: "pipe",
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         // A comfortably wide, scaled-down "transient" backoff (unscaled 1-30s): wide
         // enough that B's real startup + explicit takeover reliably finish well inside
         // it, narrow enough that the test does not need to wait long.
-        BRIDGE_TEST: "1", BRIDGE_TEST_BACKOFF_SCALE: "0.15",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_BACKOFF_SCALE: "0.15",
       } as Record<string, string>,
     });
     let errA = "";
@@ -951,10 +951,10 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
         args: [SERVER],
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "0",
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-          BRIDGE_TEST: "1", BRIDGE_TEST_PLUGIN_VERSION: "0.1.0",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "0",
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          EINWEAVE_TEST: "1", EINWEAVE_TEST_PLUGIN_VERSION: "0.1.0",
         } as Record<string, string>,
       });
       clientB = new Client({ name: "test-client-b", version: "0.0.0" }, { capabilities: {} });
@@ -1038,11 +1038,11 @@ describe("finding 3 (2026-09-27 re-review): a live holder's renewal must go supe
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1", BRIDGE_TEST_LOCK_RETRY_MS: "300",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_LOCK_RETRY_MS: "300",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -1110,10 +1110,10 @@ describe("finding 2 (2026-09-27 re-review): the pre-send lock re-check", () => {
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -1168,10 +1168,10 @@ describe("finding 4 (2026-09-27 re-review): the standby retry must not carry a s
       args: [SERVER],
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1", BRIDGE_TEST_LOCK_RETRY_MS: "300",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_LOCK_RETRY_MS: "300",
       } as Record<string, string>,
     });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
@@ -1246,10 +1246,10 @@ describe("finding 7 (2026-09-27 re-review): an explicit takeover against a still
       args: [SERVER],
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
     });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });

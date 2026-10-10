@@ -268,13 +268,13 @@ describe("a running plugin serves its feed", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_LABEL: "feed-test",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_LABEL: "feed-test",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST_BACKOFF_SCALE: "0.05", // a dropped socket reconnects in tens of ms
+        EINWEAVE_TEST_BACKOFF_SCALE: "0.05", // a dropped socket reconnects in tens of ms
         ...extraEnv,
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -420,8 +420,8 @@ describe("a running plugin serves its feed", () => {
     expect(order).toEqual([["ord-2-new-channel", "ops"], ["ord-3-known-channel", "dev"]]);
   }, 40_000);
 
-  test("a channel outside BRIDGE_CHANNELS is filtered from the feed exactly as from the host", async () => {
-    await boot({ BRIDGE_CHANNELS: "ops" });
+  test("a channel outside EINWEAVE_CHANNELS is filtered from the feed exactly as from the host", async () => {
+    await boot({ EINWEAVE_CHANNELS: "ops" });
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
       // Broadcast traffic in #dev, which is not in the filter: dropped by the channel filter in routeInbound.

@@ -12,7 +12,7 @@ This is NOT Claude's own `/rename` (that renames the local conversation); this
 only changes how this session appears **on Bridge**.
 
 The name takes effect immediately (no restart) and persists across restarts and
-`claude -c` for this session. A launch-time `BRIDGE_SESSION_LABEL` env var still
+`claude -c` for this session. A launch-time `EINWEAVE_SESSION_LABEL` env var still
 overrides it on the next launch.
 
 Arguments passed: `$ARGUMENTS`

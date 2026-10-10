@@ -10,7 +10,6 @@ const [dir, apiUrl, rounds] = [process.argv[2]!, process.argv[3]!, Number(proces
 const m = new CredentialManager({
   profile: resolveProfile(dir, undefined),
   envApiUrl: apiUrl,
-  staleStaticTokenPresent: false,
   enrolmentKey: "",
   sessionKey: () => `p${process.pid}`,
   sessionKeyReady: async () => {},

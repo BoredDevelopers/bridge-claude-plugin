@@ -19,18 +19,17 @@
  * a Bridge confirmation, never the user's prompt. And stdout is model context:
  * the only thing ever written there is the one JSON object below.
  */
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { writeSync } from "node:fs";
 import { deliveredEntryId } from "../delivery/tags";
 import { ctlSocketPath } from "../delivery/ctl-path";
+import { resolveStateDir } from "../state-dir";
 import type { CtlRequest } from "../delivery/ctl-protocol";
 
 const STDIN_TIMEOUT_MS = 1000;
 const SOCKET_TIMEOUT_MS = 1500;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
-const stateDir = process.env.EINWEAVE_STATE_DIR || join(homedir(), ".einweave");
+const stateDir = resolveStateDir();
 
 function claudePid(): number | null {
   const raw = (process.env.CLAUDE_PID ?? "").trim();

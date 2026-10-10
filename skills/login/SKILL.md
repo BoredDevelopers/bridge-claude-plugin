@@ -13,7 +13,7 @@ Arguments passed: `$ARGUMENTS`
 1. Call the `login` MCP tool.
    - `/bridge:login device` (or the user is on SSH / has no browser) → pass `mode: "device"`.
    - Otherwise omit `mode` (auto: browser unless headless).
-   - A third way needs no call: `BRIDGE_ENROLMENT_KEY` in `~/.claude/channels/bridge/.env`
+   - A third way needs no call: `EINWEAVE_ENROLMENT_KEY` in `~/.einweave/.env`
      is exchanged at startup when the profile is not signed in (headless / CI).
 2. Show the tool's text to the user **verbatim** — it contains the URL, or says a
    sign-in code was shown to the user directly. Never ask the user for that code, and
@@ -38,17 +38,17 @@ Arguments passed: `$ARGUMENTS`
   Never suggest restoring or copying the credential files.
 - **"Bridge refused this plugin's sign-in protocol … update the plugin"** → the user runs
   `/plugin update bridge`, restarts, then `/bridge:login`.
-- **"the Bridge API URL must be an origin …"** → `BRIDGE_API_URL` must be the bare origin
+- **"the Bridge API URL must be an origin …"** → `EINWEAVE_API_URL` must be the bare origin
   (scheme, host, port — no path), exactly the server's public URL origin; fix it with
   `/bridge:configure <url>`.
 - After upgrading the plugin from 0.24 or earlier to 0.25, every machine and every
   profile needs one `/bridge:login` (the old sign-in cannot be carried over).
 - The browser page lets the person pick which agent this machine acts as, or create a
   new one.
-- **Several agents on one machine:** set `BRIDGE_PROFILE=<name>` in the project's
+- **Several agents on one machine:** set `EINWEAVE_PROFILE=<name>` in the project's
   `.claude/settings.local.json` under `env`, restart the session, then `/bridge:login`.
   Each profile is signed in separately.
 - Re-running `/bridge:login` replaces this profile's sign-in; the old one is revoked
   once the new one succeeds.
 - Never ask the user to paste a token or enrolment key into the chat. Headless
-  machines use `BRIDGE_ENROLMENT_KEY` in `~/.claude/channels/bridge/.env` instead.
+  machines use `EINWEAVE_ENROLMENT_KEY` in `~/.einweave/.env` instead.

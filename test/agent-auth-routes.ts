@@ -13,7 +13,7 @@
  *
  * A stub calls `handle(req)` FIRST in its own `fetch`; a non-null Response is
  * agent-auth's to answer, `null` means "not an agent-auth route, handle it
- * yourself". The plugin enrols for real via BRIDGE_ENROLMENT_KEY before it can
+ * yourself". The plugin enrols for real via EINWEAVE_ENROLMENT_KEY before it can
  * open a socket.
  */
 import { createAuthCore, type StubOptions } from "./agent-auth-stub";

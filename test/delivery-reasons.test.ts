@@ -1,10 +1,10 @@
 /**
- * BRIDGE_CHANNELS may narrow broadcast traffic. It must NEVER suppress a message
+ * EINWEAVE_CHANNELS may narrow broadcast traffic. It must NEVER suppress a message
  * the server addressed to this session.
  *
  * WHY THIS EXISTS — a message was received and binned on 2026-07-30.
  *
- * `channelDecision()` dropped anything whose channel was not in BRIDGE_CHANNELS,
+ * `channelDecision()` dropped anything whose channel was not in EINWEAVE_CHANNELS,
  * with one exemption: the agent's own `<agent>-tasks`. Explicit context targeting
  * bypassed it via `targetsThisSession`; `mention` and `thread` had no bypass at
  * all. So aio's in-thread reply in `aio-tasks` was delivered to all three
@@ -109,7 +109,7 @@ const message = (id: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
+describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
   let dir = "";
   let stub: Stub;
   let plugin: ReturnType<typeof Bun.spawn>;
@@ -122,10 +122,10 @@ describe("BRIDGE_CHANNELS cannot suppress an addressed message", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_CHANNELS: FILTER,
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_CHANNELS: FILTER,
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
