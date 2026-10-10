@@ -66,6 +66,11 @@ export class MissedTracker<T extends { id: string }> {
   prompt(pending: readonly T[], at: number): MissedSplit<T> {
     const fresh: T[] = [];
     const outstanding: T[] = [];
+    // Forget entries that left pending by any other route (a read tool returned
+    // them, a dismissal): a later redelivery is then a fresh push, judged on its
+    // own turn — and the maps stay bounded by the pending set.
+    const live = new Set(pending.map((e) => e.id));
+    for (const id of this.pushes.keys()) if (!live.has(id)) this.settled(id);
     for (const entry of pending) {
       const push = this.pushes.get(entry.id);
       if (!push) continue;

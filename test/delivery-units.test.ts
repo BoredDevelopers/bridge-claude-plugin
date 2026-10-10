@@ -95,10 +95,18 @@ describe("MissedTracker (measured rule, not the RFC's first one)", () => {
     expect(t.prompt([e("a"), e("never-pushed")], 10000)).toEqual({ fresh: [], outstanding: [] });
   });
 
+  test("an entry that left pending without settled() is forgotten: its redelivery mid-turn is judged afresh", () => {
+    const t = new MissedTracker<{ id: string }>();
+    t.pushed("a", 0); // idle
+    t.prompt([], 100); // "a" was read by a tool meanwhile: no longer pending; a turn starts
+    t.pushed("a", 200); // redelivered mid-turn
+    expect(t.prompt([e("a")], 5000).fresh).toEqual([]);
+  });
+
   test("a redelivery keeps the FIRST push time and idle state", () => {
     const t = new MissedTracker<{ id: string }>();
     t.pushed("a", 0); // idle
-    t.prompt([], 100); // a turn starts
+    t.prompt([e("a")], 100); // a turn starts; "a" still pending (inside the grace)
     t.pushed("a", 200); // redelivered mid-turn
     expect(t.prompt([e("a")], 5000).fresh).toEqual([e("a")]);
   });
