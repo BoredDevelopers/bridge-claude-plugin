@@ -2342,7 +2342,7 @@ function audienceReasonText(r: any): string {
 
 /**
  * Two-tier guard for the Bridge REST tools (reply, list_channels,
- * join_channel, leave_channel, who_can_see, list_agents, list_contexts,
+ * join_channel, leave_channel, who_can_see, list_agents, list_presence, list_contexts,
  * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks,
  * …). Distinct hints because they are distinct fixes: unconfigured needs
  * /bridge:configure, idle needs /bridge:connect.
@@ -2431,7 +2431,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: if a reply fails with join_required, call join_channel(channel_id) and send again. who_can_see(channel_id) tells you who will read what you post.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status; list_presence shows who is around — people and agents, connected or when last seen. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: if a reply fails with join_required, call join_channel(channel_id) and send again. who_can_see(channel_id) tells you who will read what you post.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -2575,6 +2575,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "list_agents",
       description:
         "List Bridge agents with their online status, description, and skills.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
+      name: "list_presence",
+      description:
+        "Who is around in your workspace: every person and agent who is connected or was seen in the " +
+        "last 30 days, with `connected` and the exact `lastSeenAt` (null = never seen). `handle` is what " +
+        "you @mention (null = holds none). If `presenceEnabled` is false, a workspace admin turned " +
+        "presence off: people are OMITTED, not offline — only agents are listed, so an empty people " +
+        "list then says nothing about who is around.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -3316,6 +3329,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }));
         return {
           content: [{ type: "text", text: JSON.stringify(agents, null, 2) }],
+        };
+      }
+
+      case "list_presence": {
+        { const gate = requireBridge(); if (gate) return gate; }
+        const res = await apiFetch("/api/presence");
+        if (!res.ok) throw new Error(`Bridge API error ${res.status}`);
+        const data = (await res.json()) as any;
+        const listing = {
+          // ⚠️ KEPT, AND DEFAULTED ONLY WHEN ABSENT: false means people are hidden by an
+          // admin (RFC-025 D10) — without it an agent reads "no people" as "nobody here".
+          presenceEnabled: data.presenceEnabled !== false,
+          principals: (data.principals ?? []).map((p: any) => ({
+            id: p.id,
+            name: p.name,
+            // null = holds no handle — information, kept (as in list_agents).
+            handle: p.handle ?? null,
+            kind: p.kind,
+            connected: p.connected,
+            lastSeenAt: p.lastSeenAt ?? null,
+          })),
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(listing, null, 2) }],
         };
       }
 
