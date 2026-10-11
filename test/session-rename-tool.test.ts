@@ -192,7 +192,6 @@ function startLabelStub() {
                 agentId: "jorgen-mac",
                 agentName: "Jörgen (Mac)",
                 contextId: "ctx",
-                sendToken: "send-tok",
               },
             })
           );
@@ -256,7 +255,8 @@ describe("set_session_label tool (best effort — stdio round trip)", () => {
       const seen = stub.putSeen();
       expect(seen?.path).toBe("/api/agents/jorgen-mac/contexts/ctx/label");
       expect(seen?.body).toEqual({ label: "Reviewer" });
-      expect(seen?.contextHeader).toBe("send-tok");
+      // RFC-027 D2: no session header — the access token names the grant; the path carries its id.
+      expect(seen?.contextHeader).toBeNull();
 
       const stored = readLabelFileRaw(dir, SESSION_KEY);
       expect(stored).toBe("Reviewer");

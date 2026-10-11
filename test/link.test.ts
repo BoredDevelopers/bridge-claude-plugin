@@ -146,6 +146,14 @@ describe("link/adapter — what reaches the model", () => {
     expect(h.pushed).toEqual(["b2"]);
   });
 
+  test("targeted at another session of this agent → dismissed; at this one → surfaced", async () => {
+    const h = harness();
+    await h.adapter.push!(asEntry(msg("e1", { metadata: JSON.stringify({ contextId: "other-grant", contextAgentId: ME.agent }) })));
+    await h.adapter.push!(asEntry(msg("e2", { metadata: JSON.stringify({ contextId: ME.grant, contextAgentId: ME.agent }) })));
+    expect(h.dismissed).toEqual(["e1"]);
+    expect(h.pushed).toEqual(["e2"]);
+  });
+
   test("nothing is pushed before the host is ready", async () => {
     let open!: () => void;
     const gate = new Promise<void>((r) => (open = r));

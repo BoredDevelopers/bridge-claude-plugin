@@ -125,7 +125,11 @@ export function channelAdapter(d: AdapterDeps): DeliveryAdapter {
         // surfaced unless the server addressed them here.
         const ownSend = (mine && senderGrant(m) === mine) || d.isOwnSend(entry.id);
         const ownAgentBroadcast = !!m.agentId && m.agentId === d.myAgentId() && !isAddressed(m.deliveryReasons);
-        if (ownSend || ownAgentBroadcast) {
+        // Targeted at ANOTHER session of this agent. The server routes targets itself (RFC-027
+        // D2); this is the client's own check that a mis-route never surfaces in the wrong window.
+        const meta = parseMetadata(m.metadata);
+        const forOtherSession = !!mine && str(meta.contextId) !== "" && str(meta.contextId) !== mine && meta.contextAgentId === d.myAgentId();
+        if (ownSend || ownAgentBroadcast || forOtherSession) {
           d.dismiss(entry.id);
           return;
         }

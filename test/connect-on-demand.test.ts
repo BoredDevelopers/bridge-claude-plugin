@@ -10,7 +10,7 @@
  * pipe) rather than resolving.
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -18,7 +18,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { connectStateFileFor, writeConnectState } from "../connect-store";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
-import { writeInstallation } from "../auth/node/store";
+import { procStartOf } from "../proc-start";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
 // A well-formed key (server format + CRC) — the strict core refuses anything else.
@@ -450,42 +450,16 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
     const dir = mkdtempSync(join(tmpdir(), "cod-lockretry-"));
     const stub = startToolStub();
 
-    // HOLDER: acquires and keeps the lock for `key` via the EINWEAVE_SESSION_KEY
-    // override (settles immediately, unlike the loser below). Points at a
-    // closed port, like session-lock.test.ts's boot() — only the lock matters
-    // here, not whether the holder itself ever authenticates. The lock is
-    // keyed by EINWEAVE_STATE_DIR alone (not by profile), so the holder gets
-    // its OWN profile with credentials seeded straight to disk (matching its
-    // own closed-port URL) — it still contends for the same lock as the
-    // loser below, which uses the shared default profile against `stub`.
-    const holderDir = join(dir, "profiles", "holder");
-    writeInstallation(holderDir, { apiUrl: "http://127.0.0.1:1", installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
-    const holder = Bun.spawn(["bun", SERVER], {
-      env: {
-        ...process.env,
-        CLAUDE_PLUGIN_DATA: dir,
-        EINWEAVE_STATE_DIR: dir,
-        EINWEAVE_PROFILE: "holder",
-        EINWEAVE_API_URL: "http://127.0.0.1:1",
-        EINWEAVE_AUTOCONNECT: "1",
-        EINWEAVE_SESSION_KEY: key,
-        CLAUDE_CODE_SSE_PORT: "",
-      } as Record<string, string>,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let holderErr = "";
-    (async () => {
-      const d = new TextDecoder();
-      for await (const c of holder.stderr as any) holderErr += d.decode(c, { stream: true });
-    })();
-    const holderDeadline = Date.now() + 9_000;
-    while (Date.now() < holderDeadline && !/session lock acquired/.test(holderErr)) {
-      await Bun.sleep(100);
-    }
-    expect(holderErr, "holder must take the lock before the loser starts").toContain(
-      "session lock acquired"
+    // HOLDER: a live process named in the session lock, at a NEWER version — so the
+    // loser below stands by rather than taking over (RFC-017 D3: newer wins). A real
+    // plugin cannot play this part without a working sign-in: the SDK Session releases
+    // its lock when it stops, and one that cannot mint stops at once.
+    const holder = Bun.spawn(["sleep", "120"], { stdout: "ignore", stderr: "ignore" });
+    mkdirSync(join(dir, "locks"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(dir, "locks", `${key}.lock`),
+      JSON.stringify({ format: 0, pid: holder.pid, procStart: procStartOf(holder.pid), sessionKey: key, at: new Date().toISOString(), software: "bridge-claude-plugin", version: "99.0.0" }),
+      { mode: 0o600 }
     );
 
     // LOSER: same session key, resolved via CLAUDE_CODE_SESSION_ID — the
