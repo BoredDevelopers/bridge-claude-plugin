@@ -179,7 +179,7 @@ export interface DrainPayload {
 }
 /** The three accountable kinds (L1) — what a session's model owes (D3). */
 export type EntryKind = "message" | "task_event" | "action_request";
-/** `GET /api/deliveries` — the same payloads the frames carry. */
+/** `GET /api/deliveries` — the same payloads the frames carry, one keyset page of them. */
 export interface DeliveriesResponse {
     entries: {
         kind: EntryKind;
@@ -187,6 +187,8 @@ export interface DeliveriesResponse {
         reasons: string[];
         payload: Record<string, unknown>;
     }[];
+    /** Opaque cursor for the next page (`?after=`); null on the last one. Absent from a pre-paging server = null. */
+    next?: string | null;
 }
 /**
  * The numeric WS close codes the server sends, named so nothing above this layer
