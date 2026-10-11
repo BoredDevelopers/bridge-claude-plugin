@@ -5,7 +5,7 @@
  *
  * Both processes point at a CLOSED port — this is about the proc registry, not a live
  * connection (same trick session-lock.test.ts uses): `writeProc` runs unconditionally at
- * startup, before the connect attempt, and BRIDGE_AUTOCONNECT=0 means neither process
+ * startup, before the connect attempt, and EINWEAVE_AUTOCONNECT=0 means neither process
  * ever tries to dial out at all.
  */
 import { describe, test, expect } from "bun:test";
@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { writeInstallation } from "../auth/node/store";
+import { writeInstallation } from "./key-fixtures";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
 
@@ -28,10 +28,10 @@ async function bootMcp(dir: string, sessionKey: string): Promise<Client> {
     env: {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: CLOSED_PORT_API_URL,
-      BRIDGE_AUTOCONNECT: "0",
-      BRIDGE_SESSION_KEY: sessionKey,
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+      EINWEAVE_AUTOCONNECT: "0",
+      EINWEAVE_SESSION_KEY: sessionKey,
       CLAUDE_CODE_SSE_PORT: "",
     } as Record<string, string>,
   });
@@ -114,7 +114,7 @@ describe("finding 11b: proc state says \"connected\" only once authenticated, ne
           // window finding 11b is about: the lock is already won, but the socket has not
           // authenticated yet.
           new Promise<void>((r) => (releaseAuth = r)).then(() => {
-            ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "session-hold" } }));
+            ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "session-hold" } }));
           });
         },
       },
@@ -122,10 +122,10 @@ describe("finding 11b: proc state says \"connected\" only once authenticated, ne
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: "session-hold", CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: "session-hold", CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });

@@ -1,5 +1,5 @@
 {
-  "description": "Publishes the stable conversation id so the Bridge MCP server keeps one context across --continue/--resume",
+  "description": "Publishes the stable conversation id (SessionStart/End) and confirms which Bridge entries reached the model (UserPromptSubmit/Stop, RFC-027)",
   "hooks": {
     "SessionStart": [
       {
@@ -19,6 +19,28 @@
             "type": "command",
             "command": "command -v bun >/dev/null 2>&1 || exit 0; exec bun \"${CLAUDE_PLUGIN_ROOT}/hooks/session-map.ts\" end",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v bun >/dev/null 2>&1 || exit 0; exec bun \"${CLAUDE_PLUGIN_ROOT}/hooks/delivery.ts\" prompt",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v bun >/dev/null 2>&1 || exit 0; exec bun \"${CLAUDE_PLUGIN_ROOT}/hooks/delivery.ts\" stop",
+            "timeout": 5
           }
         ]
       }

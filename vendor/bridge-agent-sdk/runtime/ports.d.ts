@@ -58,8 +58,8 @@ export interface Timer {
     }): TimerHandle;
 }
 /** Wall-clock time only — NEVER the server-clock-offset `Clock` in `../core/clock.ts`
- * (that one signs proofs; this one drives the reconnect backoff and the replay cursor,
- * exactly the split `../core/cursor.ts` already documents). */
+ * (that one signs proofs; this one drives the reconnect backoff, the liveness watchdog
+ * and the reconcile timer — local intervals, never compared with a server timestamp). */
 export interface WallClock {
     now(): number;
 }

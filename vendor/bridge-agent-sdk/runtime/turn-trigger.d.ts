@@ -1,4 +1,4 @@
-import type { Inbound } from "./session";
+import type { Inbound } from "./delivery";
 export interface TurnSelf {
     /** This session's own context id — a message whose `senderContextId` equals this is an echo. */
     contextId?: string | null;

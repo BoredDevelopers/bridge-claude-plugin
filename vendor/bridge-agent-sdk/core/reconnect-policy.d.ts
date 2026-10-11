@@ -1,4 +1,4 @@
-export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked" | "superseded" | "too-old";
+export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked" | "superseded" | "too-old" | "session-in-use";
 export declare function classifyClose(code: number | undefined, reason?: string): CloseClass;
 /**
  * Delay before reconnect attempt `attempt` (1-based), or `null` = do not
@@ -19,7 +19,7 @@ export interface HolderIdentity {
     cwd?: string;
 }
 /** The stable, data-only reason a consumer switches on to pick its OWN wording (D4). */
-export type StopReason = "session-revoked" | "installation-revoked" | "installation-locked" | "policy-unknown" | "superseded" | "too-old";
+export type StopReason = "session-revoked" | "installation-revoked" | "installation-locked" | "policy-unknown" | "superseded" | "too-old" | "session-in-use";
 /**
  * The data `describeClose`'s prose used to encode (D4: "turned into data"). Always
  * carries `class`/`code`/`reason`/`retry`; the terminal classes (`revoked`,

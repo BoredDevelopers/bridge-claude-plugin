@@ -1,17 +1,16 @@
 /**
  * connect-on-demand, Task 2: staying alive when unconfigured.
  *
- * Today server.ts calls `process.exit(1)` at startup when BRIDGE_API_URL /
- * BRIDGE_TOKEN are missing, so an unconfigured install gets a dead MCP
- * server instead of working tools + guidance. This spawns server.ts with NO
- * BRIDGE_TOKEN (and no BRIDGE_API_URL) and drives it over stdio MCP, like
+ * server.ts once called `process.exit(1)` at startup when unconfigured, so an
+ * unconfigured install got a dead MCP server instead of working tools +
+ * guidance. This spawns server.ts with NO EINWEAVE_API_URL and drives it over stdio MCP, like
  * session-rename-tool.test.ts does — the only assertion that actually proves
  * "stays alive" is a successful `tools/list` round trip, since a dead child
  * would leave the request hanging (or the transport erroring on a closed
  * pipe) rather than resolving.
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -19,7 +18,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { connectStateFileFor, writeConnectState } from "../connect-store";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
-import { writeInstallation } from "../auth/node/store";
+import { procStartOf } from "../proc-start";
 
 const SERVER = new URL("../server.ts", import.meta.url).pathname;
 // A well-formed key (server format + CRC) — the strict core refuses anything else.
@@ -28,14 +27,12 @@ const ENROLMENT_KEY = mintAgentToken("ek");
 describe("connect-on-demand: unconfigured startup", () => {
   test("stays alive and answers tools/list when unconfigured", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cod-unconfigured-"));
-    // Start from the real env (so `bun` resolves etc.), then strip the two
-    // vars server.ts currently treats as required — a leftover BRIDGE_TOKEN
-    // in the ambient env would silently defeat the "unconfigured" premise.
+    // Start from the real env (so `bun` resolves etc.), then strip the API URL —
+    // one in the ambient env would silently defeat the "unconfigured" premise.
     const env: Record<string, string> = { ...process.env } as Record<string, string>;
-    delete env.BRIDGE_API_URL;
-    delete env.BRIDGE_TOKEN;
+    delete env.EINWEAVE_API_URL;
     env.CLAUDE_PLUGIN_DATA = dir;
-    env.BRIDGE_STATE_DIR = dir;
+    env.EINWEAVE_STATE_DIR = dir;
 
     const transport = new StdioClientTransport({
       command: "bun",
@@ -58,7 +55,7 @@ describe("connect-on-demand: unconfigured startup", () => {
 /**
  * connect-on-demand, Task 3: the `wantConnected` startup gate.
  *
- * `wantConnected` is resolved as `readConnectState(...) ?? (BRIDGE_AUTOCONNECT
+ * `wantConnected` is resolved as `readConnectState(...) ?? (EINWEAVE_AUTOCONNECT
  * === "1")` right after SESSION_KEY settles, and the startup connect is now
  * `if (!shuttingDown && wantConnected && API_URL && TOKEN) connectUnlessDuplicate()`.
  * These spawn server.ts against a stub Bridge WS (mirrors
@@ -103,8 +100,9 @@ function startAuthStub() {
           authFrame = frame;
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
@@ -121,13 +119,13 @@ describe("connect-on-demand: wantConnected startup gate", () => {
     const env: Record<string, string> = {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+      EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY,
       CLAUDE_CODE_SESSION_ID: CONNECT_SESSION_KEY,
       CLAUDE_CODE_SSE_PORT: "",
     };
-    delete env.BRIDGE_AUTOCONNECT;
+    delete env.EINWEAVE_AUTOCONNECT;
     const plugin = Bun.spawn(["bun", SERVER], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     try {
       await Bun.sleep(NO_CONNECT_WINDOW_MS);
@@ -139,18 +137,18 @@ describe("connect-on-demand: wantConnected startup gate", () => {
     }
   }, 30_000);
 
-  test("connects when BRIDGE_AUTOCONNECT=1", async () => {
+  test("connects when EINWEAVE_AUTOCONNECT=1", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cod-connect-"));
     const stub = startAuthStub();
     const env: Record<string, string> = {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+      EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY,
       CLAUDE_CODE_SESSION_ID: CONNECT_SESSION_KEY,
       CLAUDE_CODE_SSE_PORT: "",
-      BRIDGE_AUTOCONNECT: "1",
+      EINWEAVE_AUTOCONNECT: "1",
     };
     const plugin = Bun.spawn(["bun", SERVER], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     try {
@@ -165,7 +163,7 @@ describe("connect-on-demand: wantConnected startup gate", () => {
     }
   }, 30_000);
 
-  test("persisted false beats BRIDGE_AUTOCONNECT=1", async () => {
+  test("persisted false beats EINWEAVE_AUTOCONNECT=1", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cod-connect-"));
     // Pre-write the connect-state file BEFORE spawning, so it is there for
     // server.ts to read at startup — content "0" (persisted disconnected).
@@ -176,12 +174,12 @@ describe("connect-on-demand: wantConnected startup gate", () => {
     const env: Record<string, string> = {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+      EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY,
       CLAUDE_CODE_SESSION_ID: CONNECT_SESSION_KEY,
       CLAUDE_CODE_SSE_PORT: "",
-      BRIDGE_AUTOCONNECT: "1",
+      EINWEAVE_AUTOCONNECT: "1",
     };
     const plugin = Bun.spawn(["bun", SERVER], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     try {
@@ -238,8 +236,9 @@ function startToolStub() {
           authFrames.push(frame);
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
@@ -258,13 +257,13 @@ function connectToolEnv(dir: string, stubPort: number, sessionKey: string): Reco
   const env: Record<string, string> = {
     ...process.env,
     CLAUDE_PLUGIN_DATA: dir,
-    BRIDGE_STATE_DIR: dir,
-    BRIDGE_API_URL: `http://127.0.0.1:${stubPort}`,
-    BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
+    EINWEAVE_STATE_DIR: dir,
+    EINWEAVE_API_URL: `http://127.0.0.1:${stubPort}`,
+    EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY,
     CLAUDE_CODE_SESSION_ID: sessionKey,
     CLAUDE_CODE_SSE_PORT: "",
   };
-  delete env.BRIDGE_AUTOCONNECT;
+  delete env.EINWEAVE_AUTOCONNECT;
   return env;
 }
 
@@ -397,9 +396,9 @@ describe("connect-on-demand: connect/disconnect tools", () => {
     }
 
     const framesBefore = stub.authFrames().length;
-    // Fresh process, same session key + state dir, no BRIDGE_AUTOCONNECT: the
+    // Fresh process, same session key + state dir, no EINWEAVE_AUTOCONNECT: the
     // persisted "0" from the disconnect above is the only thing that can
-    // decide this — resolution is `readConnectState(...) ?? (BRIDGE_AUTOCONNECT
+    // decide this — resolution is `readConnectState(...) ?? (EINWEAVE_AUTOCONNECT
     // === "1")`, and both env inputs are absent here.
     const plugin = Bun.spawn(["bun", SERVER], {
       env: connectToolEnv(dir, stub.port, key),
@@ -431,7 +430,7 @@ describe("connect-on-demand: connect/disconnect tools", () => {
  * freed lock and reconnect — after an explicit disconnect.
  *
  * Spawns a HOLDER that keeps the session lock (mirrors session-lock.test.ts),
- * then a LOSER sharing its session key with BRIDGE_AUTOCONNECT=1 so it arms
+ * then a LOSER sharing its session key with EINWEAVE_AUTOCONNECT=1 so it arms
  * lockRetryTimer on startup, calls `disconnect` on the loser, frees the lock
  * by killing the holder, waits past LOCK_RETRY_MS (30s, server.ts), and
  * asserts the loser never sent an auth frame and its connect-state file
@@ -451,48 +450,22 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
     const dir = mkdtempSync(join(tmpdir(), "cod-lockretry-"));
     const stub = startToolStub();
 
-    // HOLDER: acquires and keeps the lock for `key` via the BRIDGE_SESSION_KEY
-    // override (settles immediately, unlike the loser below). Points at a
-    // closed port, like session-lock.test.ts's boot() — only the lock matters
-    // here, not whether the holder itself ever authenticates. The lock is
-    // keyed by BRIDGE_STATE_DIR alone (not by profile), so the holder gets
-    // its OWN profile with credentials seeded straight to disk (matching its
-    // own closed-port URL) — it still contends for the same lock as the
-    // loser below, which uses the shared default profile against `stub`.
-    const holderDir = join(dir, "profiles", "holder");
-    writeInstallation(holderDir, { apiUrl: "http://127.0.0.1:1", installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
-    const holder = Bun.spawn(["bun", SERVER], {
-      env: {
-        ...process.env,
-        CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_PROFILE: "holder",
-        BRIDGE_API_URL: "http://127.0.0.1:1",
-        BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: key,
-        CLAUDE_CODE_SSE_PORT: "",
-      } as Record<string, string>,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let holderErr = "";
-    (async () => {
-      const d = new TextDecoder();
-      for await (const c of holder.stderr as any) holderErr += d.decode(c, { stream: true });
-    })();
-    const holderDeadline = Date.now() + 9_000;
-    while (Date.now() < holderDeadline && !/session lock acquired/.test(holderErr)) {
-      await Bun.sleep(100);
-    }
-    expect(holderErr, "holder must take the lock before the loser starts").toContain(
-      "session lock acquired"
+    // HOLDER: a live process named in the session lock, at a NEWER version — so the
+    // loser below stands by rather than taking over (RFC-017 D3: newer wins). A real
+    // plugin cannot play this part without a working sign-in: the SDK Session releases
+    // its lock when it stops, and one that cannot mint stops at once.
+    const holder = Bun.spawn(["sleep", "120"], { stdout: "ignore", stderr: "ignore" });
+    mkdirSync(join(dir, "locks"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(dir, "locks", `${key}.lock`),
+      JSON.stringify({ format: 0, pid: holder.pid, procStart: procStartOf(holder.pid), sessionKey: key, at: new Date().toISOString(), software: "bridge-claude-plugin", version: "99.0.0" }),
+      { mode: 0o600 }
     );
 
     // LOSER: same session key, resolved via CLAUDE_CODE_SESSION_ID — the
-    // BRIDGE_SESSION_KEY override is reserved for the holder above, so the
+    // EINWEAVE_SESSION_KEY override is reserved for the holder above, so the
     // loser goes through the normal ~3s resolution path like the Task 4/5
-    // tests. BRIDGE_AUTOCONNECT=1 so it attempts to connect on its own once
+    // tests. EINWEAVE_AUTOCONNECT=1 so it attempts to connect on its own once
     // SESSION_KEY settles, loses the lock race, and arms lockRetryTimer.
     const transport = new StdioClientTransport({
       command: "bun",
@@ -501,10 +474,10 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
-        BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY,
+        EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: key,
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
@@ -560,7 +533,7 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
  *
  * This calls `disconnect` as the VERY FIRST tool call — no settling sleep
  * before it, so SESSION_KEY is still FALLBACK_SESSION_KEY at the moment the
- * handler starts — with BRIDGE_AUTOCONNECT=1 so the bug (a live clobber back
+ * handler starts — with EINWEAVE_AUTOCONNECT=1 so the bug (a live clobber back
  * to "connect") would be directly observable as an auth frame. Then it waits
  * past the settle window and asserts: no auth frame was ever sent, the
  * connect-state file under the REAL resolved key reads "0", it is the ONLY
@@ -572,7 +545,7 @@ describe("connect-on-demand: Finding 2 — pre-settle connect/disconnect intent"
     const key = "50000000-0000-0000-0000-000000000001";
     const dir = mkdtempSync(join(tmpdir(), "cod-presettle-"));
     const stub = startToolStub();
-    const env = { ...connectToolEnv(dir, stub.port, key), BRIDGE_AUTOCONNECT: "1" };
+    const env = { ...connectToolEnv(dir, stub.port, key), EINWEAVE_AUTOCONNECT: "1" };
     const transport = new StdioClientTransport({ command: "bun", args: [SERVER], env });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
     try {
@@ -588,7 +561,7 @@ describe("connect-on-demand: Finding 2 — pre-settle connect/disconnect intent"
 
       expect(
         stub.authFrame(),
-        "an early disconnect must stick even with BRIDGE_AUTOCONNECT=1"
+        "an early disconnect must stick even with EINWEAVE_AUTOCONNECT=1"
       ).toBeNull();
       expect(readState(dir, key)).toBe("0");
 
@@ -616,7 +589,7 @@ describe("connect-on-demand: Finding 2 — pre-settle connect/disconnect intent"
  * The 9 Bridge REST tools (reply, list_channels, list_agents, list_contexts,
  * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks)
  * must refuse with a DISTINCT hint depending on WHY they can't proceed:
- * unconfigured (no BRIDGE_API_URL/BRIDGE_TOKEN) vs. configured-but-idle
+ * unconfigured (no EINWEAVE_API_URL) vs. configured-but-idle
  * (wantConnected === false). `connect`/`disconnect`/`set_session_label` stay
  * ungated — `list_channels` stands in for all 9 here since they share one
  * helper called identically at the top of each case (see server.ts).
@@ -657,8 +630,9 @@ function startGuardStub() {
           authFrame = frame;
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
@@ -670,11 +644,10 @@ function startGuardStub() {
 
 function unconfiguredEnv(dir: string): Record<string, string> {
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
-  delete env.BRIDGE_API_URL;
-  delete env.BRIDGE_TOKEN;
-  delete env.BRIDGE_AUTOCONNECT;
+  delete env.EINWEAVE_API_URL;
+  delete env.EINWEAVE_AUTOCONNECT;
   env.CLAUDE_PLUGIN_DATA = dir;
-  env.BRIDGE_STATE_DIR = dir;
+  env.EINWEAVE_STATE_DIR = dir;
   return env;
 }
 
@@ -712,7 +685,7 @@ describe("connect-on-demand: REST tool guard", () => {
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
     try {
       await client.connect(transport);
-      // BRIDGE_ENROLMENT_KEY enrols asynchronously (SESSION_KEY resolution
+      // EINWEAVE_ENROLMENT_KEY enrols asynchronously (SESSION_KEY resolution
       // then a real token exchange), unlike the old synchronous legacy
       // token — poll rather than assume it has landed by the first call.
       let text = "";
@@ -836,7 +809,7 @@ describe("connect-on-demand: status tool", () => {
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
     try {
       await client.connect(transport);
-      // BRIDGE_ENROLMENT_KEY enrols asynchronously (SESSION_KEY resolution
+      // EINWEAVE_ENROLMENT_KEY enrols asynchronously (SESSION_KEY resolution
       // then a real token exchange), unlike the old synchronous legacy
       // token — poll rather than assume it has landed by the first call.
       let body: any = null;

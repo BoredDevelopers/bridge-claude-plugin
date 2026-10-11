@@ -12,7 +12,7 @@
  * ("callers MUST call clear() … skipping it leaks both") rather than the
  * plugin's caller-specific workaround.
  */
-import { type DeliveryReason } from "../core";
+import { type DeliveryReason, type DeliveriesResponse } from "../core";
 import type { Runtime } from "./ports";
 import type { AgentClient } from "./client";
 export declare class ApiRequestError extends Error {
@@ -50,15 +50,16 @@ export interface MessageEnvelope {
     type: string;
     agentId?: string | null;
     agentName?: string | null;
-    senderContextId?: string;
+    /** The sending session's grant id, or null for a person / a session-less send. */
+    senderContextId?: string | null;
     createdAt: string;
     [k: string]: unknown;
 }
 export interface SendBody {
     content: string;
     type?: string;
+    /** Address ONE session: its grant id (RFC-027 D2). Never a session key. */
     contextId?: string;
-    senderContextId?: string;
     broadcast?: boolean;
     clientMsgId?: string;
     metadata?: Record<string, unknown>;
@@ -126,6 +127,29 @@ export interface AgentSummary {
     state?: string;
     [k: string]: unknown;
 }
+/**
+ * One principal in `GET /api/presence` (RFC-025): every person and agent in the workspace
+ * who is connected or was seen in the last 30 days. `lastSeenAt` is exact; null only when
+ * never seen. `handle` is what an @mention resolves (null when none) — `id` is opaque.
+ */
+export interface PresencePrincipal {
+    id: string;
+    name: string;
+    handle: string | null;
+    kind: "agent" | "human";
+    connected: boolean;
+    connectedAt: string | null;
+    lastSeenAt: string | null;
+}
+/**
+ * `presenceEnabled: false` — a workspace admin turned presence off (RFC-025 D10): people
+ * are OMITTED, not offline; only agents (and nobody else) are listed. Read it before
+ * concluding from an empty people list that nobody is around.
+ */
+export interface PresenceList {
+    principals: PresencePrincipal[];
+    presenceEnabled: boolean;
+}
 export interface ContextSummary {
     id: string;
     label?: string | null;
@@ -142,9 +166,16 @@ export interface TaskResult {
 export type Api = ReturnType<typeof createApi>;
 export declare function createApi(rt: Runtime, client: AgentClient): {
     channels: {
-        list: () => Promise<{
+        /** `includeArchived`: an archived channel resolves too (so join/leave can say "archived", not "no such channel"). */
+        list: (p?: {
+            includeArchived?: boolean;
+        }) => Promise<{
             channels: ChannelSummary[];
         }>;
+        join: (channelId: string) => Promise<unknown>;
+        leave: (channelId: string) => Promise<unknown>;
+        /** Who will read what is posted here (decision 17). */
+        audience: (channelId: string) => Promise<unknown>;
         readState: () => Promise<{
             channels: ReadStateEntry[];
         }>;
@@ -167,7 +198,7 @@ export declare function createApi(rt: Runtime, client: AgentClient): {
         /** Root-only (RFC-012 slice 5.4) — `body` must never carry `threadId`/`parentId`; reply with `threads.reply`. */
         create: (channelId: string, body: SendBody & {
             title?: string;
-        }, contextToken?: string) => Promise<SendResult>;
+        }) => Promise<SendResult>;
         receipts: (ids: string[]) => Promise<{
             receipts: unknown[];
         }>;
@@ -189,7 +220,7 @@ export declare function createApi(rt: Runtime, client: AgentClient): {
             events: unknown[];
         }>;
         /** ALWAYS the thread route (RFC-018 D8: "`parentId` is never sent") — never `channelId`. */
-        reply: (threadId: string, body: SendBody, contextToken?: string) => Promise<SendResult>;
+        reply: (threadId: string, body: SendBody) => Promise<SendResult>;
         rename: (threadId: string, title: string) => Promise<ThreadResult>;
         markRead: (threadId: string, body?: {
             lastReadSeq?: number;
@@ -210,6 +241,13 @@ export declare function createApi(rt: Runtime, client: AgentClient): {
             label?: string;
         }>;
     };
+    presence: {
+        list: () => Promise<PresenceList>;
+    };
+    /** RFC-027 D5: what THIS session's model still owes — its own entries and its agent's unowned, not yet seen. */
+    deliveries: {
+        list: () => Promise<DeliveriesResponse>;
+    };
     tasks: {
         claim: (messageId: string) => Promise<TaskResult>;
         updateStatus: (messageId: string, body: {
@@ -224,5 +262,7 @@ export declare function createApi(rt: Runtime, client: AgentClient): {
         }) => Promise<{
             tasks: TaskResult[];
         }>;
+        /** Who can see this task's thread (decision 17). */
+        audience: (messageId: string) => Promise<unknown>;
     };
 };

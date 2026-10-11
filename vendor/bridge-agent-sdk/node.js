@@ -9,8 +9,10 @@ import {
   procStartMatches,
   procStartOf,
   runTail,
+  tailEnter,
+  tailLeave,
   tailMain
-} from "./index-sj1dj0nx.js";
+} from "./index-vp9k7kmc.js";
 import"./index-0nd9zcgb.js";
 import {
   FEED_PROTOCOL_VERSION,
@@ -26,12 +28,13 @@ import {
   encodeFrame,
   isJoinState,
   isP256PrivateJwk,
+  joinStateSeq,
   parseClientFrame,
   randomB64url
-} from "./index-h8ffc6pv.js";
+} from "./index-c3kvp3qz.js";
 
 // src/node/store.ts
-import { readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { mkdirSync as mkdirSync3, readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/node/format-guard.ts
@@ -297,7 +300,6 @@ var installationFile = (dir) => join2(dir, "installation.json");
 var keyFile = (dir) => join2(dir, "key.json");
 var stateFile = (dir) => join2(dir, "state");
 var attemptFile = (dir) => join2(dir, "attempt");
-var cursorFile = (dir) => join2(dir, "cursor");
 function readText(path) {
   try {
     return readFileSync3(path, "utf8");
@@ -368,10 +370,16 @@ function fileStore(dir) {
 `, { durable: true });
     },
     async writeJoinState(joinState) {
-      if (!isJoinState(joinState))
+      const next = joinStateSeq(joinState);
+      if (!isJoinState(joinState) || next === null)
         throw new Error("refusing to write a malformed join state");
+      const cur = readState(dir);
+      const curSeq = cur === null ? null : joinStateSeq(cur);
+      if (curSeq !== null && curSeq > next)
+        return false;
       writeAtomic(stateFile(dir), joinState + `
 `, { durable: true });
+      return true;
     },
     async clear() {
       if (isNewerInstallation(dir))
@@ -380,14 +388,20 @@ function fileStore(dir) {
       removeQuiet(keyFile(dir));
       removeQuiet(stateFile(dir));
       removeQuiet(attemptFile(dir));
+      sweepOrphanTemps(dir, 0);
+      try {
+        fsyncDir(dir);
+      } catch {}
+    },
+    async isNewer() {
+      return isNewerInstallation(dir);
     },
     async readAttempt() {
       const t = readText(attemptFile(dir))?.trim() ?? "";
-      return t.length > 0 ? t : null;
+      return ATTEMPT.test(t) ? t : null;
     },
-    async writeAttempt(attempt) {
-      writeAtomic(attemptFile(dir), attempt + `
-`, { durable: true });
+    async createAttempt(candidate) {
+      return createOrReadAttempt(dir, candidate);
     },
     async clearAttempt() {
       removeQuiet(attemptFile(dir));
@@ -397,25 +411,78 @@ function fileStore(dir) {
     }
   };
 }
-function fileCursorStore(dir) {
-  const path = cursorFile(dir);
-  return {
-    async read() {
-      const t = readText(path)?.trim() ?? "";
-      return t.length > 0 ? t : null;
-    },
-    async write(cursor) {
-      if (cursor === null) {
-        removeQuiet(path);
-        return;
+var ATTEMPT = /^[A-Za-z0-9_-]{22,128}$/;
+async function createOrReadAttempt(dir, candidate) {
+  mkdirSync3(dir, { recursive: true, mode: 448 });
+  const path = attemptFile(dir);
+  for (let i = 0;; i++) {
+    let fd = null;
+    try {
+      fd = __fsIo.openSync(path, "wx", 384);
+    } catch (e) {
+      if (e?.code !== "EEXIST")
+        throw e;
+    }
+    if (fd !== null) {
+      try {
+        writeAllAndSync(fd, candidate + `
+`);
+      } finally {
+        __fsIo.closeSync(fd);
       }
-      writeAtomic(path, cursor + `
+      fsyncDir(dir);
+      return candidate;
+    }
+    let existing;
+    try {
+      existing = readFileSync3(path, "utf8").trim();
+    } catch (e) {
+      if (e?.code === "ENOENT")
+        continue;
+      throw e;
+    }
+    if (ATTEMPT.test(existing)) {
+      try {
+        const rfd = __fsIo.openSync(path, "r");
+        try {
+          __fsIo.fsyncSync(rfd);
+        } finally {
+          __fsIo.closeSync(rfd);
+        }
+      } catch (e) {
+        if (e?.code === "ENOENT")
+          continue;
+        throw e;
+      }
+      fsyncDir(dir);
+      return existing;
+    }
+    if (i >= 20) {
+      removeQuiet(path);
+      continue;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+var GRANT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+function fileSeqStore(dir) {
+  return {
+    async load(grantId) {
+      if (!GRANT_ID.test(grantId))
+        return null;
+      const n = Number((readText(join2(dir, grantId)) ?? "").trim());
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    },
+    async save(grantId, seq) {
+      if (!GRANT_ID.test(grantId) || !Number.isSafeInteger(seq) || seq < 0)
+        return;
+      writeAtomic(join2(dir, grantId), `${seq}
 `);
     }
   };
 }
 function sweepOrphanTemps(dir, minAgeMs = 60000) {
-  const OWN_TMP = /^(key\.json|state|installation\.json|attempt|cursor)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
+  const OWN_TMP = /^(key\.json|state|installation\.json|attempt)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
   let n = 0;
   let names;
   try {
@@ -438,7 +505,7 @@ function sweepOrphanTemps(dir, minAgeMs = 60000) {
   return n;
 }
 // src/node/session-lock.ts
-import { mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync2, renameSync as renameSync3, unlinkSync as unlinkSync3, statSync as statSync3 } from "node:fs";
+import { mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, renameSync as renameSync3, unlinkSync as unlinkSync3, statSync as statSync3 } from "node:fs";
 import { join as join3 } from "node:path";
 var LOCK_RECORD_FORMAT = 0;
 function sessionLock(opts) {
@@ -571,7 +638,7 @@ function sessionLock(opts) {
       return "lost";
     const procStart = await myProcStart();
     try {
-      mkdirSync3(lockDir, { recursive: true, mode: 448 });
+      mkdirSync4(lockDir, { recursive: true, mode: 448 });
       let outcome = "acquire";
       if (!writeLockExclusive(procStart)) {
         const rec = readLockRecordForAcquire();
@@ -666,7 +733,7 @@ function hostname() {
 }
 // src/node/feed-server.ts
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync as mkdirSync4, unlinkSync as unlinkSync4 } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync as mkdirSync5, unlinkSync as unlinkSync4 } from "node:fs";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join as join4 } from "node:path";
@@ -682,7 +749,7 @@ function defaultMaxPathBytes() {
 }
 function mkdirOnce(dir) {
   try {
-    mkdirSync4(dir, { mode: 448 });
+    mkdirSync5(dir, { mode: 448 });
   } catch (e) {
     if (e.code !== "EEXIST")
       throw e;
@@ -695,7 +762,7 @@ function resolveFeedSocketPath(o) {
   const preferredDir = join4(o.stateDir, "feed");
   const preferred = join4(preferredDir, `${o.contextId}.sock`);
   if (Buffer.byteLength(preferred) <= max) {
-    mkdirSync4(preferredDir, { recursive: true, mode: 448 });
+    mkdirSync5(preferredDir, { recursive: true, mode: 448 });
     chmodSync(preferredDir, 448);
     return preferred;
   }
@@ -906,7 +973,7 @@ export {
   TAIL_USAGE,
   feedClient,
   feedServer,
-  fileCursorStore,
+  fileSeqStore,
   fileStore,
   hostname,
   legacyProcStartOf,
@@ -920,6 +987,8 @@ export {
   sessionLock,
   sweepLockTombstones,
   sweepOrphanTemps,
+  tailEnter,
+  tailLeave,
   tailMain,
   withInstallationLock
 };

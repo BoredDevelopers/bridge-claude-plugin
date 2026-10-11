@@ -7,7 +7,6 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, utimesSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles } from "../connect-store";
@@ -128,10 +127,3 @@ describe("sweepConnectStateFiles", () => {
   });
 });
 
-/** RFC-017 P0/C8: real 0.25 output (test/fixtures/generate-v025.ts) must still load. */
-describe("C8: the v025 fixture loads", () => {
-  test("readConnectState reads 0.25's own file", () => {
-    const v025 = fileURLToPath(new URL("./fixtures/v025", import.meta.url));
-    expect(readConnectState(v025, "fixture-session")).toBe(true);
-  });
-});

@@ -34,7 +34,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { writeInstallation } from "../auth/node/store";
+import { writeInstallation, writeKey, writeState } from "./key-fixtures";
+import { generateSoftwareKey } from "../vendor/bridge-agent-sdk/core/index.js";
+import { makeJoinState } from "./dpop-verify";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
 import pkg from "../package.json" with { type: "json" };
@@ -53,8 +55,15 @@ const CLOSED_PORT_API_URL = "http://127.0.0.1:1";
 
 let dir = "";
 const lockFile = () => join(dir, "locks", `${SESSION_ID}.lock`);
+// A COMPLETE credential (key + state + installation): its mint fails on the closed port
+// — a network error, which the SDK Session retries while keeping the session lock. An
+// installation alone would be a terminal "incomplete sign-in", and a Session that stops
+// releases its lock: no holder left for these tests to contend with.
+const SEED_KEY = await generateSoftwareKey();
 function seedCredentials(d: string): void {
-  writeInstallation(d, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
+  writeKey(d, SEED_KEY.privateJwk);
+  writeState(d, makeJoinState(1));
+  writeInstallation(d, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), jkt: SEED_KEY.signer.jkt, keyStorage: "software" });
 }
 
 // What a 0.26.1+ writer records (normalized TZ/locale — proc-start.ts).
@@ -90,10 +99,10 @@ async function boot(waitMs = 9000): Promise<{ err: string; declined: boolean; co
     env: {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: CLOSED_PORT_API_URL,
-      BRIDGE_AUTOCONNECT: "1",
-      BRIDGE_SESSION_KEY: SESSION_ID,
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+      EINWEAVE_AUTOCONNECT: "1",
+      EINWEAVE_SESSION_KEY: SESSION_ID,
       CLAUDE_CODE_SSE_PORT: "",
     } as Record<string, string>,
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -141,9 +150,9 @@ describe("single instance per session key", () => {
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -214,28 +223,18 @@ describe("single instance per session key", () => {
     expect(r.connected).toBe(true);
   }, 30_000);
 
-  test("WITHOUT `ps`, an unverifiable holder still fails OPEN", async () => {
-    // FOUND BY MUTATION: deleting `if (!rec.procStart) return false` changed
-    // nothing, because the comparison below it already rejects an empty recorded
-    // value against a real one. There is exactly one input where only that guard
-    // runs — when `procStartOf` ALSO returns "" — and it is reachable: `ps` off
-    // PATH. Then "" === "" matches, every holder reads as live, and the box
-    // locks every session out of Bridge. `pidAlive` uses process.kill(pid, 0)
-    // and does not need `ps`, so the pid genuinely is alive here.
-    // A `ps` that fails, shadowing the real one. PATH cannot simply be emptied —
-    // `bun` is resolved through it too, and the spawn would fail for an unrelated
-    // reason and score as "declined".
+  /** Boot with `ps` shadowed by a failing shim (PATH cannot be emptied: `bun` resolves through it). */
+  async function bootWithoutPs(): Promise<string> {
     const shimBin = join(dir, "shim");
     mkdirSync(shimBin, { recursive: true });
     writeFileSync(join(shimBin, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-    writeLock({ pid: process.pid, procStart: "", sessionKey: SESSION_ID, at: new Date().toISOString() });
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
         PATH: `${shimBin}:${process.env.PATH}`, // `ps` resolves to the failing shim
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -244,8 +243,27 @@ describe("single instance per session key", () => {
     const deadline = Date.now() + 9000;
     while (Date.now() < deadline && !/DUPLICATE INSTANCE|session lock acquired/.test(err)) await Bun.sleep(100);
     p.kill();
-    expect(/DUPLICATE INSTANCE/.test(err), "no `ps` must not mean no Bridge").toBe(false);
-    expect(/session lock acquired/.test(err)).toBe(true);
+    return err;
+  }
+
+  test("WITHOUT `ps`, a LIVE holder that cannot be verified is never stolen (SDK rule, RFC-018 minor finding 8)", async () => {
+    // Without `ps` EVERY record's start time is unverifiable. Reading that as "not live"
+    // (0.29's rule) let every contender steal every live holder on such a host — the
+    // double connection this lock exists to prevent. The kernel still says the pid lives.
+    // A NEWER holder, so version-aware takeover (D3) is not what decides it.
+    writeLock({ pid: process.pid, procStart: "", sessionKey: SESSION_ID, at: new Date().toISOString(), version: "99.0.0" });
+    const err = await bootWithoutPs();
+    expect(err).toMatch(/DUPLICATE INSTANCE/);
+    expect(err).not.toMatch(/session lock acquired/);
+  }, 30_000);
+
+  test("WITHOUT `ps`, a DEAD holder is still reclaimed — no `ps` never means no Bridge", async () => {
+    const dead = Bun.spawn(["true"]);
+    await dead.exited;
+    writeLock({ pid: dead.pid, procStart: "", sessionKey: SESSION_ID, at: new Date().toISOString() });
+    const err = await bootWithoutPs();
+    expect(err).not.toMatch(/DUPLICATE INSTANCE/);
+    expect(err).toMatch(/session lock acquired/);
   }, 30_000);
 
   test("a corrupt lock file fails OPEN rather than stranding the session", async () => {
@@ -277,9 +295,9 @@ describe("single instance per session key", () => {
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -304,9 +322,9 @@ describe("single instance per session key", () => {
       Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: CLOSED_PORT_API_URL, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: CLOSED_PORT_API_URL, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       })
@@ -361,8 +379,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
   }, 30_000);
 
   test("a missing holder version (a 0.25-shaped record, no `version` field at all) counts as 0.25 — older than this build, so it is TAKEN OVER", async () => {
-    // Byte-for-byte the v025 lock shape (test/fixtures/v025/locks): pid, procStart,
-    // sessionKey, at — nothing else. D3: "a missing version counts as 0.25 or older."
+    // The 0.25 lock shape: pid, procStart, sessionKey, at — nothing else. D3: "a missing version counts as 0.25 or older."
     // This build is 0.26.0 (P9's bump), so omitting the field reads as strictly
     // OLDER, not equal — the auto path takes over, same as C1's explicit "0.1.0"
     // above. This one pins that OMITTING the field entirely is read the same way
@@ -407,7 +424,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type === "auth") {
             authFrame = frame;
-            ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "ctx" } }));
+            ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "ctx" } }));
           }
         },
       },
@@ -417,10 +434,10 @@ describe("RFC-017 D3: version-aware takeover", () => {
       const p = Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_ENROLMENT_KEY: enrolmentKey,
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -469,7 +486,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
             ws.close(4006, "Authentication timeout"); // transient — retries fast, on its own
             return;
           }
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -478,10 +495,10 @@ describe("RFC-017 D3: version-aware takeover", () => {
       const p = Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_ENROLMENT_KEY: enrolmentKey,
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -499,75 +516,6 @@ describe("RFC-017 D3: version-aware takeover", () => {
     }
   }, 30_000);
 
-  test("F1b: supersede sent but the server's `authenticated` frame names a DIFFERENT context — one model notice, and status shows it", async () => {
-    // The takeover locally succeeded (we hold the lock, we sent supersede:true), but the
-    // SERVER did not actually hand us SESSION_KEY as our context id (an ineligible
-    // grant, a pre-017 server that ignores `supersede`, or a lost race) — the plugin must
-    // notice and say so, once.
-    rmSync(join(dir, "installation.json"), { force: true });
-    const agentAuth = createAgentAuthRoutes();
-    const enrolmentKey = mintAgentToken("ek");
-    agentAuth.addEnrolmentKey(enrolmentKey);
-    const server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch(req, srv) {
-        const auth = await agentAuth.handle(req);
-        if (auth) return auth;
-        if (srv.upgrade(req)) return;
-        return new Response("no", { status: 400 });
-      },
-      websocket: {
-        message(ws, raw) {
-          let frame: any = {};
-          try { frame = JSON.parse(String(raw)); } catch { return; }
-          if (frame.type !== "auth") return;
-          // Deliberately NOT SESSION_ID — the server renamed us despite `supersede`.
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "some-connection-id" } }));
-        },
-      },
-    });
-    try {
-      writeLock({ pid: process.pid, procStart: procStart(process.pid), sessionKey: SESSION_ID, at: new Date().toISOString(), version: "0.1.0" });
-      const transport = new StdioClientTransport({
-        command: "bun",
-        args: [SERVER],
-        env: {
-          ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_ENROLMENT_KEY: enrolmentKey,
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        } as Record<string, string>,
-      });
-      const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
-      const notices: string[] = [];
-      client.fallbackNotificationHandler = async (n: any) => {
-        if (typeof n?.params?.content === "string") notices.push(n.params.content);
-      };
-      try {
-        await client.connect(transport);
-        const sawNotice = await (async () => {
-          const end = Date.now() + 9000;
-          while (Date.now() < end) {
-            if (notices.some((c) => c.includes("another window still holds this session's id"))) return true;
-            await Bun.sleep(50);
-          }
-          return false;
-        })();
-        expect(sawNotice).toBe(true);
-        const matching = notices.filter((c) => c.includes("another window still holds this session's id"));
-        expect(matching, "once, not once per reconnect").toHaveLength(1);
-        const status: any = await client.callTool({ name: "status", arguments: {} });
-        const s = JSON.parse(status.content[0].text);
-        expect(s.supersede_ineffective).toBe(true);
-      } finally {
-        await client.close().catch(() => {});
-      }
-    } finally {
-      server.stop(true);
-    }
-  }, 30_000);
 });
 
 describe("F2: a holder in reconnect backoff re-validates the lock before its OWN timer fires", () => {
@@ -579,7 +527,7 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
     // real agent-auth+WS stub, one shared installation (B reuses whatever A enrols —
     // enrolFromKeyIfNeeded no-ops once `installation.json` exists), and the SAME
     // on-disk session lock, which is what this test is actually about. A is
-    // deliberately reported as an OLDER version (BRIDGE_TEST_PLUGIN_VERSION) so B's
+    // deliberately reported as an OLDER version (EINWEAVE_TEST_PLUGIN_VERSION) so B's
     // real, unoverridden version wins the lock automatically once it starts. Auth
     // frames are told apart by ORDER (A connects first, at boot; B only after A is
     // already up), not by identity — the server treats every socket the same.
@@ -609,7 +557,7 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
           auths++;
           if (auths === 1) liveFirstSocket = ws;
           else bAuthFrames.push(frame);
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
           if (auths === 1) onFirstAuthenticated?.();
         },
         close(ws) {
@@ -621,14 +569,14 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
     const pA = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         // A comfortably wide, scaled-down "credential"-class backoff (unscaled 30-60s):
         // wide enough that B's real startup + auth reliably finishes well inside it,
         // narrow enough that the test does not need to wait long.
-        BRIDGE_TEST: "1", BRIDGE_TEST_PLUGIN_VERSION: "0.1.0", BRIDGE_TEST_BACKOFF_SCALE: "0.15",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_PLUGIN_VERSION: "0.1.0", EINWEAVE_TEST_BACKOFF_SCALE: "0.15",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -664,9 +612,9 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
       pB = Bun.spawn(["bun", SERVER], {
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         } as Record<string, string>,
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -726,7 +674,7 @@ describe("finding 5: lock renewal never renews a record that no longer names thi
           let frame: any = {};
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type !== "auth") return;
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -734,11 +682,11 @@ describe("finding 5: lock renewal never renews a record that no longer names thi
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1", BRIDGE_TEST_LOCK_RETRY_MS: "300",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_LOCK_RETRY_MS: "300",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -798,7 +746,7 @@ describe("finding 11a: a superseded window invalidates its access token and stop
             return;
           }
           auths++;
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -807,10 +755,10 @@ describe("finding 11a: a superseded window invalidates its access token and stop
       args: [SERVER],
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
     });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
@@ -885,7 +833,7 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
           auths++;
           if (auths === 1) liveFirstSocket = ws;
           else bAuthFrames.push(frame);
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
           if (auths === 1) onFirstAuthenticated?.();
         },
         close(ws) {
@@ -900,14 +848,14 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
       stderr: "pipe",
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
         // A comfortably wide, scaled-down "transient" backoff (unscaled 1-30s): wide
         // enough that B's real startup + explicit takeover reliably finish well inside
         // it, narrow enough that the test does not need to wait long.
-        BRIDGE_TEST: "1", BRIDGE_TEST_BACKOFF_SCALE: "0.15",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_BACKOFF_SCALE: "0.15",
       } as Record<string, string>,
     });
     let errA = "";
@@ -951,10 +899,10 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
         args: [SERVER],
         env: {
           ...process.env,
-          CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-          BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "0",
-          BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-          BRIDGE_TEST: "1", BRIDGE_TEST_PLUGIN_VERSION: "0.1.0",
+          CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+          EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "0",
+          EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+          EINWEAVE_TEST: "1", EINWEAVE_TEST_PLUGIN_VERSION: "0.1.0",
         } as Record<string, string>,
       });
       clientB = new Client({ name: "test-client-b", version: "0.0.0" }, { capabilities: {} });
@@ -1027,7 +975,7 @@ describe("finding 3 (2026-09-27 re-review): a live holder's renewal must go supe
           liveSocket = ws;
           // Deliberately never sends a 4008 — the fix must notice on its OWN, via the
           // lock file, rather than wait for a server-driven close this stub never sends.
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
         close(ws) {
           if (liveSocket === ws) socketClosed = true;
@@ -1038,11 +986,11 @@ describe("finding 3 (2026-09-27 re-review): a live holder's renewal must go supe
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1", BRIDGE_TEST_LOCK_RETRY_MS: "300",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_LOCK_RETRY_MS: "300",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -1103,28 +1051,28 @@ describe("finding 2 (2026-09-27 re-review): the pre-send lock re-check", () => {
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type !== "auth") return;
           authFrames.push(frame);
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
     const p = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${server.port}`, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_ENROLMENT_KEY: enrolmentKey,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
     let err = "";
     (async () => { const d = new TextDecoder(); for await (const c of p.stderr as any) err += d.decode(c, { stream: true }); })();
     try {
-      // A passes the gate (writes its OWN lock record) and opens its socket — wait for
-      // that, which is right when it is about to await the (delayed) mint.
+      // A passes the gate (writes its OWN lock record) and starts minting — the SDK Session
+      // mints BEFORE it opens a socket, so the (delayed) mint is where A now waits.
       const openDeadline = Date.now() + 15_000;
-      while (Date.now() < openDeadline && !/WebSocket connected/.test(err)) await Bun.sleep(20);
-      expect(/WebSocket connected/.test(err), "A must have passed the gate and opened its socket").toBe(true);
+      while (Date.now() < openDeadline && !/session lock acquired/.test(err)) await Bun.sleep(20);
+      expect(/session lock acquired/.test(err), "A must have passed the gate").toBe(true);
       expect(existsSync(lockFile()), "A must hold the local lock by now").toBe(true);
 
       // B "takes over" the LOCAL lock file directly — standing in for a separate live
@@ -1168,10 +1116,10 @@ describe("finding 4 (2026-09-27 re-review): the standby retry must not carry a s
       args: [SERVER],
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: CLOSED_PORT_API_URL,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST: "1", BRIDGE_TEST_LOCK_RETRY_MS: "300",
+        CLAUDE_PLUGIN_DATA: dir, EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+        EINWEAVE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
+        EINWEAVE_TEST: "1", EINWEAVE_TEST_LOCK_RETRY_MS: "300",
       } as Record<string, string>,
     });
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
@@ -1206,77 +1154,3 @@ describe("finding 4 (2026-09-27 re-review): the standby retry must not carry a s
     }
   }, 20_000);
 });
-
-describe("finding 7 (2026-09-27 re-review): an explicit takeover against a still-ineffective claim must reopen the socket", () => {
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "lock-")); seedCredentials(dir); });
-  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
-
-  test("connect {takeover:true} while connected but supersede_ineffective must send a NEW auth frame, not report \"connected\" and do nothing", async () => {
-    // The server ALWAYS renames this session to a connection id, whatever the auth
-    // frame carries — so the plugin's very first (uncontested, but still
-    // supersede-carrying — see connectWs's own doc comment) connect already ends up
-    // `wsConnected && authenticated` with `supersede_ineffective: true`.
-    rmSync(join(dir, "installation.json"), { force: true });
-    const authFrames: any[] = [];
-    const agentAuth = createAgentAuthRoutes();
-    const enrolmentKey = mintAgentToken("ek");
-    agentAuth.addEnrolmentKey(enrolmentKey);
-    const server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch(req, srv) {
-        const auth = await agentAuth.handle(req);
-        if (auth) return auth;
-        if (srv.upgrade(req)) return;
-        return new Response("no", { status: 400 });
-      },
-      websocket: {
-        message(ws, raw) {
-          let frame: any = {};
-          try { frame = JSON.parse(String(raw)); } catch { return; }
-          if (frame.type !== "auth") return;
-          authFrames.push(frame);
-          // Deliberately NEVER SESSION_ID — every attempt is renamed to a connection id.
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "some-connection-id" } }));
-        },
-      },
-    });
-    const transport = new StdioClientTransport({
-      command: "bun",
-      args: [SERVER],
-      env: {
-        ...process.env,
-        CLAUDE_PLUGIN_DATA: dir, BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${server.port}`, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_ENROLMENT_KEY: enrolmentKey,
-        BRIDGE_SESSION_KEY: SESSION_ID, CLAUDE_CODE_SSE_PORT: "",
-      } as Record<string, string>,
-    });
-    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
-    try {
-      await client.connect(transport);
-      const deadline1 = Date.now() + 15_000;
-      while (Date.now() < deadline1 && authFrames.length < 1) await Bun.sleep(30);
-      expect(authFrames, "the first (uncontested) connect").toHaveLength(1);
-      const statusResult: any = await client.callTool({ name: "status", arguments: {} });
-      const status1 = JSON.parse(statusResult.content[0].text);
-      expect(status1.websocket).toBe("connected");
-      expect(status1.supersede_ineffective, "renamed away from SESSION_KEY on every attempt").toBe(true);
-
-      // THE BUG this pins: without the fix, this call sees `wsConnected && authenticated`
-      // already true and returns "connected" as a no-op — no new auth frame is EVER
-      // sent again, so a person's takeover can never actually retry the claim.
-      const result: any = await client.callTool({ name: "connect", arguments: { takeover: true } });
-      expect(result.content?.[0]?.text, "must reopen the socket, not report the stale 'connected'").toBe("connecting");
-
-      const deadline2 = Date.now() + 15_000;
-      while (Date.now() < deadline2 && authFrames.length < 2) await Bun.sleep(30);
-      expect(authFrames, "a genuinely NEW auth frame must have gone out").toHaveLength(2);
-      expect(authFrames[1]?.supersede, "still holds the local lock, so still claims it").toBe(true);
-    } finally {
-      await client.close().catch(() => {});
-      server.stop(true);
-    }
-  }, 30_000);
-});
-

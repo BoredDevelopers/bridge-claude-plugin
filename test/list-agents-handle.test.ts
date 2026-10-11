@@ -61,8 +61,9 @@ function startStub(): Stub {
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
+            v: 2,
             type: "authenticated",
-            data: { agentId: "aio", agentName: "Aio", handle: "aio", contextId: "ctx-under-test" },
+            payload: { agentId: "aio", agentName: "Aio", handle: "aio", contextId: "ctx-under-test" },
           }));
         }
       },
@@ -104,9 +105,9 @@ describe("list_agents surfaces the per-tenant handle", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-666666666666",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,

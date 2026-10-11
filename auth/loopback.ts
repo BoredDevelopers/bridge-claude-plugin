@@ -10,7 +10,7 @@
  *   a page of its own;
  * - it closes after the answer or after `timeoutMs`.
  */
-import type { AuthMetadata } from "./core/protocol";
+import type { AuthMetadata } from "../vendor/bridge-agent-sdk/core/index.js";
 import { PLUGIN_CLIENT_ID } from "./client-id";
 
 export type LoopbackAnswer = { code: string } | { error: string };

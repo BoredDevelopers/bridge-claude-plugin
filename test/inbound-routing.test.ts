@@ -14,7 +14,7 @@
  *
  * WHAT IT PINS
  *   A  subscribed channel,   untargeted   -> surfaces
- *   B  other channel,       untargeted    -> filtered (BRIDGE_CHANNELS honoured)
+ *   B  other channel,       untargeted    -> filtered (EINWEAVE_CHANNELS honoured)
  *   C  other channel,       TARGETED      -> surfaces anyway
  *   D  our own `me-tasks`,  untargeted    -> filtered, like any other channel
  *   E  other channel,       @MENTION      -> surfaces anyway
@@ -32,8 +32,8 @@
  * Two things are required, and the test SKIPS rather than passing vacuously if
  * either is missing:
  *
- *   BRIDGE_API_DIR            <bridge>/packages/api
- *   BRIDGE_TEST_PG_ADMIN_URL  a Postgres 18 to create scratch databases in.
+ *   EINWEAVE_API_DIR            <bridge>/packages/api
+ *   EINWEAVE_TEST_PG_ADMIN_URL  a Postgres 18 to create scratch databases in.
  *                             Defaults to the server repo's test container
  *                             (`docker compose -f docker-compose.test.yml up -d`
  *                             in that repo, or `bun run test` there).
@@ -57,13 +57,13 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const API_DIR = process.env.BRIDGE_API_DIR ?? "";
+const API_DIR = process.env.EINWEAVE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
 
 // Same default as the server repo's scripts/run-tests.ts, so a developer who
 // has that suite working already has this one working.
 const ADMIN_URL =
-  process.env.BRIDGE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+  process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
 
 /** Is there actually a Postgres behind ADMIN_URL? Probe, don't assume. */
 async function pgReachable(): Promise<boolean> {
@@ -120,72 +120,44 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       await api.runMigrations();
       closeApiPool = async () => { await api.closePool(); };
 
-      const { db, schema } = api;
-
-      // Only the NOT NULL columns are set; `created_at` and friends carry schema
-      // defaults. Fewer fields named here is fewer things to rot.
-      await db.insert(schema.agents).values([
-        { id: "me", name: "Me" },
-        { id: "other", name: "Other" },
-      ]);
-      // Agents have NO static token (bridge 0048). Seat both in the
-      // 'default' workspace and mint each an enrolment key through the API's OWN
-      // credential module — `me` (the plugin) enrols from BRIDGE_ENROLMENT_KEY at
-      // boot; `other` enrols over HTTP below to post as a second agent.
-      await api.pool.query(`UPDATE principals SET tenant_id = 'default' WHERE id IN ('me', 'other')`);
-      // …and give each its @handle there (identity chain PR-1: mentions resolve through
-      // `tenant_handles`, not the agent id) — without it the @mention case cannot resolve.
-      await api.pool.query(
-        `INSERT INTO tenant_handles (tenant_id, principal_id, handle, folded_handle, created_at)
-         VALUES ('default', 'me', 'me', 'me', extract(epoch from now())::bigint),
-                ('default', 'other', 'other', 'other', extract(epoch from now())::bigint)`
-      );
+      // Raw rows, in the shape of the API's own test harness (packages/api/test/harness.ts
+      // seedTenant / seedAgents / seedChannel / seedMember): every id is a uuid, everything
+      // lives in ONE workspace. When the schema moves, mirror that file.
+      const q = (sql: string, params: unknown[] = []) => api.pool.query(sql, params);
+      const T = crypto.randomUUID();
+      await q(`INSERT INTO tenants (id, name, region, shard, created_at) VALUES ($1, 'inbound-routing', 'eu', 0, now())`, [T]);
+      const ME = crypto.randomUUID(), OTHER = crypto.randomUUID();
+      // Agents have NO static token: `me` (the plugin) enrols from EINWEAVE_ENROLMENT_KEY at
+      // boot; `other` enrols over HTTP below to post as a second agent. Each gets its @handle
+      // (mentions resolve through `tenant_handles`) — without it the @mention case cannot resolve.
+      for (const [id, name] of [[ME, "me"], [OTHER, "other"]]) {
+        await q(`INSERT INTO agents (tenant_id, id, name, created_at) VALUES ($1, $2, $3, now())`, [T, id, name]);
+        await q(`INSERT INTO tenant_handles (tenant_id, principal_id, handle, folded_handle, created_at) VALUES ($1, $2, $3, $3, now())`, [T, id, name]);
+      }
       const creds: any = await import(join(API_DIR, "src/agent-credentials.ts"));
       const keyFor = async (id: string) => {
-        const k = await creds.mintEnrolmentKey(id, "default", { id, type: "agent", contextId: null }, {});
+        const k = await creds.mintEnrolmentKey(id, T, { id, type: "agent", contextId: null }, {});
         if (!k.ok) throw new Error(`mintEnrolmentKey(${id}): ${k.error}`);
         return k.key as string;
       };
-      const KEY_ME = await keyFor("me"), KEY_OTHER = await keyFor("other");
+      const KEY_ME = await keyFor(ME), KEY_OTHER = await keyFor(OTHER);
 
       /**
-       * `me-tasks` IS NOW A REAL CASE, and used to be excluded from this list
-       * with the note "a control that cannot fail" — because `channelDecision()`
-       * exempted the agent's own `<id>-tasks` channel from the filter outright.
+       * `me-tasks` is an ordinary channel (bridge issue #13 removed the agent's own
+       * `<id>-tasks` exemption): unsubscribed and unaddressed, it drops like any other —
+       * case D below. `other-tasks` stays as the someone-else's-channel case.
        *
-       * That exemption is gone (bridge issue #13). A channel named after this
-       * agent is now an ordinary channel: unsubscribed and unaddressed, it drops
-       * like any other, which is case D below. `other-tasks` stays as the
-       * someone-else's-channel case so both sides of the old special-case are
-       * covered rather than swapped.
+       * Every channel gets a `me` channel INTEREST, including the filtered ones: without it
+       * the server never routes the untargeted message at all, and cases B and D would pass
+       * because nothing was sent rather than because the CLIENT filter dropped it. `other`
+       * is seated as a member so it may post (5a-2: posting needs membership).
        */
-      /**
-       * ⚠️ NO `ownerAgentId` — AND THIS FIXTURE BROKE ONCE FOR EXACTLY THAT.
-       * An earlier version seeded `me-tasks` with `ownerAgentId: "me"`, to make
-       * case D arrive via the `owner` delivery reason (the only broadcast-tier
-       * reason a card-less agent got in its own task channel). The server has
-       * since dropped `channels.owner_agent_id` entirely, and `schema` here is
-       * the LIVE API schema — imported from BRIDGE_API_DIR — so that key became
-       * a column the table does not have.
-       *
-       * It is worth stating how that would have surfaced: this whole file SKIPS
-       * unless BRIDGE_API_DIR is set, so the break would have reported as a
-       * green suite rather than a failure. Same trap the header describes.
-       *
-       * Case D is unaffected. Every channel below gets an explicit `me` channel
-       * interest, so the message is still routed to this agent and still has to
-       * be dropped by the CLIENT filter — which is what D asserts.
-       */
+      const CH: Record<string, string> = {};
       for (const c of ["general", "other-tasks", "me-tasks"]) {
-        await db.insert(schema.channels).values({ id: c, name: c });
-        // Interest in ALL of them, including the filtered ones: without it the
-        // server never routes the untargeted message at all, and cases B and D
-        // would pass because nothing was sent rather than because the client
-        // dropped it.
-        await db
-          .insert(schema.agentInterests)
-          .values({ agentId: "me", interestType: "channel", interestValue: c })
-          .onConflictDoNothing();
+        const id = (CH[c] = crypto.randomUUID());
+        await q(`INSERT INTO channels (tenant_id, id, kind, name, visibility, created_at) VALUES ($1, $2, 'channel', $3, 'public', now())`, [T, id, c]);
+        await q(`INSERT INTO channel_members (tenant_id, channel_id, principal_id, role, added_by, created_at, source) VALUES ($1, $2, $3, 'member', NULL, now(), 'posted')`, [T, id, OTHER]);
+        await q(`INSERT INTO agent_interests (tenant_id, agent_id, interest_type, interest_value) VALUES ($1, $2, 'channel', $3) ON CONFLICT DO NOTHING`, [T, ME, id]);
       }
 
       const PORT = String(4700 + Math.floor(Number(process.hrtime.bigint() % 200n)));
@@ -195,7 +167,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
           ...process.env, DATABASE_URL: dbUrl, PORT,
           // The discovery document advertises endpoints under this origin (RFC 8414):
           // it must be THIS server, or the plugin is sent to the wrong one.
-          BRIDGE_PUBLIC_URL: URL_,
+          EINWEAVE_PUBLIC_URL: URL_,
           FORGE_OIDC_CLIENT_SECRET: "x",
           BETTER_AUTH_SECRET: "test-secret-at-least-32-characters-long",
           NODE_ENV: "test",
@@ -210,10 +182,9 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       expect(up, "bridge server did not start").toBe(true);
 
       // `other` signs in the real way (RFC-016): a fresh key, the enrolment-key grant with a
-      // DPoP proof, then a client_credentials mint — through the plugin's OWN auth/core,
-      // which is also what `@bridge/agent-sdk` will ship.
-      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../auth/core");
-      const { randomB64url } = await import("../auth/core/b64url");
+      // DPoP proof, then a client_credentials mint — through `@bridge/agent-sdk`'s core.
+      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/bridge-agent-sdk/core/index.js");
+      const { randomB64url } = await import("./key-fixtures");
       const clockOther = new Clock();
       const tc = new TokenClient({ clock: clockOther, clientId: "bridge-claude-plugin" });
       const meta = await tc.discover(URL_);
@@ -233,10 +204,10 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
         env: {
           ...process.env,
-          BRIDGE_API_URL: URL_, BRIDGE_ENROLMENT_KEY: KEY_ME, BRIDGE_AUTOCONNECT: "1",
-          BRIDGE_CHANNELS: "general",          // deliberately NOT other-tasks
-          BRIDGE_SESSION_KEY: "test-session",
-          BRIDGE_STATE_DIR: dir, CLAUDE_PLUGIN_DATA: dir, CLAUDE_PROJECT_DIR: dir,
+          EINWEAVE_API_URL: URL_, EINWEAVE_ENROLMENT_KEY: KEY_ME, EINWEAVE_AUTOCONNECT: "1",
+          EINWEAVE_CHANNELS: "general",          // deliberately NOT other-tasks
+          EINWEAVE_SESSION_KEY: "test-session",
+          EINWEAVE_STATE_DIR: dir, CLAUDE_PLUGIN_DATA: dir, CLAUDE_PROJECT_DIR: dir,
         },
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
       });
@@ -272,7 +243,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       // cannot express; a one-column lookup does not warrant importing drizzle's
       // operators into this repo. Parameterised, and deliberately UNNAMED — a
       // named prepared statement is the pg footgun the server repo warns about.
-      const ctxRows = await api.pool.query("SELECT id FROM agent_contexts WHERE agent_id = $1", ["me"]);
+      const ctxRows = await api.pool.query("SELECT id FROM agent_contexts WHERE agent_id = $1", [ME]);
       const ctx = ctxRows.rows[0]?.id;
       expect(ctx, "plugin never registered a context").toBeTruthy();
 
@@ -326,18 +297,18 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
         return false;
       };
 
-      await post("general", "case-A-subscribed-untargeted");
+      await post(CH.general!, "case-A-subscribed-untargeted");
       const gotA = await awaitArrival("case-A-subscribed-untargeted");
 
-      await post("other-tasks", "case-B-unsubscribed-untargeted");
+      await post(CH["other-tasks"]!, "case-B-unsubscribed-untargeted");
       const gotB = await awaitArrival("case-B-unsubscribed-untargeted");
 
-      await post("other-tasks", "case-C-targeted", ctx);
+      await post(CH["other-tasks"]!, "case-C-targeted", ctx);
       const gotC = await awaitArrival("case-C-targeted");
 
       // D: OUR OWN `me-tasks`, unsubscribed and unaddressed. Delivered
       // unconditionally before the exemption was removed.
-      await post("me-tasks", "case-D-own-tasks-channel");
+      await post(CH["me-tasks"]!, "case-D-own-tasks-channel");
       const gotD = await awaitArrival("case-D-own-tasks-channel");
 
       /**
@@ -351,7 +322,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
        * same filter, opposite outcome — so E is not vacuous. Mentions are on by
        * default server-side; `@me` is matched as a whole token against the id.
        */
-      await post("other-tasks", "@me case-E-mention-pierces-filter");
+      await post(CH["other-tasks"]!, "@me case-E-mention-pierces-filter");
       const gotE = await awaitArrival("case-E-mention-pierces-filter");
 
       // The inbound path must never throw. This is the assertion that would
@@ -365,9 +336,9 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       expect(gotC, "TARGETED at this session must surface regardless of filter").toBe(true);
       expect(gotD, "our own `-tasks` channel no longer bypasses the filter").toBe(false);
       expect(gotE, "an @mention must pierce the channel filter").toBe(true);
-      expect(errLines.some((l) => l.includes("FILTERED ch=other-tasks")),
+      expect(errLines.some((l) => l.includes(`FILTERED ch=${CH["other-tasks"]}`)),
         "expected the client filter to log the drop").toBe(true);
-      expect(errLines.some((l) => l.includes("FILTERED ch=me-tasks")),
+      expect(errLines.some((l) => l.includes(`FILTERED ch=${CH["me-tasks"]}`)),
         "expected our own -tasks channel to be dropped by the filter too").toBe(true);
     },
     120_000

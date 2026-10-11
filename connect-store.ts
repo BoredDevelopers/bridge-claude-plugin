@@ -3,14 +3,14 @@
  * effects. Mirrors label-store.ts (which mirrors the cursor idiom). Keyed by
  * SESSION_KEY (resume-stable), so a session's connected/disconnected choice
  * survives reconnect and `claude -c`. Wired into server.ts: resolution is
- * `readConnectState(...) ?? (BRIDGE_AUTOCONNECT==="1")`; connect/disconnect
+ * `readConnectState(...) ?? (EINWEAVE_AUTOCONNECT==="1")`; connect/disconnect
  * tools write it.
  *
  * D8 audit: this file's whole value space is exactly "0" or "1" — no JSON envelope, so
  * it stays byte-for-byte what 0.25 writes and reads (§7's mixed-period rule: a 0.25 and
  * a 0.26 window sharing a machine must both keep working on it). ANY other content
  * (corrupt, or a hypothetical future release's own encoding) already reads as
- * `undefined` today, degrading to the BRIDGE_AUTOCONNECT default — never a crash. The
+ * `undefined` today, degrading to the EINWEAVE_AUTOCONNECT default — never a crash. The
  * one gap that mattered (D8's "never delete/rewrite/sweep a format it does not know")
  * is closed on the WRITE side: `writeConnectState` checks the CURRENT file first and
  * refuses to clobber content that PARSES as a JSON record declaring a `format` this

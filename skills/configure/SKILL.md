@@ -11,7 +11,7 @@ allowed-tools:
 
 # /bridge:configure — Bridge Channel Setup
 
-Writes the Bridge API URL to `~/.claude/channels/bridge/.env` and orients the
+Writes the Bridge API URL to `~/.einweave/.env` and orients the
 user on the current state. The machine then signs in with `/bridge:login` — no
 token is pasted anywhere. Static tokens are retired; the server no longer
 accepts them.
@@ -26,22 +26,19 @@ Arguments passed: `$ARGUMENTS`
 
 Read both config values and give the user the full picture:
 
-1. **API URL** — check `~/.claude/channels/bridge/.env` for `BRIDGE_API_URL`.
+1. **API URL** — check `~/.einweave/.env` for `EINWEAVE_API_URL`.
    Show set/not-set.
 
 2. **Sign-in** — call the `status` MCP tool and show its `auth` block
    (profile, credential `installation` / `none`, installation name,
-   `key_storage`, `key_thumbprint`). If it carries a `problem` or a `hint`
-   (BRIDGE_TOKEN set but no credential), show that too.
+   `key_storage`, `key_thumbprint`). If it carries a `problem`, show that too.
 
-3. **Channel filter** — check `BRIDGE_CHANNELS`. Show the filter or "all
+3. **Channel filter** — check `EINWEAVE_CHANNELS`. Show the filter or "all
    channels" if empty.
 
 4. **What next** — based on state:
    - No URL → *"Run `/bridge:configure <url>` to set up Bridge."*
    - URL set, credential `none` → *"Run `/bridge:login` to sign this machine in."*
-   - URL set, credential `none`, hint present → *"BRIDGE_TOKEN is no longer
-     supported — run `/bridge:login` instead."*
    - credential `installation` → *"Ready. Run `/bridge:connect` to join Bridge in
      this session (or use `claudeb`, which auto-connects)."*
 
@@ -53,17 +50,17 @@ the server publishes as its public URL: every request is signed over it, so anot
 port, scheme or host alias is refused. Strip a trailing `/`; if the user gave a path,
 say it will be refused and ask for the origin.
 
-1. `mkdir -p ~/.claude/channels/bridge`
-2. Read existing `.env` if present; update/add the `BRIDGE_API_URL=` line,
+1. `mkdir -p ~/.einweave`
+2. Read existing `.env` if present; update/add the `EINWEAVE_API_URL=` line,
    preserve other keys.
-3. `chmod 600 ~/.claude/channels/bridge/.env`.
+3. `chmod 600 ~/.einweave/.env`.
 4. Confirm, then tell the user to restart the session (or `/reload-plugins`) and
    run `/bridge:login`.
 
 ### `channels <list>` — set channel filter
 
 1. Parse comma-separated channel names from `$ARGUMENTS` after "channels".
-2. Read `.env`, update `BRIDGE_CHANNELS=` line.
+2. Read `.env`, update `EINWEAVE_CHANNELS=` line.
 3. Write back. Confirm.
 4. Note: changes need session restart or `/reload-plugins`.
 
@@ -74,9 +71,7 @@ list, so a narrow filter cannot cost a message meant for it.
 
 ### `clear` — remove credentials
 
-Delete `BRIDGE_API_URL=` and `BRIDGE_TOKEN=` lines from `.env` (a leftover
-`BRIDGE_TOKEN=` line is dead — the server no longer accepts it — but clear it
-anyway so it stops showing up in the sign-in hint).
+Delete the `EINWEAVE_API_URL=` line from `.env`.
 
 ---
 

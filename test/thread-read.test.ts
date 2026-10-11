@@ -52,6 +52,8 @@ type Stub = {
   answerBodies: any[];
   /** Bodies sent to `/kind`, in order. */
   kindBodies: any[];
+  /** Every `ack` frame the plugin sent over the socket (RFC-027 D4), in order. */
+  acks: { ids: string[]; how: string }[];
   set: (s: Partial<State>) => void;
   stop: () => void;
 };
@@ -77,6 +79,7 @@ function startStub(): Stub {
   const calls: string[] = [];
   const readBodies: { path: string; body: any }[] = [];
   const answerBodies: any[] = [];
+  const acks: { ids: string[]; how: string }[] = [];
   const kindBodies: any[] = [];
   let st: State = { root: null, replies: [], threadStatus: 200, legacy: false, readStatus: 200, threads: [], legacyList: false, answerStatus: 200, answerError: "", events: [], eventsStatus: 200 };
   let answer: string | null = null; // the thread's accepted answer
@@ -174,11 +177,13 @@ function startStub(): Stub {
       message(ws, raw) {
         let frame: any = {};
         try { frame = JSON.parse(String(raw)); } catch { return; }
+        if (frame.type === "ack") acks.push({ ids: frame.ids, how: frame.how });
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
+            v: 2,
             type: "authenticated",
-            data: { agentId: "bellman", agentName: "Bellman", contextId: "ctx-under-test" },
+            payload: { agentId: "bellman", agentName: "Bellman", contextId: "ctx-under-test" },
           }));
         }
       },
@@ -193,6 +198,7 @@ function startStub(): Stub {
     readBodies,
     answerBodies,
     kindBodies,
+    acks,
     set: (s) => { st = { ...st, ...s }; },
     stop: () => server.stop(true),
   };
@@ -212,9 +218,9 @@ describe("read_thread / list_threads", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
       } as Record<string, string>,
@@ -296,6 +302,10 @@ describe("read_thread / list_threads", () => {
     const q = new URLSearchParams(stub.calls.find((c) => c.includes("/messages"))!.split("?")[1]);
     expect(q.get("limit")).toBe("2");
     expect(q.has("sinceSeq")).toBe(false);
+    // RFC-027 D4: the root and the replies it returned are acked `model` — nothing it did not return.
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && stub.acks.length === 0) await Bun.sleep(25);
+    expect(stub.acks).toEqual([{ ids: [body.root.id, ...body.replies.map((r: any) => r.id)], how: "model" }]);
   });
 
   test("since_seq reaches the server as sinceSeq, omits the root, and marks that page", async () => {

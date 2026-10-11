@@ -4,9 +4,9 @@ import {
 import {
   ADDRESSED_REASONS,
   Clock,
-  Dedupe,
+  MAX_ACK_IDS,
+  PROTOCOL_VERSION,
   TokenClient,
-  advanceCursor,
   apiOrigin,
   assertNever,
   classifyClose,
@@ -19,14 +19,14 @@ import {
   isAddressed,
   isKeyAlreadyEnrolled,
   isOAuthError,
+  joinStateSeq,
   randomB64url,
   reconnectDelay,
-  sinceParam,
   softwareSigner,
   supportsKeyCredentials,
   userAgent,
   wsHtu
-} from "./index-h8ffc6pv.js";
+} from "./index-c3kvp3qz.js";
 
 // src/runtime/runtime.ts
 function unref(handle) {
@@ -95,10 +95,63 @@ var TERMINAL = new Set([
   "update_required",
   "too_old",
   "refused",
-  "server_mismatch"
+  "server_mismatch",
+  "clock"
 ]);
 function isTerminalCredentialError(e) {
   return isAgentClientError(e) && TERMINAL.has(e.code);
+}
+
+// src/runtime/pending.ts
+var DEFAULT_MAX = 1000;
+
+class Pending {
+  opts;
+  held = new Map;
+  constructor(opts = {}) {
+    this.opts = opts;
+  }
+  get size() {
+    return this.held.size;
+  }
+  has(id) {
+    return this.held.has(id);
+  }
+  add(entry) {
+    if (this.held.has(entry.id))
+      return false;
+    this.held.set(entry.id, { ...entry });
+    const max = this.opts.maxSize ?? DEFAULT_MAX;
+    while (this.held.size > max) {
+      const oldest = this.held.keys().next().value;
+      if (oldest === undefined)
+        break;
+      this.held.delete(oldest);
+    }
+    return true;
+  }
+  markPushed(id, at) {
+    const e = this.held.get(id);
+    if (e)
+      e.pushedAt = at;
+  }
+  list() {
+    return [...this.held.values()].map((e) => ({ ...e }));
+  }
+  confirm(ids) {
+    const taken = [];
+    for (const id of ids) {
+      if (this.held.delete(id))
+        taken.push(id);
+    }
+    if (taken.length > 0)
+      this.opts.onConfirm?.(taken);
+    return taken;
+  }
+  remove(ids) {
+    for (const id of ids)
+      this.held.delete(id);
+  }
 }
 
 // src/runtime/session.ts
@@ -106,18 +159,32 @@ var REMINT_REARM_MS = 30000;
 var DEFAULT_LIVENESS_MS = 90000;
 var DEFAULT_STANDBY_RETRY_MS = 30000;
 var DEFAULT_BUFFER_SIZE = 1000;
+var DEFAULT_RECONCILE_MS = 15 * 60000;
 var DEFAULT_STATUS_BUFFER_SIZE = 100;
-var DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
-var DEDUPE_MAX = 1e4;
+var SETTLED_MAX = 1e4;
 var OWN_SENT_MAX = 1000;
+var CHECKPOINT = { mode: "checkpoint" };
+function stopKindFromClose(outcome) {
+  if (outcome.stop === "superseded")
+    return "superseded";
+  if (outcome.stop === "too-old")
+    return "too-old";
+  if (outcome.stop === "session-in-use")
+    return "session-in-use";
+  return "revoked";
+}
+
 class Session {
   rt;
   client;
   opts;
+  pending;
   ws = null;
+  started = false;
   reconnectTimer = null;
   watchdogTimer = null;
   standbyTimer = null;
+  reconcileTimer = null;
   lock;
   reconnectAttempt = 0;
   lastClose = { cls: "transient" };
@@ -125,20 +192,23 @@ class Session {
   remintedAfter4001 = false;
   sockBearer;
   sockGrant = null;
-  authSupersede = false;
   draining = false;
   stopped = null;
   resolveClosed;
   closedPromise;
   myContextId = null;
-  mySendToken = "";
   agentId;
   agentName;
-  cursor = null;
-  cursorReady;
-  dedupe;
+  heartbeatMs = null;
+  seq = { grantId: null, last: 0, saved: 0, epoch: 0 };
+  seqWrites = Promise.resolve();
+  lastSequencedAt = 0;
+  adapter;
+  settled = new Map;
   ownMessageIds = new Set;
-  messagesChannel;
+  acks = { model: new Set, dismissed: new Set };
+  pushQueue = [];
+  pushing = false;
   statusChannel;
   unsubscribeRotation;
   unsubscribeLockLost;
@@ -149,8 +219,8 @@ class Session {
     let resolve;
     this.closedPromise = new Promise((r) => resolve = r);
     this.resolveClosed = resolve;
-    this.dedupe = new Dedupe({ ttlMs: DEDUPE_TTL_MS, maxSize: DEDUPE_MAX, now: () => rt.clock.now() });
-    this.messagesChannel = new AsyncChannel(opts.bufferSize ?? DEFAULT_BUFFER_SIZE);
+    this.adapter = opts.adapter ?? CHECKPOINT;
+    this.pending = new Pending({ onConfirm: (ids) => this.ack(ids, "model") });
     this.statusChannel = new AsyncChannel(DEFAULT_STATUS_BUFFER_SIZE);
     this.lock = opts.lock;
     this.unsubscribeRotation = client.onAccessRotated((frame) => this.sendReauth(frame));
@@ -165,21 +235,23 @@ class Session {
       this.client.invalidateAccess();
       this.finish({ kind: "superseded" });
     }) : null;
-    this.cursorReady = (opts.cursorStore ? opts.cursorStore.read() : Promise.resolve(null)).then((c) => {
-      this.cursor = c;
-    }).catch(() => {
-      this.cursor = null;
-    });
-    this.cursorReady.then(() => this.connectOrStandby());
+    if (opts.autoConnect !== false)
+      this.start();
   }
-  messages() {
-    return this.messagesChannel;
+  start() {
+    if (this.started)
+      return;
+    this.started = true;
+    this.connectOrStandby();
   }
   status() {
     return this.statusChannel;
   }
   self() {
     return { contextId: this.myContextId, agentId: this.agentId, ownMessageIds: this.ownMessageIds };
+  }
+  lastSeq() {
+    return this.seq.saved;
   }
   stopReason() {
     return this.stopped;
@@ -188,30 +260,35 @@ class Session {
     return this.closedPromise;
   }
   async send(channelId, content, opts = {}) {
-    const body = { content, senderContextId: this.myContextId ?? undefined, ...opts };
-    const result = await this.client.api.messages.create(channelId, body, this.mySendToken || undefined);
+    const result = await this.client.api.messages.create(channelId, { content, ...opts });
     if (result.id)
       this.rememberOwnSend(result.id);
     return result;
   }
   async reply(threadId, content, opts = {}) {
-    const body = { content, senderContextId: this.myContextId ?? undefined, ...opts };
-    const result = await this.client.api.threads.reply(threadId, body, this.mySendToken || undefined);
+    const result = await this.client.api.threads.reply(threadId, { content, ...opts });
     if (result.id)
       this.rememberOwnSend(result.id);
     return result;
   }
-  ack(messageId) {
-    if (this.ws && this.ws.readyState === WS_READY_STATE.OPEN) {
-      try {
-        this.ws.send(JSON.stringify({ type: "receipt", messageId }));
-      } catch {}
+  ack(ids, how) {
+    const list = [...new Set(ids)].filter((id) => typeof id === "string" && id.length > 0);
+    if (list.length === 0)
+      return;
+    this.pending.remove(list);
+    for (const id of list) {
+      if (how === "dismissed" && this.settled.get(id) === "model")
+        continue;
+      this.settle(id, how);
+      this.acks[how].add(id);
     }
+    this.flushAcks();
   }
   async drain() {
     if (this.stopped)
       return;
     this.draining = true;
+    this.flushAcks();
     this.clearReconnectTimer();
     this.clearWatchdog();
     this.clearStandbyRetry();
@@ -271,6 +348,20 @@ class Session {
       this.connectOrStandby();
     }, this.opts.standbyRetryMs ?? DEFAULT_STANDBY_RETRY_MS);
   }
+  async useGrant(grantId) {
+    if (grantId === this.seq.grantId)
+      return;
+    let stored = null;
+    if (grantId && this.opts.seqStore) {
+      try {
+        stored = await this.opts.seqStore.load(grantId);
+      } catch {
+        stored = null;
+      }
+    }
+    const n = stored !== null && Number.isSafeInteger(stored) && stored > 0 ? stored : 0;
+    this.seq = { grantId, last: n, saved: n, epoch: this.seq.epoch + 1 };
+  }
   async connect() {
     if (this.draining || this.stopped)
       return;
@@ -285,6 +376,9 @@ class Session {
     }
     if (this.draining || this.stopped)
       return;
+    await this.useGrant(this.client.grant()?.sessionId ?? null);
+    if (this.draining || this.stopped)
+      return;
     let sock;
     try {
       sock = new this.rt.WebSocket(this.wsUrl());
@@ -297,7 +391,7 @@ class Session {
     this.sockGrant = this.client.grant();
     let lastInboundAt = this.rt.clock.now();
     sock.addEventListener("open", async () => {
-      const supersede = this.lock ? await this.lock.isHeld() : false;
+      const lockHeld = this.lock ? await this.lock.isHeld() : false;
       if (this.ws !== sock)
         return;
       const sessionInfo = {
@@ -306,27 +400,30 @@ class Session {
         softwareId: this.client.softwareId(),
         clientVersion: this.client.softwareVersion()
       };
-      this.authSupersede = supersede;
+      const supersede = lockHeld || this.opts.supersede === true;
       try {
         sock.send(JSON.stringify({
           type: "auth",
+          v: PROTOCOL_VERSION,
           token: cred.token,
           dpop: cred.dpop,
-          since: sinceParam(this.cursor, this.rt.clock.now()),
+          lastSeq: this.seq.saved,
           sessionInfo,
-          ...this.mySendToken ? { sendToken: this.mySendToken } : {},
           ...supersede ? { supersede: true } : {}
         }));
       } catch {}
     });
     sock.addEventListener("message", (ev) => {
       lastInboundAt = this.rt.clock.now();
+      if (this.ws !== sock)
+        return;
       this.onFrame(String(ev.data));
     });
     sock.addEventListener("close", (ev) => {
       if (this.ws !== sock)
         return;
       this.clearWatchdog();
+      this.clearReconcile();
       this.ws = null;
       const authenticatedFor = this.authenticatedAt === null ? 0 : this.rt.clock.now() - this.authenticatedAt;
       this.authenticatedAt = null;
@@ -351,8 +448,9 @@ class Session {
         });
         return;
       }
-      if (cls === "too-old") {
-        this.finish({ kind: "too-old", close: closeOutcome(cls, code, reason, { myVersion: this.client.softwareVersion() }) });
+      if (cls === "too-old" || cls === "session-in-use") {
+        const outcome = closeOutcome(cls, code, reason, { myVersion: this.client.softwareVersion() });
+        this.finish({ kind: stopKindFromClose(outcome), close: outcome });
         return;
       }
       if (cls === "revoked" && reason === "session revoked")
@@ -385,26 +483,32 @@ class Session {
       this.scheduleReconnect(immediate);
     });
     sock.addEventListener("error", () => {});
-    const livenessMs = this.opts.livenessTimeoutMs ?? DEFAULT_LIVENESS_MS;
     this.watchdogTimer = this.rt.timer.setInterval(() => {
-      if (this.rt.clock.now() - lastInboundAt < livenessMs)
+      if (this.rt.clock.now() - lastInboundAt < this.livenessMs())
         return;
       const wasCurrent = this.ws === sock;
       if (wasCurrent)
         this.ws = null;
       this.clearWatchdog();
+      this.clearReconcile();
       try {
         sock.close();
       } catch {}
       if (wasCurrent)
         this.scheduleReconnect();
-    }, Math.max(1, Math.floor(livenessMs / 3)), { unref: true });
+    }, Math.max(1, Math.floor(this.livenessMs() / 3)), { unref: true });
+  }
+  livenessMs() {
+    if (this.opts.livenessTimeoutMs !== undefined)
+      return this.opts.livenessTimeoutMs;
+    return this.heartbeatMs !== null ? this.heartbeatMs * 3 : DEFAULT_LIVENESS_MS;
   }
   credentialFailure(sock, err) {
     if (sock !== null && this.ws !== sock)
       return;
     this.ws = null;
     this.clearWatchdog();
+    this.clearReconcile();
     if (sock) {
       try {
         sock.close();
@@ -450,11 +554,13 @@ class Session {
     this.clearReconnectTimer();
     this.clearWatchdog();
     this.clearStandbyRetry();
+    this.clearReconcile();
     this.unsubscribeRotation();
     this.unsubscribeLockLost?.();
     this.lock?.release();
+    this.pushQueue.length = 0;
+    this.adapter.close?.();
     this.emitStatus({ kind: "stopped", stop });
-    this.messagesChannel.end();
     this.statusChannel.end();
     this.resolveClosed(stop);
   }
@@ -467,90 +573,202 @@ class Session {
       } catch {}
     }
   }
-  onFrame(raw) {
-    let data;
+  sendJson(frame) {
+    if (!this.ws || this.ws.readyState !== WS_READY_STATE.OPEN)
+      return false;
     try {
-      data = JSON.parse(raw);
+      this.ws.send(JSON.stringify(frame));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  flushAcks() {
+    if (this.authenticatedAt === null)
+      return;
+    for (const how of ["model", "dismissed"]) {
+      const queued = [...this.acks[how]];
+      for (let i = 0;i < queued.length; i += MAX_ACK_IDS) {
+        const ids = queued.slice(i, i + MAX_ACK_IDS);
+        if (!this.sendJson({ type: "ack", ids, how }))
+          return;
+        for (const id of ids)
+          this.acks[how].delete(id);
+      }
+    }
+  }
+  noteSeq(seq) {
+    this.lastSequencedAt = this.rt.clock.now();
+    if (!(seq > this.seq.last))
+      return;
+    this.seq.last = seq;
+    const { grantId, epoch } = this.seq;
+    if (!grantId)
+      return;
+    const store = this.opts.seqStore;
+    if (!store) {
+      this.seq.saved = seq;
+      return;
+    }
+    this.seqWrites = this.seqWrites.then(() => store.save(grantId, seq)).then(() => {
+      if (this.seq.epoch === epoch && seq > this.seq.saved)
+        this.seq.saved = seq;
+    }, () => {});
+  }
+  clearReconcile() {
+    this.reconcileTimer?.clear();
+    this.reconcileTimer = null;
+  }
+  armReconcile() {
+    this.clearReconcile();
+    const after = this.opts.reconcileAfterMs ?? DEFAULT_RECONCILE_MS;
+    this.lastSequencedAt = this.rt.clock.now();
+    this.reconcileTimer = this.rt.timer.setInterval(() => {
+      if (this.authenticatedAt === null || this.rt.clock.now() - this.lastSequencedAt < after)
+        return;
+      this.lastSequencedAt = this.rt.clock.now();
+      this.reconcile();
+    }, Math.max(1, Math.min(after, 60000)), { unref: true });
+  }
+  async reconcile() {
+    let res;
+    try {
+      res = await this.client.api.deliveries.list();
     } catch {
       return;
     }
-    switch (data.type) {
+    for (const e of res.entries ?? []) {
+      const entry = entryFrom(e.kind, e.payload, true);
+      if (entry)
+        this.deliver(entry);
+    }
+  }
+  onFrame(raw) {
+    let env;
+    try {
+      env = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (env?.v !== PROTOCOL_VERSION || typeof env.type !== "string")
+      return;
+    if (typeof env.seq === "number" && Number.isSafeInteger(env.seq))
+      this.noteSeq(env.seq);
+    const p = env.payload ?? {};
+    switch (env.type) {
       case "authenticated":
-        this.handleAuthenticated(data.data);
+        this.handleAuthenticated(p);
+        return;
+      case "ping":
+        this.sendJson({ type: "pong", lastSeq: this.seq.saved });
         return;
       case "message":
-        this.handleInbound(data.data, data.deliveryReasons, true);
-        return;
-      case "replay": {
-        const d = data.data;
-        for (const m of d?.messages ?? []) {
-          const reasons = d?.missed && (!m.deliveryReasons || m.deliveryReasons.length === 0) ? ["target"] : m.deliveryReasons;
-          this.handleInbound(m, reasons, !d?.missed, !!d?.missed);
-        }
+      case "task_event":
+      case "action_request": {
+        const entry = entryFrom(env.type, p, p.redelivery === true);
+        if (entry)
+          this.deliver(entry);
         return;
       }
-      case "ping":
-        if (this.ws && this.ws.readyState === WS_READY_STATE.OPEN) {
-          try {
-            this.ws.send(JSON.stringify({ type: "pong", ts: this.rt.clock.now() }));
-          } catch {}
-        }
+      case "catchup":
+        this.emitStatus({ kind: "catchup", channels: Array.isArray(p.channels) ? p.channels : [] });
         return;
-      case "context_rebound": {
-        const d = data.data;
-        if (typeof d?.sendToken === "string" && d.sendToken) {
-          if (typeof d.contextId === "string" && d.contextId)
-            this.myContextId = d.contextId;
-          this.mySendToken = d.sendToken;
-        }
+      case "invalid_session": {
+        this.seq = { ...this.seq, last: 0, saved: 0, epoch: this.seq.epoch + 1 };
+        const lost = p.lost ?? { frames: 0, from: null };
+        this.emitStatus({ kind: "invalid_session", lost });
         return;
       }
+      case "drain": {
+        const sock = this.ws;
+        this.ws = null;
+        this.clearWatchdog();
+        this.clearReconcile();
+        this.authenticatedAt = null;
+        try {
+          sock?.close(1000, "drain");
+        } catch {}
+        this.lastClose = { cls: "transient" };
+        this.scheduleReconnect(true);
+        return;
+      }
+      case "receipt":
+        if (typeof p.messageId === "string" && typeof p.state === "string")
+          this.emitStatus({ kind: "receipt", receipt: p });
+        return;
+      case "error":
+        if (typeof p.message === "string" && p.message)
+          this.emitStatus({ kind: "server_error", message: p.message });
+        return;
       default:
         return;
     }
   }
-  handleAuthenticated(data) {
-    const newContextId = typeof data?.contextId === "string" ? data.contextId : "";
-    if (this.myContextId && newContextId && newContextId !== this.myContextId)
-      this.mySendToken = "";
-    this.myContextId = newContextId || null;
-    this.agentId = typeof data?.agentId === "string" ? data.agentId : undefined;
-    this.agentName = typeof data?.agentName === "string" ? data.agentName : undefined;
-    if (typeof data?.sendToken === "string" && data.sendToken)
-      this.mySendToken = data.sendToken;
+  handleAuthenticated(p) {
+    this.myContextId = typeof p.contextId === "string" && p.contextId ? p.contextId : null;
+    this.agentId = typeof p.agentId === "string" ? p.agentId : undefined;
+    this.agentName = typeof p.agentName === "string" ? p.agentName : undefined;
+    this.heartbeatMs = typeof p.heartbeatMs === "number" && p.heartbeatMs > 0 ? p.heartbeatMs : null;
     this.authenticatedAt = this.rt.clock.now();
     this.reconnectAttempt = 0;
     this.lastClose = { cls: "transient" };
-    const supersedeIneffective = this.authSupersede && this.myContextId !== null && this.myContextId !== this.client.sessionKey();
     this.emitStatus({
       kind: "authenticated",
       agentId: this.agentId,
       agentName: this.agentName,
-      handle: typeof data?.handle === "string" ? data.handle : null,
+      handle: typeof p.handle === "string" ? p.handle : null,
       contextId: this.myContextId,
-      advice: data?.client,
-      ...supersedeIneffective ? { supersedeIneffective: true } : {}
+      advice: p.client
     });
+    this.flushAcks();
+    this.armReconcile();
   }
-  handleInbound(msg, reasons, bumpCursor, bypassDedupe = false) {
-    if (!msg?.id)
+  deliver(entry) {
+    const settled = this.settled.get(entry.id);
+    if (settled) {
+      this.acks[settled].add(entry.id);
+      this.flushAcks();
       return;
-    if (!bypassDedupe && !this.dedupe.seen(msg.id))
-      return;
-    if (bumpCursor && msg.createdAt) {
-      const next = advanceCursor(this.cursor, msg.createdAt);
-      if (next !== this.cursor) {
-        this.cursor = next;
-        this.opts.cursorStore?.write(next);
-      }
     }
-    const envelope = { ...msg, deliveryReasons: reasons ?? [] };
-    if (!isAddressed(envelope.deliveryReasons) && this.opts.filter && !this.opts.filter(envelope))
+    if (this.pending.has(entry.id))
       return;
-    const dropped = this.messagesChannel.push(envelope);
-    if (dropped) {
-      this.dedupe.forget(dropped.id);
-      this.emitStatus({ kind: "slow-consumer", droppedMessageId: dropped.id });
+    if (entry.kind === "message" && !isAddressed(entry.message.deliveryReasons) && this.opts.filter && !this.opts.filter(entry.message))
+      return;
+    this.pending.add(pendingMeta(entry));
+    if (this.adapter.mode !== "channel" || !this.adapter.push)
+      return;
+    this.pushQueue.push(entry);
+    const max = this.opts.bufferSize ?? DEFAULT_BUFFER_SIZE;
+    while (this.pushQueue.length > max) {
+      const dropped = this.pushQueue.shift();
+      this.pending.remove([dropped.id]);
+      this.emitStatus({ kind: "slow-consumer", droppedId: dropped.id });
+    }
+    this.drainPushQueue();
+  }
+  async drainPushQueue() {
+    if (this.pushing)
+      return;
+    this.pushing = true;
+    try {
+      while (this.pushQueue.length > 0 && !this.stopped) {
+        const entry = this.pushQueue.shift();
+        try {
+          await this.adapter.push(entry);
+          this.pending.markPushed(entry.id, this.rt.clock.now());
+        } catch {}
+      }
+    } finally {
+      this.pushing = false;
+    }
+  }
+  settle(id, how) {
+    this.settled.delete(id);
+    this.settled.set(id, how);
+    if (this.settled.size > SETTLED_MAX) {
+      const oldest = this.settled.keys().next().value;
+      if (oldest !== undefined)
+        this.settled.delete(oldest);
     }
   }
   rememberOwnSend(id) {
@@ -562,9 +780,37 @@ class Session {
     }
   }
 }
+function entryFrom(kind, p, redelivery) {
+  if (kind === "message") {
+    const { message, deliveryReasons } = p;
+    if (!message || typeof message.id !== "string")
+      return null;
+    return { kind: "message", id: message.id, redelivery, message: { ...message, deliveryReasons: Array.isArray(deliveryReasons) ? deliveryReasons : [] } };
+  }
+  if (kind === "task_event") {
+    const event = p;
+    return typeof event.id === "string" ? { kind: "task_event", id: event.id, redelivery, event } : null;
+  }
+  if (kind === "action_request") {
+    const action = p;
+    return typeof action.id === "string" ? { kind: "action_request", id: action.id, redelivery, action } : null;
+  }
+  return null;
+}
+function pendingMeta(entry) {
+  const base = { id: entry.id, kind: entry.kind, pushedAt: null, redelivery: entry.redelivery };
+  if (entry.kind === "message") {
+    const m = entry.message;
+    return { ...base, channelId: m.channelId ?? null, threadId: m.threadId ?? null, type: m.type ?? null, senderHandle: m.senderHandle ?? null };
+  }
+  if (entry.kind === "task_event") {
+    return { ...base, channelId: null, threadId: entry.event.threadId ?? null, type: entry.event.change ?? null, senderHandle: null };
+  }
+  return { ...base, channelId: null, threadId: null, type: entry.action.action ?? null, senderHandle: null };
+}
 
 // src/runtime/sdk-version.generated.ts
-var SDK_VERSION = "0.3.0";
+var SDK_VERSION = "0.6.1";
 
 // src/runtime/api.ts
 var HTTP_TIMEOUT_MS = 20000;
@@ -605,8 +851,7 @@ async function request(rt, client, method, path, opts, retried = false) {
           runtimeVersion: rt.userAgent.runtimeVersion,
           os: rt.userAgent.os,
           arch: rt.userAgent.arch
-        }),
-        ...opts.contextToken ? { "X-Bridge-Context": opts.contextToken } : {}
+        })
       },
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined
     });
@@ -648,20 +893,23 @@ function createApi(rt, client) {
   };
   return {
     channels: {
-      list: () => req("GET", "/api/channels"),
+      list: (p = {}) => req("GET", `/api/channels${p.includeArchived ? "?includeArchived=true" : ""}`),
+      join: (channelId) => req("POST", `/api/channels/${encodeURIComponent(channelId)}/join`, { body: {} }),
+      leave: (channelId) => req("POST", `/api/channels/${encodeURIComponent(channelId)}/leave`, { body: {} }),
+      audience: (channelId) => req("GET", `/api/channels/${encodeURIComponent(channelId)}/audience`),
       readState: () => req("GET", "/api/channels/read-state"),
       markRead: (channelId, body) => req("POST", `/api/channels/${encodeURIComponent(channelId)}/read`, { body: body ?? {} })
     },
     messages: {
       list: (p) => req("GET", `/api/messages${qs(p)}`),
-      create: (channelId, body, contextToken) => req("POST", "/api/messages", { body: { channelId, ...body }, contextToken }),
+      create: (channelId, body) => req("POST", "/api/messages", { body: { channelId, ...body } }),
       receipts: (ids) => req("GET", `/api/messages/receipts?ids=${ids.map(encodeURIComponent).join(",")}`)
     },
     threads: {
       list: (p) => req("GET", `/api/threads${qs({ channel: p.channel, q: p.query })}`),
       messages: (threadId, p = {}) => req("GET", `/api/threads/${encodeURIComponent(threadId)}/messages${qs(p)}`),
       events: (threadId) => req("GET", `/api/threads/${encodeURIComponent(threadId)}/events`),
-      reply: (threadId, body, contextToken) => req("POST", `/api/threads/${encodeURIComponent(threadId)}/messages`, { body, contextToken }),
+      reply: (threadId, body) => req("POST", `/api/threads/${encodeURIComponent(threadId)}/messages`, { body }),
       rename: (threadId, title) => req("PUT", `/api/threads/${encodeURIComponent(threadId)}`, { body: { title } }),
       markRead: (threadId, body) => req("POST", `/api/threads/${encodeURIComponent(threadId)}/read`, { body: body ?? {} }),
       markAnswer: (threadId, messageId) => req("PUT", `/api/threads/${encodeURIComponent(threadId)}/answer`, { body: { messageId } }),
@@ -673,11 +921,18 @@ function createApi(rt, client) {
       contexts: (agentId) => req("GET", `/api/agents/${encodeURIComponent(agentId)}/contexts`),
       setContextLabel: (agentId, contextId, label) => req("PUT", `/api/agents/${encodeURIComponent(agentId)}/contexts/${encodeURIComponent(contextId)}/label`, { body: { label } })
     },
+    presence: {
+      list: () => req("GET", "/api/presence")
+    },
+    deliveries: {
+      list: () => req("GET", "/api/deliveries")
+    },
     tasks: {
       claim: (messageId) => req("POST", `/api/tasks/${encodeURIComponent(messageId)}/claim`),
       updateStatus: (messageId, body) => req("PUT", `/api/tasks/${encodeURIComponent(messageId)}/status`, { body }),
       cancel: (messageId, reason) => req("POST", `/api/tasks/${encodeURIComponent(messageId)}/cancel`, { body: reason ? { reason } : {} }),
-      list: (p = {}) => req("GET", `/api/tasks${qs(p)}`)
+      list: (p = {}) => req("GET", `/api/tasks${qs(p)}`),
+      audience: (messageId) => req("GET", `/api/tasks/${encodeURIComponent(messageId)}/audience`)
     }
   };
 }
@@ -738,6 +993,8 @@ async function pollDeviceCode(rt, poll, auth, opts = {}) {
 
 // src/runtime/client.ts
 var EXPIRY_SLACK_MS = 60000;
+var STOP_CODES = new Set(["refused", "session_limit", "too_old", "server_mismatch", "corrupt_state", "update_required", "clock"]);
+var UNUSABLE_FILE = new Set(["EACCES", "EPERM", "EISDIR"]);
 
 class AgentClient {
   rt;
@@ -873,7 +1130,7 @@ class AgentClient {
       return await this.mintLocked();
     } catch (e) {
       const err = this.toClientError(e);
-      if (err.code === "refused" || err.code === "session_limit" || err.code === "too_old" || err.code === "server_mismatch")
+      if (STOP_CODES.has(err.code))
         this.stopped = err;
       throw err;
     }
@@ -918,10 +1175,15 @@ class AgentClient {
     if (signer.jkt !== record.installation.jkt) {
       throw new AgentClientError({ code: "refused", message: "the store's key does not match its installation" });
     }
-    let attempt = await this.opts.store.readAttempt();
-    if (attempt === null) {
-      attempt = randomB64url(16);
-      await this.opts.store.writeAttempt(attempt);
+    let attempt;
+    try {
+      attempt = await this.opts.store.createAttempt(randomB64url(32));
+    } catch (e) {
+      const code = e?.code;
+      if (typeof code === "string" && UNUSABLE_FILE.has(code)) {
+        throw new AgentClientError({ code: "refused", message: `the store's write-ahead attempt is unusable (${code}) — fix its permissions, or log in again`, cause: e });
+      }
+      throw e;
     }
     const reconnect = this.reconnectNext;
     let g;
@@ -1014,7 +1276,8 @@ class AgentClient {
         return;
       const late = this.rt.clock.now() - this.access.refreshAt > 60000;
       if (late) {
-        this.lateRefreshTimer?.clear();
+        if (this.lateRefreshTimer)
+          return;
         this.lateRefreshTimer = this.rt.timer.setTimeout(() => {
           this.lateRefreshTimer = null;
           go();
@@ -1043,31 +1306,39 @@ class AgentClient {
       return "deleted";
     }, this.lockOpts());
   }
-  async enrolWithKey(enrolmentKey, installationName) {
-    const meta = await this.discoverOrRefuse();
-    let key = await generateSoftwareKey();
-    let g;
-    try {
-      g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName });
-    } catch (e) {
-      if (!isKeyAlreadyEnrolled(e))
-        throw this.toClientError(e);
-      key = await generateSoftwareKey();
-      g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName });
-    }
-    await this.writeEnrolment(meta, installationName, g, key);
-    return g;
+  async enrolWithKey(enrolmentKey, installationName, opts = {}) {
+    return this.opts.store.withLock(async (signal) => {
+      if (await this.opts.store.read() || await this.opts.store.isNewer?.())
+        return null;
+      const meta = await this.discoverOrRefuse(signal);
+      let key = await generateSoftwareKey();
+      let g;
+      try {
+        g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName }, { signal });
+      } catch (e) {
+        if (!isKeyAlreadyEnrolled(e))
+          throw this.toClientError(e);
+        key = await generateSoftwareKey();
+        g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName }, { signal }).catch((e2) => {
+          throw this.toClientError(e2);
+        });
+      }
+      await this.writeEnrolmentLocked(signal, meta, installationName, g, key, opts);
+      return g;
+    }, this.lockOpts());
   }
-  async enrolWithAuthorizationCode(p, installationName) {
+  async enrolWithAuthorizationCode(p, installationName, opts = {}) {
+    await this.refuseOverNewer();
     const meta = await this.discoverOrRefuse();
-    const key = await generateSoftwareKey();
+    const key = opts.key ?? await generateSoftwareKey();
     const g = await this.tokens.exchangeCode(meta, key.signer, p).catch((e) => {
       throw this.toClientError(e);
     });
-    await this.writeEnrolment(meta, installationName, g, key);
+    await this.writeEnrolment(meta, installationName, g, key, opts);
     return g;
   }
-  async deviceAuthorization(installationName) {
+  async deviceAuthorization(installationName, opts = {}) {
+    await this.refuseOverNewer();
     const meta = await this.discoverOrRefuse();
     const auth = await this.tokens.deviceAuthorization(meta, installationName).catch((e) => {
       throw this.toClientError(e);
@@ -1085,17 +1356,39 @@ class AgentClient {
         return await this.tokens.pollDeviceCode(meta, key.signer, auth.device_code);
       }
     };
-    const complete = async (opts = {}) => {
-      const r = await pollDeviceCode(this.rt, poll, auth, opts);
+    const complete = async (o = {}) => {
+      const r = await pollDeviceCode(this.rt, poll, auth, o);
       if (!r.ok)
         throw new AgentClientError({ code: r.error === "cancelled" ? "aborted" : "refused", message: r.error });
-      await this.writeEnrolment(meta, installationName, r.grant, key);
+      const discard = async (err) => {
+        if (!await this.revokeGrant(meta, key.signer, r.grant).then(() => true, () => false)) {
+          try {
+            opts.onUnrevoked?.([{ installationId: r.grant.installation_id }]);
+          } catch {}
+        }
+        throw err;
+      };
+      const cancelled = () => new AgentClientError({ code: "aborted", message: "cancelled" });
+      if (o.signal?.aborted)
+        return discard(cancelled());
+      const confirm = opts.confirm;
+      if (confirm && !await Promise.resolve().then(() => confirm(r.grant)).catch(() => false)) {
+        return discard(new AgentClientError({ code: "declined", message: "the person declined binding this machine to that agent" }));
+      }
+      if (o.signal?.aborted)
+        return discard(cancelled());
+      await this.writeEnrolment(meta, installationName, r.grant, key, opts);
       return r.grant;
     };
     return { auth, complete };
   }
-  async discoverOrRefuse() {
-    const meta = await this.tokens.discover(this.opts.apiUrl).catch((e) => {
+  async refuseOverNewer() {
+    if (await this.opts.store.isNewer?.()) {
+      throw new AgentClientError({ code: "refused", message: "this store holds an installation written by a newer build — update before signing in here" });
+    }
+  }
+  async discoverOrRefuse(signal) {
+    const meta = await this.tokens.discover(this.opts.apiUrl, signal).catch((e) => {
       throw this.toClientError(e);
     });
     if (!supportsKeyCredentials(meta)) {
@@ -1103,42 +1396,61 @@ class AgentClient {
     }
     return meta;
   }
-  async writeEnrolment(meta, name, g, key) {
-    await this.opts.store.withLock(async (signal) => {
-      const old = await this.opts.store.read();
-      const oldAttempt = old ? await this.opts.store.readAttempt() : null;
-      try {
-        await this.opts.store.write({
-          installation: {
-            installationId: g.installation_id,
-            installationName: name,
-            apiUrl: this.opts.apiUrl,
-            jkt: key.signer.jkt,
-            keyStorage: key.signer.keyStorage,
-            ...g.agent ? { agent: g.agent } : {},
-            ...g.workspace ? { workspace: g.workspace } : {}
-          },
-          privateJwk: key.privateJwk,
-          joinState: g.join_state
-        });
-        await this.opts.store.clearAttempt();
-      } catch (e) {
-        await this.revokeGrant(meta, key.signer, g, signal).catch(() => {});
-        if (old && old.installation.installationId !== g.installation_id) {
-          await this.revokeRecord(old, oldAttempt, signal).catch(() => {});
-        }
-        throw e;
-      }
-      this.access = null;
-      this.stopped = null;
-      this.sessionBlocked = false;
-      this.reconnectNext = false;
-      this.mintNotBefore = 0;
-      this.resourceNonce = undefined;
+  async writeEnrolment(meta, name, g, key, opts = {}) {
+    await this.opts.store.withLock((signal) => this.writeEnrolmentLocked(signal, meta, name, g, key, opts), this.lockOpts());
+  }
+  async writeEnrolmentLocked(signal, meta, name, g, key, opts) {
+    const old = await this.opts.store.read();
+    const oldAttempt = old ? await this.opts.store.readAttempt() : null;
+    try {
+      await this.opts.store.write({
+        installation: {
+          installationId: g.installation_id,
+          installationName: name,
+          apiUrl: this.opts.apiUrl,
+          jkt: key.signer.jkt,
+          keyStorage: key.signer.keyStorage,
+          ...g.agent ? { agent: g.agent } : {},
+          ...g.workspace ? { workspace: g.workspace } : {}
+        },
+        privateJwk: key.privateJwk,
+        joinState: g.join_state
+      });
+      await this.opts.store.clearAttempt();
+    } catch (e) {
+      const left = [];
+      if (!await this.revokeGrant(meta, key.signer, g, signal).then(() => true, () => false))
+        left.push({ installationId: g.installation_id });
       if (old && old.installation.installationId !== g.installation_id) {
-        await this.revokeRecord(old, oldAttempt, signal).catch(() => {});
+        if (!await this.revokeRecord(old, oldAttempt, signal).then(() => true, () => false)) {
+          left.push({ installationId: old.installation.installationId, ...old.installation.installationName !== undefined ? { installationName: old.installation.installationName } : {} });
+        }
       }
-    }, this.lockOpts());
+      if (left.length > 0) {
+        try {
+          opts.onUnrevoked?.(left);
+        } catch {}
+      }
+      throw e;
+    }
+    this.access = null;
+    this.stopped = null;
+    this.sessionBlocked = false;
+    this.reconnectNext = false;
+    this.mintNotBefore = 0;
+    this.resourceNonce = undefined;
+    try {
+      await opts.onWritten?.();
+    } catch {}
+    if (old && old.installation.installationId !== g.installation_id) {
+      try {
+        await this.revokeRecord(old, oldAttempt, signal);
+      } catch (e) {
+        try {
+          opts.onPreviousRevokeFailed?.(old.installation, e);
+        } catch {}
+      }
+    }
   }
   async revokeGrant(meta, signer, g, signal) {
     await this.tokens.revoke(meta, signer, { installationId: g.installation_id, joinState: g.join_state, attempt: null, scope: "installation" }, { signal });
@@ -1150,16 +1462,22 @@ class AgentClient {
   }
   async logout(opts = {}) {
     const revoke = opts.revoke ?? true;
-    await this.opts.store.withLock(async (signal) => {
+    const result = await this.opts.store.withLock(async (signal) => {
       const record = await this.opts.store.read();
+      let outcome = "skipped";
       if (record && revoke) {
         try {
           const meta = await this.tokens.discover(record.installation.apiUrl, signal);
           const signer = this.opts.signer ?? await softwareSigner(record.privateJwk);
           await this.tokens.revoke(meta, signer, { installationId: record.installation.installationId, joinState: record.joinState, attempt: await this.opts.store.readAttempt(), scope: "installation" }, { signal });
-        } catch {}
+          outcome = "revoked";
+        } catch (e) {
+          const a = classifyTokenError(e);
+          outcome = a.kind === "installation_gone" ? a.reason === "installation_locked" ? "locked" : "revoked" : { failed: e instanceof Error ? e.message : String(e) };
+        }
       }
       await this.opts.store.clear();
+      return { installation: record?.installation ?? null, revoke: outcome };
     }, this.lockOpts());
     this.access = null;
     this.stopped = null;
@@ -1167,6 +1485,7 @@ class AgentClient {
     this.reconnectNext = false;
     this.mintNotBefore = 0;
     this.resourceNonce = undefined;
+    return result;
   }
   session(opts = {}) {
     return new Session(this.rt, this, opts);
@@ -1177,6 +1496,53 @@ class AgentClient {
     this.lateRefreshTimer?.clear();
     this.lateRefreshTimer = null;
   }
+}
+// src/runtime/delivery.ts
+function queueAdapter() {
+  let offered = null;
+  let reader = null;
+  let closed = false;
+  return {
+    mode: "channel",
+    push(entry) {
+      return new Promise((taken) => {
+        if (closed)
+          return taken();
+        if (reader) {
+          const r = reader;
+          reader = null;
+          taken();
+          r({ value: entry, done: false });
+          return;
+        }
+        offered = { entry, taken };
+      });
+    },
+    close() {
+      closed = true;
+      offered?.taken();
+      offered = null;
+      reader?.({ value: undefined, done: true });
+      reader = null;
+    },
+    entries() {
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: () => {
+            if (offered) {
+              const o = offered;
+              offered = null;
+              o.taken();
+              return Promise.resolve({ value: o.entry, done: false });
+            }
+            if (closed)
+              return Promise.resolve({ value: undefined, done: true });
+            return new Promise((resolve) => reader = resolve);
+          }
+        })
+      };
+    }
+  };
 }
 // src/runtime/turn-trigger.ts
 var TURN_TRIGGER_REASONS = new Set([...ADDRESSED_REASONS, "channel"]);
@@ -1200,18 +1566,28 @@ function memoryCredentialStore() {
       record = r;
     },
     async writeJoinState(joinState) {
-      if (record)
-        record = { ...record, joinState };
+      if (!record)
+        return false;
+      const next = joinStateSeq(joinState);
+      const cur = joinStateSeq(record.joinState);
+      if (next === null)
+        throw new Error("refusing to write a malformed join state");
+      if (cur !== null && cur > next)
+        return false;
+      record = { ...record, joinState };
+      return true;
     },
     async clear() {
       record = null;
       attempt = null;
     },
     async readAttempt() {
-      return attempt;
+      return attempt !== null && /^[A-Za-z0-9_-]{22,128}$/.test(attempt) ? attempt : null;
     },
-    async writeAttempt(a) {
-      attempt = a;
+    async createAttempt(candidate) {
+      if (attempt === null)
+        attempt = candidate;
+      return attempt;
     },
     async clearAttempt() {
       attempt = null;
@@ -1229,14 +1605,14 @@ function memoryCredentialStore() {
     }
   };
 }
-function memoryCursorStore(initial = null) {
-  let cursor = initial;
+function memorySeqStore(initial = {}) {
+  const seqs = new Map(Object.entries(initial));
   return {
-    async read() {
-      return cursor;
+    async load(grantId) {
+      return seqs.get(grantId) ?? null;
     },
-    async write(c) {
-      cursor = c;
+    async save(grantId, seq) {
+      seqs.set(grantId, seq);
     }
   };
 }
@@ -1293,6 +1669,7 @@ export {
   AgentClient,
   AgentClientError,
   ApiRequestError,
+  Pending,
   Session,
   WS_READY_STATE,
   createRuntime,
@@ -1301,6 +1678,7 @@ export {
   isTerminalCredentialError,
   isTurnTrigger,
   memoryCredentialStore,
-  memoryCursorStore,
-  memorySessionLock
+  memorySeqStore,
+  memorySessionLock,
+  queueAdapter
 };

@@ -52,7 +52,7 @@ const SWEEP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // server's default STATE_DIR.
 const MAP_DIR = join(
   process.env.CLAUDE_PLUGIN_DATA ||
-    join(homedir(), ".claude", "channels", "bridge"),
+    join(homedir(), ".einweave"),
   "sessions"
 );
 

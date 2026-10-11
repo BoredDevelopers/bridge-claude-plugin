@@ -1,6 +1,6 @@
 /**
  * The process registry (RFC-017 D2): every Bridge plugin process on the machine writes
- * `~/.claude/channels/bridge/procs/<pid>.json` describing itself, so a person (or a
+ * `~/.einweave/procs/<pid>.json` describing itself, so a person (or a
  * future `status` / `/bridge:update`, D9) can answer "where is the other window" — the
  * question the RFC-016 rollout could not answer (see the RFC's §1, item 3).
  *
@@ -15,10 +15,8 @@
  *
  * fs / the clock / pid-liveness are one object each so tests can inject failures, a
  * fake time or fake processes — ESM namespace imports cannot be spied on. Same idiom as
- * auth/node/store.ts's `__io` and auth/node/lock.ts's `__lockIo`; production never
- * replaces them. Each module owns its own liveness check rather than importing
- * server.ts's (server.ts has no exports and runs top-level side effects) — the same
- * shape test/fixtures/v024/lock.ts and server.ts already duplicate independently.
+ * the SDK node store's `__fsIo` and its lock's `__lockIo`; production never replaces them. Each module owns its own liveness check rather than importing
+ * server.ts's (server.ts has no exports and runs top-level side effects).
  */
 import { procStartOf, legacyProcStartOf } from "./proc-start";
 import { mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync } from "fs";

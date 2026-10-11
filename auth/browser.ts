@@ -1,7 +1,7 @@
 /**
  * Can this machine show a browser, and open one (RFC-014 §7.2). Headless ⇒ the
  * device flow: SSH, CI, or Linux/BSD with no display (az / gh / entire-cli
- * heuristics). `BRIDGE_BROWSER=none` never opens one — the URL is printed instead.
+ * heuristics). `EINWEAVE_BROWSER=none` never opens one — the URL is printed instead.
  */
 type Env = Record<string, string | undefined>;
 
@@ -16,7 +16,7 @@ export function isHeadless(env: Env, platform: string = process.platform): boole
 }
 
 export function browserDisabled(env: Env): boolean {
-  return (env.BRIDGE_BROWSER ?? "").trim().toLowerCase() === "none";
+  return (env.EINWEAVE_BROWSER ?? "").trim().toLowerCase() === "none";
 }
 
 /** Open `url` in the default browser; false when that could not be started. */

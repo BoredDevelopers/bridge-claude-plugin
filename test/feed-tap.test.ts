@@ -234,13 +234,13 @@ function startStub(): Stub {
         if (frame.type === "auth") {
           socket = ws;
           auths++;
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "bellman-id", agentName: "Bellman (Mac)", handle: "bellman", contextId: "ctx-under-test" } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "bellman-id", agentName: "Bellman (Mac)", handle: "bellman", contextId: "ctx-under-test" } }));
         }
       },
       close() { socket = null; },
     },
   });
-  return { port: server.port!, send: (f) => socket?.send(JSON.stringify(f)), connected: () => socket !== null, stop: () => server.stop(true), posted, drop: (code, reason) => socket?.close(code, reason), auths: () => auths, channelHits: () => channelHits, holdChannels: () => { held = new Promise<void>((r) => (release = r)); }, releaseChannels: () => { release?.(); held = null; } };
+  return { port: server.port!, send: (f) => socket?.send(JSON.stringify(v2Frame(f))), connected: () => socket !== null, stop: () => server.stop(true), posted, drop: (code, reason) => socket?.close(code, reason), auths: () => auths, channelHits: () => channelHits, holdChannels: () => { held = new Promise<void>((r) => (release = r)); }, releaseChannels: () => { release?.(); held = null; } };
 }
 
 async function until<T>(what: string, fn: () => T | undefined | null | false, ms = 15_000): Promise<T> {
@@ -251,6 +251,13 @@ async function until<T>(what: string, fn: () => T | undefined | null | false, ms
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(25);
   }
+}
+
+/** The tests write `{type:"message", data, deliveryReasons}`; the wire is protocol v2 (RFC-027). */
+let seq = 0;
+function v2Frame(f: any): any {
+  if (f?.type !== "message" || !f.data) return f;
+  return { v: 2, type: "message", seq: ++seq, payload: { message: { senderContextId: null, threadId: null, ...f.data }, ...(f.deliveryReasons ? { deliveryReasons: f.deliveryReasons } : {}) } };
 }
 
 describe("a running plugin serves its feed", () => {
@@ -268,13 +275,13 @@ describe("a running plugin serves its feed", () => {
       env: {
         ...process.env,
         CLAUDE_PLUGIN_DATA: dir,
-        BRIDGE_STATE_DIR: dir,
-        BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-        BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY, BRIDGE_AUTOCONNECT: "1",
-        BRIDGE_SESSION_LABEL: "feed-test",
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+        EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY, EINWEAVE_AUTOCONNECT: "1",
+        EINWEAVE_SESSION_LABEL: "feed-test",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
-        BRIDGE_TEST_BACKOFF_SCALE: "0.05", // a dropped socket reconnects in tens of ms
+        EINWEAVE_TEST_BACKOFF_SCALE: "0.05", // a dropped socket reconnects in tens of ms
         ...extraEnv,
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -284,6 +291,11 @@ describe("a running plugin serves its feed", () => {
       const dec = new TextDecoder();
       for await (const chunk of plugin.stdout as any) out += dec.decode(chunk, { stream: true });
     })();
+    // The host's MCP handshake: channel pushes wait for `initialized`.
+    const stdin = plugin.stdin as { write: (s: string) => void; flush?: () => void };
+    stdin.write(JSON.stringify({ jsonrpc: "2.0", id: "boot", method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } } }) + "\n");
+    stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
+    stdin.flush?.();
     await until("the plugin to connect to the stub", () => stub.connected());
   }
 
@@ -371,11 +383,11 @@ describe("a running plugin serves its feed", () => {
     await boot();
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
-      // Skipped in handleInboundMessage: our own send coming back (sender context is ours).
+      // Skipped in the adapter: our own send coming back (sender grant is ours).
       { data: { id: "skip-own-send", channelId: "chan-dev-id", agentName: "bellman", content: "echo", senderContextId: "ctx-under-test" }, deliveryReasons: ["target"] },
-      // Skipped INSIDE routeInbound: this agent's own message from another of its sessions, unaddressed.
+      // Skipped in the adapter: this agent's own message from another of its sessions, unaddressed.
       { data: { id: "skip-own-agent", channelId: "chan-dev-id", agentId: "bellman-id", agentName: "bellman", content: "from my other window", senderContextId: "ctx-other" } },
-      // Skipped INSIDE routeInbound: targeted at ANOTHER session of this agent.
+      // Skipped in the adapter: targeted at ANOTHER session of this agent.
       { data: { id: "skip-other-context", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "for the other window", metadata: JSON.stringify({ contextId: "ctx-other", contextAgentId: "bellman-id" }) }, deliveryReasons: ["mention"] },
     ]);
     expect(seen).toEqual(["msg-barrier"]);
@@ -420,11 +432,11 @@ describe("a running plugin serves its feed", () => {
     expect(order).toEqual([["ord-2-new-channel", "ops"], ["ord-3-known-channel", "dev"]]);
   }, 40_000);
 
-  test("a channel outside BRIDGE_CHANNELS is filtered from the feed exactly as from the host", async () => {
-    await boot({ BRIDGE_CHANNELS: "ops" });
+  test("a channel outside EINWEAVE_CHANNELS is filtered from the feed exactly as from the host", async () => {
+    await boot({ EINWEAVE_CHANNELS: "ops" });
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
-      // Broadcast traffic in #dev, which is not in the filter: dropped by the channel filter in routeInbound.
+      // Broadcast traffic in #dev, which is not in the filter: dropped by the Session's broadcast filter.
       { data: { id: "skip-filtered", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "broadcast in a filtered channel" }, deliveryReasons: ["channel"] },
     ]);
     // The barrier is a mention, which bypasses the filter — and is the only thing in the feed.
@@ -493,9 +505,6 @@ describe("a running plugin serves its feed", () => {
       sink.write(JSON.stringify(frame) + "\n");
       sink.flush?.();
     };
-    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } } });
-    await until("initialize to be answered", () => out.includes('"id":1'));
-    send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
     send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "reply", arguments: { channel_id: "dev", text: "Please rerun the suite.\nOnly the recovery tests.", type: "task", title: "Monitor suite" } } });
     const f = await nextMessage(frames, "sent-1");
     expect(f).toMatchObject({

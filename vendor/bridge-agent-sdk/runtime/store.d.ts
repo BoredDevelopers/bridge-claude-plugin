@@ -5,7 +5,7 @@
  * implementation of each, for tests AND for an embedder that wants no disk at
  * all (a serverless OpenClaw account, a browser demo).
  */
-import type { EcPrivateJwk, KeyStorage } from "../core";
+import { type EcPrivateJwk, type KeyStorage } from "../core";
 /** What an enrolment (`../core/protocol.ts`'s `EnrolGrant`) actually leaves behind on this machine. */
 export interface Installation {
     installationId: string;
@@ -46,17 +46,26 @@ export interface CredentialStore {
     read(): Promise<CredentialRecord | null>;
     /** Replace the whole credential (a fresh enrolment, or a login that supersedes an old one). */
     write(record: CredentialRecord): Promise<void>;
-    /** RFC-016 §3.3: advance the join-state only — never call this with an OLDER state than
-     * what `read()` last returned (`../core/join-state.ts`'s `joinStateSeq` is how a caller
-     * checks; this port does not re-validate, the same trust boundary `store.writeStateIfNotOlder`
-     * documents in the plugin). */
-    writeJoinState(joinState: string): Promise<void>;
-    /** Delete everything — logout, or a terminal `installation_gone`. */
+    /** RFC-016 §3.3: advance the join-state — "unless the store already holds a higher seq":
+     * a racer past a broken lock may have advanced it further, and going back would present a
+     * stale state next time, which is a LOCK (E6d). Equal seq is the same successor (E6b replay)
+     * and may be rewritten. Returns whether it wrote; `false` means the stored state is NEWER (a
+     * racer's), and the caller carries on — it must never re-write it older. Read-check-write:
+     * callers hold `withLock`. */
+    writeJoinState(joinState: string): Promise<boolean>;
+    /** Delete everything — logout, or a terminal `installation_gone`. Callers hold `withLock`. */
     clear(): Promise<void>;
+    /** RFC-017 D8: the store holds a credential a NEWER build wrote — `read()` answers null for
+     * it, but nothing may be written over it. Optional: a store with no format versioning
+     * (the in-memory one) never has one. */
+    isNewer?(): Promise<boolean>;
     /** E5's write-ahead attempt: created before a mint request leaves the process, read back
      * on the retry after a lost answer, deleted once the new join-state is durable. */
     readAttempt(): Promise<string | null>;
-    writeAttempt(attempt: string): Promise<void>;
+    /** Create the attempt EXCLUSIVELY, or — when one is already there (a racer past a broken
+     * lock, or a lost answer's retry) — return THAT one, so every racer sends the same attempt
+     * and they converge through E6(b). Durable before it resolves. Returns the attempt in effect. */
+    createAttempt(candidate: string): Promise<string>;
     clearAttempt(): Promise<void>;
     /** Serializes every read-modify-write below against this ONE store — the plugin's
      * installation lock, generalised. `signal` aborts once `budgetMs` elapses (default left to
@@ -71,12 +80,17 @@ export interface CredentialStore {
  * The lock is a promise chain: callers queue, never overlap, same observable shape
  * as a real file lock without the file. */
 export declare function memoryCredentialStore(): CredentialStore;
-/** The WS replay cursor (`../core/cursor.ts`), persisted so it survives a restart. */
-export interface CursorStore {
-    read(): Promise<string | null>;
-    write(cursor: string | null): Promise<void>;
+/**
+ * The last frame seq this client has STORED, per session grant (RFC-027 D5) — what the
+ * auth frame's `lastSeq` resumes from. Keyed by grant because seq is the server's resume
+ * buffer for ONE grant: a new grant starts at 0, and an old grant's number means nothing
+ * to it. `load` answers null for a grant it has never seen.
+ */
+export interface SeqStore {
+    load(grantId: string): Promise<number | null>;
+    save(grantId: string, seq: number): Promise<void>;
 }
-export declare function memoryCursorStore(initial?: string | null): CursorStore;
+export declare function memorySeqStore(initial?: Record<string, number>): SeqStore;
 /** Just enough of a lock record to name a holder in a standby status — `Session` never
  * interprets these fields itself, only forwards them (the node `LockRecord` is a superset
  * and satisfies this structurally). */

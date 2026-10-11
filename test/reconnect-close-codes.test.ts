@@ -65,8 +65,9 @@ function startStub(firstClose: Close | null, opts: { channels429?: boolean; clos
           return;
         }
         ws.send(JSON.stringify({
+          v: 2,
           type: "authenticated",
-          data: { agentId: "a", agentName: "A", contextId: "ctx" },
+          payload: { agentId: "a", agentName: "A", contextId: "ctx" },
         }));
       },
     },
@@ -91,10 +92,10 @@ async function withPlugin<T>(
     env: {
       ...process.env,
       CLAUDE_PLUGIN_DATA: dir,
-      BRIDGE_STATE_DIR: dir,
-      BRIDGE_API_URL: `http://127.0.0.1:${stub.port}`,
-      BRIDGE_ENROLMENT_KEY: ENROLMENT_KEY,
-      BRIDGE_AUTOCONNECT: "1",
+      EINWEAVE_STATE_DIR: dir,
+      EINWEAVE_API_URL: `http://127.0.0.1:${stub.port}`,
+      EINWEAVE_ENROLMENT_KEY: ENROLMENT_KEY,
+      EINWEAVE_AUTOCONNECT: "1",
       CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
       CLAUDE_CODE_SSE_PORT: "",
     } as Record<string, string>,
@@ -290,7 +291,7 @@ function startTakeoverThenDropStub() {
           return;
         }
         liveSocket = ws;
-        ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "ctx" } }));
+        ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "ctx" } }));
         onAuthenticated?.();
       },
     },

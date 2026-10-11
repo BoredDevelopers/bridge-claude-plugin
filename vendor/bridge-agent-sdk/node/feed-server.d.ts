@@ -5,7 +5,10 @@ export interface FeedHistoryResult {
     messages: FeedMessage[];
     more: boolean;
 }
-/** Fetches older messages from the Bridge server with the session's own credentials. `signal` aborts on timeout. */
+/**
+ * Fetches older messages from the Bridge server with the session's own credentials. `signal` aborts on timeout.
+ * MUST be side-effect free — no mark-read (the feed's read-only rule, `core/feed.ts` header).
+ */
 export type FeedHistoryHandler = (req: FeedHistoryRequest, signal: AbortSignal) => Promise<FeedHistoryResult>;
 export interface FeedPathOptions {
     stateDir: string;

@@ -18,7 +18,7 @@ test("the vendored SDK carries a clean <semver>+<sha> stamp", () => {
 });
 
 test("the entry points the plugin imports and launches are present", () => {
-  for (const f of ["node.js", "node.d.ts", "core/index.js", "core/index.d.ts", "tail-cli.js"]) {
+  for (const f of ["index.js", "index.d.ts", "node.js", "node.d.ts", "core/index.js", "core/index.d.ts", "tail-cli.js"]) {
     expect(existsSync(join(VENDOR, f)), f).toBe(true);
   }
 });

@@ -7,9 +7,9 @@
  * renewal, `invalidateAccess`, `sessionRevoked`/`installationRevoked`, and the
  * enrolment grants (key / authorization code / device).
  */
-import { type EnrolGrant, type DeviceAuthorization, type Signer } from "../core";
+import { type EnrolGrant, type DeviceAuthorization, type Signer, type EcPrivateJwk } from "../core";
 import type { Runtime } from "./ports";
-import type { CredentialStore } from "./store";
+import type { CredentialStore, Installation } from "./store";
 import { AgentClientError } from "./errors";
 import { Session, type SessionOptions } from "./session";
 import { type Api } from "./api";
@@ -29,6 +29,34 @@ export interface AgentClientOptions {
         discoveryMs?: number;
         mintMs?: number;
         mintBudgetMs?: number;
+    };
+}
+/** Hooks around an enrolment's write (a login that replaces this store's installation). */
+export interface EnrolOptions {
+    /** The new installation is durably written; the previous one is not yet revoked. */
+    onWritten?: () => void | Promise<void>;
+    /** The previous installation could not be revoked: it stays enrolled server-side. */
+    onPreviousRevokeFailed?: (previous: Installation, err: unknown) => void;
+    /**
+     * Installations this enrolment had to give up but could NOT revoke — they STAY enrolled
+     * server-side with no key left here: after a failed write, the new one and/or the previous
+     * one; after a declined or cancelled device approval, the new one. Called before the
+     * enrolment rejects; the caller tells the person where to revoke them.
+     */
+    onUnrevoked?: (left: Array<{
+        installationId: string;
+        installationName?: string;
+    }>) => void;
+}
+/** What a logout did server-side; the store is cleared in every case. */
+export interface LogoutResult {
+    /** What was signed out — null when the store held nothing. */
+    installation: Installation | null;
+    /** `revoked`: nothing is live server-side any more (revoked now, or already gone — expired,
+     * unknown, deactivated). `locked`: it had been LOCKED because a copy of the credential was used
+     * (E8) — tell the person. `skipped`: nothing to revoke, or `revoke: false`. */
+    revoke: "revoked" | "locked" | "skipped" | {
+        failed: string;
     };
 }
 export declare class AgentClient {
@@ -125,9 +153,15 @@ export declare class AgentClient {
      * authenticated with. `"switched"` when the store now holds a DIFFERENT installation
      * (a re-enrolment elsewhere superseded the old one) — nothing is deleted then. */
     installationRevoked(revokedId: string | null): Promise<"switched" | "deleted" | "absent">;
-    /** RFC-016 §3.2 key-credential enrolment (an enrolment key exchanged once). C6: the same
-     * key can never pass twice — one fresh-key retry. */
-    enrolWithKey(enrolmentKey: string, installationName: string): Promise<EnrolGrant>;
+    /**
+     * RFC-016 §3.2 key-credential enrolment (an enrolment key exchanged once) — ONLY when this
+     * store holds no installation; `null` (nothing spent) when it already does. Discovery,
+     * the exchange, the C6 fresh-key retry and the write all run under ONE hold of the
+     * installation lock, re-checked inside it: of several processes starting together (a
+     * headless machine's windows), exactly one spends the key; the rest find its result. An
+     * existing installation is never revoked from here — that is a login's job.
+     */
+    enrolWithKey(enrolmentKey: string, installationName: string, opts?: EnrolOptions): Promise<EnrolGrant | null>;
     /** RFC-016 §3.2 authorization-code enrolment (a browser/PKCE flow) — the loopback
      * listener and the browser launch are the CALLER's (Claude-ism / OpenClaw-ism); this
      * only exchanges the code the caller already collected. */
@@ -135,16 +169,32 @@ export declare class AgentClient {
         code: string;
         verifier: string;
         redirectUri: string;
-    }, installationName: string): Promise<EnrolGrant>;
+    }, installationName: string, opts?: EnrolOptions & {
+        /** The key whose thumbprint the caller put in the authorize URL (`dpop_jkt`): the code
+         * is bound to it (C7), so exchanging it with any other key burns the code. Default:
+         * a fresh key (only for a flow that sent no `dpop_jkt`). */
+        key?: {
+            privateJwk: EcPrivateJwk;
+            signer: Signer;
+        };
+    }): Promise<EnrolGrant>;
     /** RFC 8628 device-code enrolment. Returns the code to show the person and a `complete()`
      * that polls to approval (or expiry/cancel) and, on success, writes the store — the SDK
      * equivalent of the plugin's `startDevice`, minus the terminal prompt. */
-    deviceAuthorization(installationName: string): Promise<{
+    deviceAuthorization(installationName: string, opts?: EnrolOptions & {
+        /** Asked with the approved grant (which agent, which workspace) BEFORE anything is
+         * written: false → the new installation is revoked and `complete()` rejects `declined`.
+         * The person, not the model, decides whether this machine binds to that agent. */
+        confirm?: (grant: EnrolGrant) => Promise<boolean>;
+    }): Promise<{
         auth: DeviceAuthorization;
         complete: (opts?: {
             signal?: AbortSignal;
         }) => Promise<EnrolGrant>;
     }>;
+    /** RFC-017 D8: a newer build's installation can never be replaced from here — refuse BEFORE
+     * the person approves anything or a code is spent (the write would refuse only after). */
+    private refuseOverNewer;
     private discoverOrRefuse;
     /**
      * M3, mirroring the plugin's `completeLogin` choreography (`auth/manager.ts`): under
@@ -163,6 +213,7 @@ export declare class AgentClient {
      * ever silently orphaned (live server-side, unreachable on disk).
      */
     private writeEnrolment;
+    private writeEnrolmentLocked;
     /** `abandonEnrolment`: a grant that never made it to disk — revoke it server-side so it
      * is not left live in Bridge with no local key to use it from. Best-effort; the caller
      * swallows. */
@@ -178,7 +229,7 @@ export declare class AgentClient {
      * store is cleared either way, matching the plugin's "logout always works locally". */
     logout(opts?: {
         revoke?: boolean;
-    }): Promise<void>;
+    }): Promise<LogoutResult>;
     /** One `Session` (one WebSocket) authenticated as this client. */
     session(opts?: SessionOptions): Session;
     /** Stop the refresh ticker — call once before dropping this client. */
