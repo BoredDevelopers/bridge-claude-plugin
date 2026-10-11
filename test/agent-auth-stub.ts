@@ -747,6 +747,11 @@ export function startAuthStub(opts: StubOptions = {}) {
         const origin = `http://127.0.0.1:${server.port}`;
         if (f.type === "auth") {
           core.stats.authTokens.push(f.token);
+          // RFC-027 §5, as the server: a v1 frame (no `v: 2`, or a `since` cursor) is a client too old.
+          if (f.v !== 2 || f.since !== undefined) {
+            core.stats.refusals.push("ws:v1");
+            return core.closeLikeServer(ws, 4008, "client too old: run /plugin update bridge, then /reload-plugins");
+          }
           const forced = core.takeForcedAuthClose();
           if (forced) {
             core.stats.refusals.push(`ws:forced ${forced.code}`);

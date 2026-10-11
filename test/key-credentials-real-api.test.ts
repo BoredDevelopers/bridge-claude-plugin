@@ -93,6 +93,8 @@ async function pgReachable(): Promise<boolean> {
 const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
 const SERVER_TS = join(import.meta.dir, "..", "server.ts");
 const SEED_TS = join(import.meta.dir, "fixtures", "real-api-seed.ts");
+/** A build one patch above this one — admitted by the server's minimum, unlike anything older. */
+const NEWER_VERSION = PLUGIN_VERSION.replace(/(\d+)$/, (n) => String(Number(n) + 1));
 const AUTH_SECRET = "test-secret-at-least-32-characters-long";
 const GRANT_EK = "urn:bridge:params:oauth:grant-type:enrolment-key";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -103,7 +105,7 @@ let dbName = "";
 let dbUrl = "";
 let admin: InstanceType<typeof Bun.SQL> | null = null;
 let sql: InstanceType<typeof Bun.SQL> | null = null;
-let seed: { cookie: string; userId: string; sessionId: string; keys: string[] } = { cookie: "", userId: "", sessionId: "", keys: [] };
+let seed: { cookie: string; userId: string; sessionId: string; agentId: string; tenantId: string; keys: string[] } = { cookie: "", userId: "", sessionId: "", agentId: "", tenantId: "", keys: [] };
 let keyTurn = 0;
 /** An enrolment key for agent `me` (50 uses each, minted by the API's credential module). */
 const enrolmentKey = () => seed.keys[keyTurn++ % seed.keys.length]!;
@@ -445,7 +447,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   const wsProof = (token: string, htu = wsHtu(base)) => dpopProof(k1.signer, clock, { htm: "GET", htu, accessToken: token });
   const errors = (s: Sock) => s.frames.filter((f) => f.type === "error").map((f) => f.data?.message ?? f.message ?? null);
   const s1 = await openSocket(base);
-  s1.send({ type: "auth", token: at, dpop: await wsProof(at) });
+  s1.send({ type: "auth", v: 2, token: at, dpop: await wsProof(at) });
   await s1.wait(() => s1.frames.some((f) => f.type === "authenticated") || s1.closed() !== null);
   out.ws_auth = { authenticated: s1.frames.some((f) => f.type === "authenticated"), closed: s1.closed() };
   const m3 = await mint({ state: S2 });
@@ -454,17 +456,22 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   await s1.wait(() => s1.frames.some((f) => f.type === "reauthenticated") || s1.closed() !== null);
   out.ws_reauth = { reauthenticated: s1.frames.some((f) => f.type === "reauthenticated"), closed: s1.closed() };
   for (const [name, frame] of [
-    ["ws_auth_no_proof", { type: "auth", token: m3.json.access_token }],
-    ["ws_auth_wrong_htu", { type: "auth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) }],
-    ["ws_auth_http_proof", { type: "auth", token: m3.json.access_token, dpop: await resProof("GET", "/api/channels", m3.json.access_token) }],
+    ["ws_auth_no_proof", { type: "auth", v: 2, token: m3.json.access_token }],
+    ["ws_auth_wrong_htu", { type: "auth", v: 2, token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) }],
+    ["ws_auth_http_proof", { type: "auth", v: 2, token: m3.json.access_token, dpop: await resProof("GET", "/api/channels", m3.json.access_token) }],
+    // RFC-027 §5: a v1 frame (no `v`) is refused as a client too old — the cutover's one gate.
+    ["ws_auth_v1", { type: "auth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) }],
   ] as const) {
     const s = await openSocket(base);
     s.send(frame);
     await s.wait(() => s.closed() !== null);
     out[name] = { errors: errors(s), closed: s.closed() };
   }
+  // RFC-027: one socket per session grant — s1 goes first, or s2 is refused "session already connected".
+  s1.close();
+  await s1.wait(() => s1.closed() !== null);
   const s2 = await openSocket(base);
-  s2.send({ type: "auth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) });
+  s2.send({ type: "auth", v: 2, token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) });
   await s2.wait(() => s2.frames.some((f) => f.type === "authenticated") || s2.closed() !== null);
   s2.send({ type: "reauth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) });
   await s2.wait(() => s2.closed() !== null);
@@ -501,7 +508,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
 
   // ── a copy: a stale state LOCKS (E6d/E8) ──
   const s3 = await openSocket(base);
-  s3.send({ type: "auth", token: after.json.access_token, dpop: await wsProof(after.json.access_token) });
+  s3.send({ type: "auth", v: 2, token: after.json.access_token, dpop: await wsProof(after.json.access_token) });
   await s3.wait(() => s3.frames.some((f) => f.type === "authenticated") || s3.closed() !== null);
   out.mint_stale_state_locks = oauth(await mint({ state: S1 }));
   await s3.wait(() => s3.closed() !== null);
@@ -661,7 +668,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       const az = await fetch(authorizeUrl!, { redirect: "manual" });
       expect(az.status).toBe(302);
       const requestId = new URL(az.headers.get("location")!).pathname.split("/").pop()!;
-      const ap = await human(api.url, "POST", `/api/agent-auth/requests/${requestId}/approve`, { agentId: "me" });
+      const ap = await human(api.url, "POST", `/api/agent-auth/requests/${requestId}/approve`, { agentId: seed.agentId });
       expect(ap.status).toBe(200);
       const back = ((await ap.json()) as any).redirect as string;
       expect(back.startsWith("http://127.0.0.1:")).toBe(true);
@@ -693,7 +700,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       const look = await human(api.url, "POST", "/api/agent-auth/device/lookup", { user_code: userCode });
       expect(look.status).toBe(200);
       const { requestId } = (await look.json()) as any;
-      const ap = await human(api.url, "POST", `/api/agent-auth/requests/${requestId}/approve`, { agentId: "me" });
+      const ap = await human(api.url, "POST", `/api/agent-auth/requests/${requestId}/approve`, { agentId: seed.agentId });
       expect(ap.status).toBe(200);
       // RFC 8628 interval: the server says 5 s.
       expect(await until(p.connected, 30_000), p.stderr()).toBe(true);
@@ -823,7 +830,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       expect(await until(p.connected, 20_000), p.stderr()).toBe(true);
       const inst = readInstallation(dir)!.installationId;
       const [s] = await sessionsOf(inst, "revoke-s1");
-      const del = await human(api.url, "DELETE", `/api/agents/me/installations/${inst}/sessions/${s.id}`);
+      const del = await human(api.url, "DELETE", `/api/agents/${seed.agentId}/installations/${inst}/sessions/${s.id}`);
       expect(del.status).toBe(200);
       expect(await until(() => p.stderr().includes("WebSocket closed (4008 session revoked)"), 10_000), p.stderr()).toBe(true);
       expect(await until(() => p.notices.some((n) => n.includes("/bridge:connect")), 10_000), JSON.stringify(p.notices)).toBe(true);
@@ -904,7 +911,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       expect(row.revoke_reason).toBe("client_revoked");
       expect(Number(row.js_seq)).toBe(seqBefore);
       expect(existsSync(join(dir, "key.json"))).toBe(false);
-      const list = (await (await human(api.url, "GET", "/api/agents/me/installations")).json()) as any;
+      const list = (await (await human(api.url, "GET", `/api/agents/${seed.agentId}/installations`)).json()) as any;
       expect(list.installations.map((i: any) => i.id)).not.toContain(inst);
       expect(await until(async () => !(await p.connected()), 10_000)).toBe(true);
     } finally {
@@ -927,15 +934,14 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
     }
   });
 
-  test("RFC-017 D3/S6: supersede — two processes on ONE session, the older (0.25.0) is superseded by the newer, exactly one session grant and one context survive", async () => {
+  test("RFC-017 D3/S6: supersede — two processes on ONE session, the older is superseded by the newer, exactly one session grant and one context survive", async () => {
     const dir = tmp("keys-real-supersede-");
     const p1 = await plugin(api.url, dir, {
       EINWEAVE_ENROLMENT_KEY: enrolmentKey(),
       EINWEAVE_SESSION_KEY: "supersede-s1",
-      // A same-codebase stand-in for a 0.25 sibling (see PLUGIN_VERSION's own
-      // EINWEAVE_TEST_PLUGIN_VERSION comment) — the newer (this build's real
-      // version) must win the local lock and send `supersede: true`.
-      EINWEAVE_TEST_PLUGIN_VERSION: "0.25.0",
+      // This build is the OLDER: the server's minimum (0.30.0, RFC-027 §5) admits nothing
+      // below it, so the newer is a same-codebase stand-in (EINWEAVE_TEST_PLUGIN_VERSION) —
+      // it must win the local lock and send `supersede: true`.
     });
     let p2: Plugin | null = null;
     try {
@@ -951,7 +957,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       // A second window of the SAME Claude Code session (`claude -c`): same
       // machine, same session key, same installation on disk — no enrolment
       // key needed — running this build's TRUE (newer) version.
-      p2 = await plugin(api.url, dir, { EINWEAVE_SESSION_KEY: "supersede-s1" });
+      p2 = await plugin(api.url, dir, { EINWEAVE_SESSION_KEY: "supersede-s1", EINWEAVE_TEST_PLUGIN_VERSION: NEWER_VERSION });
       expect(await until(p2.connected, 20_000), p2.stderr()).toBe(true);
 
       // The older is told and stops — and does not auto-reconnect (D3).
@@ -982,12 +988,12 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
     const blocked = await startApi({ EINWEAVE_TEST_BLOCKED_VERSIONS: PLUGIN_VERSION });
     const dir = tmp("keys-real-blocked-");
     try {
-      // Enrol as an older, unblocked build first — real files on disk, exactly as
-      // a machine that installed 0.25 and has been running fine ever since.
+      // Enrol as another, unblocked build first — real files on disk, exactly as a
+      // machine that has been running fine until this build was blocked.
       const p1 = await plugin(blocked.url, dir, {
         EINWEAVE_ENROLMENT_KEY: enrolmentKey(),
         EINWEAVE_SESSION_KEY: "blocked-s1",
-        EINWEAVE_TEST_PLUGIN_VERSION: "0.25.0",
+        EINWEAVE_TEST_PLUGIN_VERSION: NEWER_VERSION,
       });
       try {
         expect(await until(p1.connected, 20_000), p1.stderr()).toBe(true);
