@@ -44,6 +44,16 @@ export type SessionClient = Pick<AgentClient, "apiUrl" | "sessionKey" | "softwar
         readonly deliveries: Pick<Api["deliveries"], "list">;
     };
 };
+/** The server's `receipt` frame payload (api ws.ts `broadcastReceiptEvent`). */
+export interface ReceiptEvent {
+    messageId: string;
+    agentId: string;
+    contextId: string;
+    contextLabel: string | null;
+    state: string;
+    firstSeen?: boolean;
+    at?: string;
+}
 export type StopKind = "superseded" | "too-old" | "revoked" | "session-in-use" | "credential" | "drain";
 /** Why this `Session` will never reconnect again. `close` is present for the WS-close stop
  * classes (superseded / too-old / revoked / session-in-use); `credential` for a terminal
@@ -84,6 +94,16 @@ export type SessionStatus = {
  | {
     kind: "invalid_session";
     lost: InvalidSessionPayload["lost"];
+}
+/** A receipt for a message this agent sent (✓ sent / ✓✓ seen) — display-only, never an entry. */
+ | {
+    kind: "receipt";
+    receipt: ReceiptEvent;
+}
+/** A server `error` frame. Most precede a close (`closed` follows); the rest are only said here. */
+ | {
+    kind: "server_error";
+    message: string;
 }
 /** The host stopped taking entries; this one was dropped here and stays owed by the server. */
  | {

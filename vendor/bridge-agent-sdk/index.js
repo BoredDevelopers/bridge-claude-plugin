@@ -690,6 +690,14 @@ class Session {
         this.scheduleReconnect(true);
         return;
       }
+      case "receipt":
+        if (typeof p.messageId === "string" && typeof p.state === "string")
+          this.emitStatus({ kind: "receipt", receipt: p });
+        return;
+      case "error":
+        if (typeof p.message === "string" && p.message)
+          this.emitStatus({ kind: "server_error", message: p.message });
+        return;
       default:
         return;
     }
