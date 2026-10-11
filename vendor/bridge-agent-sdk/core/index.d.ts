@@ -7,7 +7,7 @@
  * SOURCE: plugin c8b0db6 `auth/core/index.ts`. Everything from the marker below is
  * BYTE-IDENTICAL to that file (test/byte-identity.test.ts, fixtures/plugin-core/index.ts)
  * — the new SDK-only modules (reconnect-policy, lock-decision, format-guard, software,
- * wire, dedupe, cursor, control-chars, feed, tail-render, tail-state) are re-exported ABOVE the marker instead of interleaved, so the
+ * wire, dedupe, control-chars, feed, tail-render, tail-state) are re-exported ABOVE the marker instead of interleaved, so the
  * guarded region matches the plugin file exactly.
  */
 export * from "./reconnect-policy";
@@ -16,7 +16,6 @@ export * from "./format-guard";
 export * from "./software";
 export * from "./wire";
 export * from "./dedupe";
-export * from "./cursor";
 export * from "./control-chars";
 export * from "./feed";
 export * from "./tail-render";

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import {
   tailMain
-} from "./index-sj1dj0nx.js";
+} from "./index-vp9k7kmc.js";
 import"./index-0nd9zcgb.js";
-import"./index-h8ffc6pv.js";
+import"./index-c3kvp3qz.js";
 
 // src/tail-cli.ts
 process.exitCode = await tailMain(process.argv.slice(2));

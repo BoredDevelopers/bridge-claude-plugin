@@ -71,12 +71,17 @@ export interface CredentialStore {
  * The lock is a promise chain: callers queue, never overlap, same observable shape
  * as a real file lock without the file. */
 export declare function memoryCredentialStore(): CredentialStore;
-/** The WS replay cursor (`../core/cursor.ts`), persisted so it survives a restart. */
-export interface CursorStore {
-    read(): Promise<string | null>;
-    write(cursor: string | null): Promise<void>;
+/**
+ * The last frame seq this client has STORED, per session grant (RFC-027 D5) — what the
+ * auth frame's `lastSeq` resumes from. Keyed by grant because seq is the server's resume
+ * buffer for ONE grant: a new grant starts at 0, and an old grant's number means nothing
+ * to it. `load` answers null for a grant it has never seen.
+ */
+export interface SeqStore {
+    load(grantId: string): Promise<number | null>;
+    save(grantId: string, seq: number): Promise<void>;
 }
-export declare function memoryCursorStore(initial?: string | null): CursorStore;
+export declare function memorySeqStore(initial?: Record<string, number>): SeqStore;
 /** Just enough of a lock record to name a holder in a standby status — `Session` never
  * interprets these fields itself, only forwards them (the node `LockRecord` is a superset
  * and satisfies this structurally). */

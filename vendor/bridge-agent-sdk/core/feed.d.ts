@@ -89,9 +89,12 @@ export interface FeedHistoryRequest {
 export type FeedEvent = FeedMessage | FeedStatus;
 export type FeedServerFrame = FeedHello | FeedMessage | FeedStatus | FeedReplayed | FeedBinding | FeedHistory | FeedErrorFrame;
 export type FeedClientFrame = FeedSubscribe | FeedHistoryRequest;
-/** Every server-to-client `t`, and every client-to-server one — the fixture test keys on these. */
+/**
+ * Every server-to-client `t` — the fixture test keys on these. The client-to-server list,
+ * `FEED_CLIENT_FRAME_KINDS`, is DERIVED from the parser's own table further down, so it
+ * cannot drift from what a client can actually send.
+ */
 export declare const FEED_SERVER_FRAME_KINDS: readonly ["hello", "message", "status", "replayed", "binding", "history", "error"];
-export declare const FEED_CLIENT_FRAME_KINDS: readonly ["subscribe", "history"];
 export type FeedErrorCode = 
 /** The preferred or fallback socket directory is not private to this user. */
 "unsafe_dir"
@@ -159,6 +162,8 @@ export type ParseResult<F> = {
     kind: "error";
     message: string;
 };
+/** Every client-to-server `t`: read-only kinds ONLY — see the header before adding one. */
+export declare const FEED_CLIENT_FRAME_KINDS: readonly FeedClientFrame["t"][];
 /** Validate a decoded JSON value as a server frame. Strips every string. Never throws. */
 export declare function parseServerFrame(value: unknown): ParseResult<FeedServerFrame>;
 /** Validate a decoded JSON value as a client frame. Never throws. */

@@ -9,8 +9,10 @@ import {
   procStartMatches,
   procStartOf,
   runTail,
+  tailEnter,
+  tailLeave,
   tailMain
-} from "./index-sj1dj0nx.js";
+} from "./index-vp9k7kmc.js";
 import"./index-0nd9zcgb.js";
 import {
   FEED_PROTOCOL_VERSION,
@@ -28,7 +30,7 @@ import {
   isP256PrivateJwk,
   parseClientFrame,
   randomB64url
-} from "./index-h8ffc6pv.js";
+} from "./index-c3kvp3qz.js";
 
 // src/node/store.ts
 import { readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
@@ -297,7 +299,6 @@ var installationFile = (dir) => join2(dir, "installation.json");
 var keyFile = (dir) => join2(dir, "key.json");
 var stateFile = (dir) => join2(dir, "state");
 var attemptFile = (dir) => join2(dir, "attempt");
-var cursorFile = (dir) => join2(dir, "cursor");
 function readText(path) {
   try {
     return readFileSync3(path, "utf8");
@@ -397,25 +398,25 @@ function fileStore(dir) {
     }
   };
 }
-function fileCursorStore(dir) {
-  const path = cursorFile(dir);
+var GRANT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+function fileSeqStore(dir) {
   return {
-    async read() {
-      const t = readText(path)?.trim() ?? "";
-      return t.length > 0 ? t : null;
+    async load(grantId) {
+      if (!GRANT_ID.test(grantId))
+        return null;
+      const n = Number((readText(join2(dir, grantId)) ?? "").trim());
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
     },
-    async write(cursor) {
-      if (cursor === null) {
-        removeQuiet(path);
+    async save(grantId, seq) {
+      if (!GRANT_ID.test(grantId) || !Number.isSafeInteger(seq) || seq < 0)
         return;
-      }
-      writeAtomic(path, cursor + `
+      writeAtomic(join2(dir, grantId), `${seq}
 `);
     }
   };
 }
 function sweepOrphanTemps(dir, minAgeMs = 60000) {
-  const OWN_TMP = /^(key\.json|state|installation\.json|attempt|cursor)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
+  const OWN_TMP = /^(key\.json|state|installation\.json|attempt)\.\d+\.\d+\.[A-Za-z0-9_-]+\.tmp$/;
   let n = 0;
   let names;
   try {
@@ -906,7 +907,7 @@ export {
   TAIL_USAGE,
   feedClient,
   feedServer,
-  fileCursorStore,
+  fileSeqStore,
   fileStore,
   hostname,
   legacyProcStartOf,
@@ -920,6 +921,8 @@ export {
   sessionLock,
   sweepLockTombstones,
   sweepOrphanTemps,
+  tailEnter,
+  tailLeave,
   tailMain,
   withInstallationLock
 };
