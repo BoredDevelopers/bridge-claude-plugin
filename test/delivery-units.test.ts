@@ -9,6 +9,7 @@ import { deliveredEntryId } from "../delivery/tags";
 import { MissedTracker, GRACE_MS } from "../delivery/missed";
 import { missedNotice, MAX_LISTED, type NoticeEntry } from "../delivery/notice";
 import { parseCtlRequest, MAX_REQUEST_BYTES } from "../delivery/ctl-protocol";
+import { deliveryState, CHANNELS_LAUNCH } from "../delivery/state";
 
 const ID = "01992f6e-7c1a-7b2e-9f00-1a2b3c4d5e6f";
 const CH = "01992f6e-0000-7000-8000-000000000001";
@@ -183,5 +184,32 @@ describe("parseCtlRequest", () => {
     ]) {
       expect(parseCtlRequest(bad)).toBeNull();
     }
+  });
+});
+
+describe("deliveryState (status, RFC-027 D7)", () => {
+  const base = { ctl: true, pushed: 3, missed: 0, confirmed: 1, lastHookAt: 1 };
+  test("each state, in precedence order", () => {
+    expect(deliveryState({ ...base, ctl: false }).state).toBe("hooks not reporting");
+    expect(deliveryState({ ...base, pushed: 0 }).state).toBe("idle");
+    expect(deliveryState({ ...base, missed: 1 })).toEqual({ state: "unconfirmed", hint: expect.stringContaining(CHANNELS_LAUNCH) });
+    expect(deliveryState(base).state).toBe("confirmed");
+    expect(deliveryState({ ...base, confirmed: 0, lastHookAt: null }).state).toBe("hooks not reporting");
+    expect(deliveryState({ ...base, confirmed: 0 }).state).toBe("awaiting confirmation");
+  });
+
+  test("a missed entry outranks earlier confirmations — one missed means channels are off now", () => {
+    expect(deliveryState({ ...base, confirmed: 9, missed: 1 }).state).toBe("unconfirmed");
+  });
+});
+
+describe("MissedTracker.missed — read-only", () => {
+  test("counts noticed entries still pending, and does not notice anything itself", () => {
+    const t = new MissedTracker<{ id: string }>();
+    t.pushed("a", 0);
+    expect(t.missed([{ id: "a" }])).toBe(0); // status never decides "missed"
+    expect(t.prompt([{ id: "a" }], 5000).fresh.map((e) => e.id)).toEqual(["a"]);
+    expect(t.missed([{ id: "a" }])).toBe(1);
+    expect(t.missed([])).toBe(0);
   });
 });

@@ -65,6 +65,7 @@ import { MissedTracker } from "./delivery/missed";
 import { startCtlServer, sweepStaleCtlSockets, type CtlServer } from "./delivery/ctl-server";
 import { ctlSocketPath } from "./delivery/ctl-path";
 import type { NoticeEntry } from "./delivery/notice";
+import { deliveryState } from "./delivery/state";
 import { localIso } from "./local-time";
 import { sanitizeChannelParams } from "./control-chars";
 import { startFeedTap, sweepStaleFeedSockets, writeLauncher, launcherPath, type FeedTap } from "./feed-tap";
@@ -1074,6 +1075,24 @@ function connectionStatus(): Record<string, unknown> {
     ...(lastServerError ? { last_server_error: lastServerError } : {}),
     ...(holder ? { holder } : {}),
     ...(lastInvalidSession ? { last_invalid_session: lastInvalidSession } : {}),
+    ...(session?.stopReason() ? { stop_reason: session.stopReason()!.kind } : {}),
+    delivery: deliveryStatus(),
+  };
+}
+
+/** RFC-027 D7: did what this session was handed reach the model? (delivery/state.ts) */
+function deliveryStatus(): Record<string, unknown> {
+  const pending = session?.pending.list() ?? [];
+  const stats = ctl?.stats() ?? null;
+  const missed = tracker.missed(pending);
+  const { state, hint } = deliveryState({ ctl: !!ctl, pushed: pushedCount, missed, confirmed: stats?.confirmed ?? 0, lastHookAt: stats?.lastHookAt ?? null });
+  return {
+    state,
+    pending: pending.length,
+    missed,
+    confirmed: stats?.confirmed ?? 0,
+    last_hook_at: stats?.lastHookAt ? localIso(stats.lastHookAt) : null,
+    ...(hint ? { hint } : {}),
   };
 }
 
@@ -1163,6 +1182,8 @@ const rt = (() => {
 const seqStore = fileSeqStore(join(STATE_DIR, "seq"));
 /** Entries pushed but not confirmed, for the missed notice (delivery/missed.ts). */
 const tracker = new MissedTracker<PendingEntry>();
+/** Entries handed to the host in this process — `status`'s "idle" until the first. */
+let pushedCount = 0;
 /** Built once SESSION_KEY is settled (boot, below). */
 let linkClient: ReturnType<typeof sessionClient> | null = null;
 let session: Session | null = null;
@@ -1199,6 +1220,7 @@ const adapter = channelAdapter({
   isOwnSend: (id) => ownSentIds.has(id),
   dismiss: (id) => session?.ack([id], "dismissed"),
   pushed: (entry: Entry) => {
+    pushedCount++;
     tracker.pushed(entry.id, Date.now());
     // RFC-022 D8: the feed gets exactly what the host was handed, once it accepted it.
     if (entry.kind === "message") {

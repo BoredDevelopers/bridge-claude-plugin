@@ -54,6 +54,11 @@ export class MissedTracker<T extends { id: string }> {
     this.noticed.delete(id);
   }
 
+  /** Read-only, for `status`: entries a prompt found missed that are still pending. */
+  missed(pending: readonly T[]): number {
+    return pending.filter((e) => this.noticed.has(e.id)).length;
+  }
+
   stopped(at: number): void {
     this.inTurn = false;
     this.lastStopAt = at;
