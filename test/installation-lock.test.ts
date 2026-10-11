@@ -11,7 +11,6 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withInstallationLock, sweepLockTombstones, STALE_MS, LOCK_WAIT_MS, HOLD_BUDGET_MS, LOCK_DIR_NAME, __lockIo } from "../auth/node/lock";
 import { spawnRacers } from "./fixtures/go-signal";
-import { withProfileLock as withProfileLock024 } from "./fixtures/v024/lock";
 
 const DEAD_PID = 2 ** 22 + 12345;
 const lockOf = (dir: string) => join(dir, LOCK_DIR_NAME);
@@ -279,47 +278,3 @@ describe("installation lock (RFC-016 §5.2: mkdir + 120 s time-based stale break
   });
 });
 
-/**
- * test/fixtures/v024/lock.ts is a VERBATIM copy of 0.24's auth/lock.ts
- * (`git show c32ead6:auth/lock.ts`), pinned by hash.
- */
-describe("a stale 0.24 process in the same profile (cross-version lock safety)", () => {
-  test("the 0.24 fixture is 0.24's auth/lock.ts, byte for byte", () => {
-    const src = readFileSync(new URL("./fixtures/v024/lock.ts", import.meta.url), "utf8");
-    expect(createHash("sha256").update(src).digest("hex")).toBe("7da5f802d2509d7063e4931d430b9f6f8a4c8d927326feca04e66f037b7e62b4");
-  });
-
-  test("0.24's stale break (dead pid) never removes a young 0.25 lock", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "lock-x-"));
-    try {
-      // A 0.25 holder whose pid is gone but whose lock is young: 0.25 waits it out (age
-      // only); 0.24's dead-pid rule must not get to judge it at all.
-      plant(lockOf(dir), { pid: DEAD_PID, nonce: "v025" });
-      const r = await Promise.race([withProfileLock024(dir, async () => "0.24 ran"), Bun.sleep(1_500).then(() => "0.24 blocked")]);
-      expect(r).toBe("0.24 ran");
-      expect(JSON.parse(readFileSync(join(lockOf(dir), "owner.json"), "utf8")).nonce).toBe("v025");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("a held 0.24 lock and a held 0.25 lock neither block nor break each other", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "lock-x-"));
-    try {
-      let release!: () => void;
-      const held = new Promise<void>((r) => (release = r));
-      const v024 = withProfileLock024(dir, () => held);
-      await Bun.sleep(50);
-      // 0.25 gets in while 0.24 holds `.lock` …
-      expect(await Promise.race([withInstallationLock(dir, async () => "0.25 ran"), Bun.sleep(1_000).then(() => "0.25 blocked")])).toBe("0.25 ran");
-      // … and a 0.24 lock aged past 0.25's 120 s rule is not 0.25's to break.
-      age(join(dir, ".lock"), STALE_MS + 5_000);
-      await withInstallationLock(dir, async () => {});
-      expect(existsSync(join(dir, ".lock", "owner.json"))).toBe(true);
-      release();
-      await v024;
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});

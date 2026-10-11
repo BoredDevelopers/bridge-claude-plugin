@@ -379,8 +379,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
   }, 30_000);
 
   test("a missing holder version (a 0.25-shaped record, no `version` field at all) counts as 0.25 — older than this build, so it is TAKEN OVER", async () => {
-    // Byte-for-byte the v025 lock shape (test/fixtures/v025/locks): pid, procStart,
-    // sessionKey, at — nothing else. D3: "a missing version counts as 0.25 or older."
+    // The 0.25 lock shape: pid, procStart, sessionKey, at — nothing else. D3: "a missing version counts as 0.25 or older."
     // This build is 0.26.0 (P9's bump), so omitting the field reads as strictly
     // OLDER, not equal — the auto path takes over, same as C1's explicit "0.1.0"
     // above. This one pins that OMITTING the field entirely is read the same way

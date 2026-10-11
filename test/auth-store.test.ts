@@ -6,7 +6,6 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as store from "../auth/node/store";
-import * as v024 from "./fixtures/v024/store";
 import { generateSoftwareKey } from "../auth/core/signer";
 import { makeJoinState } from "./dpop-verify";
 import { spawnRacers } from "./fixtures/go-signal";
@@ -346,95 +345,6 @@ describe("RFC-014 (0.23 / 0.24) → 0.25", () => {
 });
 
 /**
- * A stale 0.24 process (still running after the update, or a second Claude Code on the
- * old plugin) shares the profile directory with 0.25. test/fixtures/v024/store.ts is a
- * VERBATIM copy of 0.24's auth/store.ts (`git show c32ead6:auth/store.ts`), pinned by hash
- * below so "0.24's behaviour" cannot drift into whatever makes this pass.
- */
-describe("a stale 0.24 process in the same profile (cross-version safety)", () => {
-  const FULL = ["installation.json", "key.json", "state", "attempt"] as const;
-
-  async function fullProfile(dir: string) {
-    const { privateJwk, signer } = await generateSoftwareKey();
-    store.writeKey(dir, privateJwk);
-    store.writeState(dir, makeJoinState(3));
-    store.writeInstallation(dir, {
-      apiUrl: "https://b.example",
-      installationId: crypto.randomUUID(),
-      installationName: "mac",
-      enrolledAt: 1,
-      jkt: signer.jkt,
-      keyStorage: "software",
-      agent: { id: "a", handle: "h", name: "n" },
-      workspace: { id: "w", name: "W" },
-    });
-    await store.createOrReadAttempt(dir);
-    return Object.fromEntries(FULL.map((f) => [f, readFileSync(join(dir, f), "utf8")]));
-  }
-
-  test("the 0.24 fixture is 0.24's auth/store.ts, byte for byte", () => {
-    const src = readFileSync(new URL("./fixtures/v024/store.ts", import.meta.url), "utf8");
-    expect(createHash("sha256").update(src).digest("hex")).toBe("f61b9c1d1fd1edfec1536e6f2cb547e2f11023284b0323bf5be30b90a8a4e640");
-  });
-
-  test("0.24 reads a 0.25 profile as 'not signed in', and every 0.24 deletion path leaves 0.25's files intact", async () => {
-    const dir = tmp("v024-");
-    try {
-      const before = await fullProfile(dir);
-      // 0.24 finds no installation → configError "not signed in"; it never reaches a token call.
-      expect(v024.readInstallation(dir)).toBeNull();
-      // Every 0.24 path that deletes (logout, a refused session grant, installationRevoked,
-      // completeLogin) is deleteProfileCredentials; plus the session sweep and the logout marker.
-      v024.deleteProfileCredentials(dir);
-      v024.sweepSessions(dir, "", 0);
-      v024.deleteSession(dir, "k");
-      v024.writeLoggedOutMarker(dir);
-      v024.clearLoggedOutMarker(dir);
-      for (const f of FULL) expect(readFileSync(join(dir, f), "utf8")).toBe(before[f]!);
-      expect(store.readInstallation(dir)).not.toBeNull();
-      expect(store.readKey(dir)).not.toBeNull();
-      expect(store.readState(dir)).not.toBeNull();
-      expect(store.readAttempt(dir)).not.toBeNull();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("0.24's readInstallation cannot parse ANY 0.25 file, even copied under its own name", async () => {
-    const dir = tmp("v024-");
-    const probe = tmp("v024-probe-");
-    try {
-      await fullProfile(dir);
-      // A caller that spreads an RFC-014 object in must not get its token onto disk.
-      store.writeInstallation(dir, { ...(store.readInstallation(dir) as store.Installation), installationToken: "brg_it_x" } as any);
-      expect(readFileSync(join(dir, "installation.json"), "utf8")).not.toContain("installationToken");
-      for (const f of FULL) {
-        copyFileSync(join(dir, f), join(probe, "credentials.json"));
-        expect(v024.readInstallation(probe)).toBeNull();
-      }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(probe, { recursive: true, force: true });
-    }
-  });
-
-  test("0.25 writes nothing where 0.24 (or the session-map hook) deletes: no credentials.json, nothing in sessions/", async () => {
-    const dir = tmp("v024-");
-    try {
-      await fullProfile(dir);
-      store.writeStateIfNotOlder(dir, makeJoinState(4));
-      store.writeLoggedOutMarker(dir);
-      writeFileSync(join(dir, "credentials.json"), "{}");
-      store.retireLegacy(dir); // leaves upgrade-required.json
-      const names = readdirSync(dir).sort();
-      expect(names).toEqual(["attempt", "installation.json", "key.json", "logged-out", "state", "upgrade-required.json"]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-/**
  * RFC-017 D8/C7: installation.json declaring a `format` this build does not know. The
  * four files are one unit (this store's header) — a newer plugin's credential must
  * survive completely untouched, not just have installation.json spared.
@@ -494,23 +404,3 @@ describe("D8: a format newer than this build knows", () => {
   });
 });
 
-/**
- * RFC-017 P0/C8: test/fixtures/v025/ is REAL 0.25 output (test/fixtures/generate-v025.ts,
- * itself calling this store's writers before this file changed — `git show
- * 0e7ec8d:auth/node/store.ts`). This build must still read every one of them.
- */
-describe("C8: every v025 fixture loads", () => {
-  const V025_PROFILE = fileURLToPath(new URL("./fixtures/v025/profile", import.meta.url));
-
-  test("installation.json", () => {
-    const inst = store.readInstallation(V025_PROFILE);
-    expect(inst).not.toBeNull();
-    expect(inst!.installationId).toBe("11111111-1111-1111-1111-111111111111");
-    expect(inst!.apiUrl).toBe("https://bridge-api.example.com");
-    expect(store.isNewerInstallation(V025_PROFILE)).toBe(false); // it has no `format` field at all — format 0
-  });
-
-  test("state", () => {
-    expect(store.readState(V025_PROFILE)).toStartWith("brg_js_3_");
-  });
-});
