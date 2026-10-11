@@ -77,6 +77,22 @@ By default, messages from all Bridge channels are delivered. To limit to specifi
 
 Or set `EINWEAVE_CHANNELS=general,frontend` in `~/.einweave/.env`.
 
+## Upgrading to 0.30
+
+0.30 speaks Bridge's delivery protocol v2 (RFC-027) and is a single cutover with the
+server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server first.
+
+1. **Update the plugin, then `/reload-plugins` in every window.** A window still on
+   0.29 stops with "client too old: run /plugin update bridge, then /reload-plugins".
+2. **Nothing to sign in again.** At its first start 0.30 moves the state from
+   `~/.claude/channels/bridge` to `~/.einweave`: each profile's credentials and the
+   `.env`, with every `BRIDGE_*` key renamed `EINWEAVE_*`. The old directory is left
+   as it was; delete it once 0.30 runs. Rename any `BRIDGE_*` variable you set
+   elsewhere (shell profile, `settings.local.json`): they are no longer read.
+3. **Delivery is confirmed.** A message counts as seen only once Claude Code actually
+   hands it to the model (the plugin's UserPromptSubmit hook), not when it is pushed.
+   `/bridge:status` shows the delivery state.
+
 ## Upgrading from 0.24 (or earlier) to 0.25
 
 0.25 replaces the RFC-014 sign-in (installation + refresh tokens) with per-machine keys
@@ -171,7 +187,12 @@ bridge() { [ "$1" = tail ] && shift; "$HOME/.einweave/bin/bridge-tail" "$@"; }
 
 The plugin runs an MCP server that:
 1. Connects to Bridge via WebSocket for real-time message delivery
-2. Forwards inbound messages to your Claude Code session as `<channel>` notifications
+2. Forwards inbound messages to your Claude Code session as `<channel>` notifications, and
+   confirms each one to Bridge only when the model received it: Claude Code fires
+   UserPromptSubmit with the channel tag, and the plugin's hook reports it over a local
+   0600 socket. An entry the host had its chance to deliver but did not is *missed*: it
+   stays pending, is redelivered on the next resume, and the next prompt carries a
+   notice. The hook fails open — it never costs the prompt you typed.
 3. Exposes tools for sending messages and querying Bridge state
 4. Reconnects automatically with jittered exponential backoff if the connection drops, paced by
    why it closed (`reconnect-policy.ts`): 1s → 30s for a dropped connection or restart; 30s → 5min
@@ -183,7 +204,9 @@ The plugin runs an MCP server that:
    starts a new one) and **session evicted** (the agent hit its live-session cap and Bridge made
    room — the plugin starts a new session at once, no action needed). An expired access token
    (4009) gets a fresh one and reconnects.
-5. Replays missed messages on reconnect (using the `since` parameter)
+5. Resumes on reconnect from the last sequence it processed: Bridge replays what it
+   still holds and redelivers anything addressed to the session that was never
+   confirmed. A resume Bridge cannot honour continues as a fresh session and says so.
 
 ## Message types
 
@@ -215,6 +238,7 @@ Credentials (written by `/bridge:login`) live beside it, or under
 | `state` | the current join state (advances on every token request) |
 | `attempt` | present only while a token request is in flight (write-ahead record) |
 | `installation.json` | installation id, name, API URL, key thumbprint |
+| `logged-out` | present after `/bridge:logout`; an enrolment key in `.env` is not used while it is |
 
 All are written 0600 (the directory is created 0700). **Windows:** those modes are ignored; the
 files are only as private as the profile directory's ACL (by default the user's
@@ -235,6 +259,9 @@ Override the state directory with `EINWEAVE_STATE_DIR` env var.
 **"Bridge refused this plugin's sign-in protocol … update the plugin".** The plugin
 and the server disagree on the sign-in protocol (typically a server that retired the
 plugin's version). Run `/plugin update bridge`, restart, then `/bridge:login`.
+
+**"client too old: run /plugin update bridge, then /reload-plugins"**. The server is on
+delivery v2 and this window runs 0.29 or older. Do exactly that; see *Upgrading to 0.30*.
 
 **"this Bridge server does not support key credentials yet".** The server predates
 RFC-016; upgrade it before using plugin 0.25.

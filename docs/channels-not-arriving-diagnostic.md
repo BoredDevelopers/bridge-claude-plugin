@@ -226,7 +226,7 @@ If section 1 shows `claude` resolving under `/mnt/c/...`, or section 8 finds a W
 
 - **`channelsEnabled` in managed settings** — tier-gated to `team` and `enterprise` accounts, ignored on personal plans.
 - **Editing `cachedGrowthBookFeatures` by hand** — the value is re-evaluated at runtime, so the edit doesn't stick.
-- **Reinstalling Bridge, regenerating the token, changing `BRIDGE_CHANNELS`** — none of these touch either gate.
+- **Reinstalling Bridge, regenerating the token, changing `EINWEAVE_CHANNELS`** — none of these touch either gate.
 
 ## What to send back
 
