@@ -1850,7 +1850,11 @@ async function requireHolder(): Promise<{ content: { type: "text"; text: string 
   const say = (text: string) => ({ content: [{ type: "text" as const, text }] });
   if (!session) return say("Bridge is still connecting (no session yet) — nothing was read or acknowledged. Try again in a moment.");
   const stopped = session.stopReason();
-  if (stopped) return say(`This window's Bridge session has stopped (${stopped.kind}) — nothing was read or acknowledged. /bridge:connect starts a new one.`);
+  if (stopped) {
+    // A superseded window can only get Bridge back by taking it over; a plain connect does nothing there.
+    const how = stopped.kind === "superseded" ? "/bridge:connect takeover moves Bridge back to this window" : "/bridge:connect starts a new one";
+    return say(`This window's Bridge session has stopped (${stopped.kind}) — nothing was read or acknowledged. ${how}.`);
+  }
   if (standbyHolder) {
     return say(
       `This window stands by — another window holds this Bridge session, and reading here would acknowledge entries on its behalf. /bridge:connect takeover moves Bridge to this window.${forkHint()}`
@@ -1858,7 +1862,7 @@ async function requireHolder(): Promise<{ content: { type: "text"; text: string 
   }
   if (!sessionEverAuthenticated) return say("Bridge is still connecting (no authenticated session yet) — nothing was read or acknowledged. Try again in a moment.");
   if (!authenticated) return say("Bridge is reconnecting — acks can't be sent yet, so nothing was read or acknowledged; try again shortly.");
-  if (!(await holdsLiveLock())) return say("This window no longer holds the Bridge session lock — nothing was read or acknowledged. /bridge:connect to take it back.");
+  if (!(await holdsLiveLock())) return say("Another window holds Bridge now (this window's lock was lost; its session is about to stop) — nothing was read or acknowledged. /bridge:connect takeover moves Bridge back to this window.");
   return null;
 }
 
@@ -1910,13 +1914,21 @@ async function readDeliveries(args: Record<string, unknown>) {
   const shown: Entry[] = [];
   const entries: Record<string, unknown>[] = [];
   let filtered = 0;
+  let unresolved = 0;
   let bytes = 0;
   let cut = false;
   const deps = { myGrant: () => myContextId, myAgentId: () => agentId, isOwnSend: (id: string) => ownSentIds.has(id) };
   for (const e of page.entries) {
-    if (e.kind === "message" && !isAddressed(e.message.deliveryReasons) && channelDecision(e.message.channelId ?? "") !== "deliver") {
-      filtered++; // declined by EINWEAVE_CHANNELS: neither shown nor acked, exactly as on the push path
-      continue;
+    if (e.kind === "message" && !isAddressed(e.message.deliveryReasons)) {
+      const decision = channelDecision(e.message.channelId ?? "");
+      if (decision === "drop") {
+        filtered++; // declined by EINWEAVE_CHANNELS: neither shown nor acked, exactly as on the push path
+        continue;
+      }
+      if (decision === "unknown") {
+        unresolved++; // the name map still cannot say (fetch failed, or refresh rate-limited): not shown, not acked, say so
+        continue;
+      }
     }
     if (shouldDismiss(e, deps)) {
       echoes.push(e.id);
@@ -1944,17 +1956,18 @@ async function readDeliveries(args: Record<string, unknown>) {
     shown.push(e);
   }
   const filteredNote =
-    filtered > 0 ? ` ${filtered} broadcast(s) in channels excluded by EINWEAVE_CHANNELS are not shown and stay owed; they do not block paging.` : "";
+    (filtered > 0 ? ` ${filtered} broadcast(s) in channels excluded by EINWEAVE_CHANNELS are not shown and stay owed; they do not block paging.` : "") +
+    (unresolved > 0 ? ` ${unresolved} broadcast(s) are in channels not resolved yet (the channel list could not be read) — not shown and not acknowledged; try again shortly.` : "");
   const next = cut ? null : page.next;
   const hint = cut
     ? `Cut short at ~${Math.round(READ_DELIVERIES_BUDGET_BYTES / 1000)} KB: more of this page is still owed. What you just read is cleared — call read_deliveries again WITHOUT \`after\` for the rest.${filteredNote}`
     : page.next
       ? `More are owed. Next: read_deliveries(after: ${JSON.stringify(page.next)}).${filteredNote}`
-      : entries.length === 0 && filtered === 0
+      : entries.length === 0 && filtered === 0 && unresolved === 0
         ? "Nothing is owed to this session."
         : `That is everything owed to this session right now.${filteredNote}`;
   // Cursor fields first, for the reason read_messages gives.
-  const text = JSON.stringify({ count: entries.length, filtered, next, ...(cut ? { truncated: true } : {}), hint, entries }, null, 2);
+  const text = JSON.stringify({ count: entries.length, filtered, ...(unresolved > 0 ? { unresolved } : {}), next, ...(cut ? { truncated: true } : {}), hint, entries }, null, 2);
 
   // Last, after every fallible step above: only now are these entries really in the model's hands.
   if (echoes.length > 0 && session && sessionEverAuthenticated && who.agentId === (agentId || null)) session.ack(echoes, "dismissed");

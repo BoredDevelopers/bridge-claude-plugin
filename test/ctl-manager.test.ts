@@ -200,7 +200,7 @@ describe("CtlManager", () => {
     expect(rogue.ownership()).toBe("ours");
   });
 
-  test("m5: a failure the holder cannot fix by waiting (an unsafe directory) is not retried by the watch, and logs once", async () => {
+  test("a permanent failure (an unsafe directory) is retried on every tick by the lock holder, but logged ONCE", async () => {
     const t = setup(undefined, 20);
     mkdirSync(join(t.dir, "ctl"), { mode: 0o700 });
     chmodSync(join(t.dir, "ctl"), 0o777);
@@ -216,9 +216,26 @@ describe("CtlManager", () => {
     await m.ensure();
     expect(m.problem()?.kind).toBe("unsafe-dir");
     await Bun.sleep(300);
-    expect(opened).toBe(1); // the watch did not try again
-    expect(lines).toHaveLength(1);
+    expect(opened).toBeGreaterThan(3); // the watch keeps trying…
+    expect(lines).toHaveLength(1); // …without repeating itself in the log
+    chmodSync(join(t.dir, "ctl"), 0o700); // someone fixes it
+    expect(await until(() => m.current() !== null)).toBe(true); // and the holder serves again, unprompted
   });
+
+  test("the socket directory removed mid-session (a tmp cleaner): the holder's watch re-creates it and serves again", async () => {
+    const t = setup(undefined, 20);
+    const m = t.manager();
+    m.hold(true);
+    await m.ensure();
+    rmSync(join(t.dir, "ctl"), { recursive: true, force: true });
+    writeFileSync(join(t.dir, "ctl"), "in the way"); // the first reclaim attempts fail (the path is a file)…
+    await Bun.sleep(150);
+    expect(m.current()).toBeNull();
+    rmSync(join(t.dir, "ctl")); // …until it is gone
+    expect(await until(() => m.current() !== null)).toBe(true);
+    expect((await ask(t.path))?.ok).toBe(true);
+  });
+
 
   test("a copy WITHOUT the lock never reclaims: it records the loss and stays out", async () => {
     const t = setup(undefined, 25);

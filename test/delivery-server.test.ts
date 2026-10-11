@@ -244,12 +244,18 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     const rid = nextId++;
     send(a, { jsonrpc: "2.0", id: rid, method: "tools/call", params: { name: "read_deliveries", arguments: {} } });
     await waitFor(() => lines(a).some((m) => m.id === rid), 8000, "read_deliveries on A");
-    expect(lines(a).find((m) => m.id === rid).result.content[0].text).toMatch(/session has stopped \(superseded\)/);
+    expect(lines(a).find((m) => m.id === rid).result.content[0].text).toMatch(/session has stopped \(superseded\).*\/bridge:connect takeover/);
   }, 90_000);
 
   test("startup removes what dead processes left: migration temps (credential bytes) and half-bound control sockets", async () => {
+    // A pid that is certainly dead, on every OS: a child we started and reaped. (Not a small
+    // constant — pid 2 is kthreadd on Linux, alive and not ours: kill(2, 0) answers EPERM, which
+    // the sweep rightly reads as "alive".)
+    const child = Bun.spawn(["true"]);
+    await child.exited;
+    const dead = child.pid;
     mkdirSync(join(dir, "ctl"), { recursive: true, mode: 0o700 });
-    const stale = [join(dir, "key.json.migrating-999999-abc123"), join(dir, "ctl", "c1.sock.tmp-999999-ab12"), join(dir, "ctl", "c2.sock")];
+    const stale = [join(dir, `key.json.migrating-${dead}-abc123`), join(dir, "ctl", `c${dead}.sock.tmp-${dead}-ab12`), join(dir, "ctl", `c${dead}.sock`)];
     for (const f of stale) writeFileSync(f, "left behind");
     await boot(false);
     await waitFor(() => stale.every((f) => !existsSync(f)), 8000, "the startup sweeps");

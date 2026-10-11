@@ -101,10 +101,11 @@ export class CtlManager<E extends { id: string }> {
       void (async () => {
         if (this.closed || !(await this.d.holdsLock())) return; // a copy that does not hold the lock never reclaims
         if (this.server) this.verify(); // a lost path queues the reclaim itself
-        // Nothing served: try again only for a loss the holder can fix. A directory that is not
-        // safe, or an open that failed outright, will fail the same way every tick — it is
-        // retried when something changes (a lock acquired, an authentication), not on a timer.
-        else if (!this.failure || this.failure.kind === "served-elsewhere") await this.ensure();
+        // Nothing served while we hold the lock: try again whatever the failure was. A directory a
+        // tmp cleaner removed, a transient rename error, an unsafe directory someone fixed — none of
+        // them announces itself, and the hooks need this socket. Repeated identical failures are
+        // logged once (open() dedupes), so the retry costs a syscall, not a log line.
+        else await this.ensure();
       })().catch(() => {});
     }, this.d.watchMs ?? 30_000);
     this.watch.unref?.();

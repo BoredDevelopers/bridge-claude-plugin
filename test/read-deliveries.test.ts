@@ -43,7 +43,7 @@ function startStub() {
   const sockets = new Set<any>();
   const acks: { ids: string[]; how: string }[] = [];
   const calls: string[] = [];
-  const state = { owed: [] as Owed[], status: 200, delayMs: 0, agentId: "bellman", authDelayMs: 0, channels: [{ id: CHANNEL_ID, name: "general" }] as { id: string; name: string }[] };
+  const state = { owed: [] as Owed[], status: 200, delayMs: 0, agentId: "bellman", authDelayMs: 0, channels: [{ id: CHANNEL_ID, name: "general" }] as { id: string; name: string }[], channelsStatus: 200 };
   const agentAuth = createAgentAuthRoutes();
   agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   const server = Bun.serve({
@@ -57,7 +57,7 @@ function startStub() {
         if (srv.upgrade(req)) return;
       }
       calls.push(`${req.method} ${url.pathname}${url.search}`);
-      if (url.pathname === "/api/channels") return Response.json({ channels: state.channels });
+      if (url.pathname === "/api/channels") return state.channelsStatus === 200 ? Response.json({ channels: state.channels }) : new Response("no", { status: state.channelsStatus });
       if (url.pathname === "/api/messages") {
         if (state.delayMs) await Bun.sleep(state.delayMs);
         return Response.json({ messages: state.owed.filter((e) => e.kind === "message").map((e) => (e.payload as any).message) });
@@ -376,6 +376,26 @@ describe("read_deliveries", () => {
     expect(body.entries.map((e: any) => e.id)).toEqual([id(1)]);
     await acksSettled(1);
     expect(stub.acks).toEqual([{ ids: [id(1)], how: "model" }]);
+  }, 60_000);
+
+  test("an UNRESOLVED channel (the channel list cannot be read) is counted separately from an excluded one: not shown, not acked", async () => {
+    stub.state.owed = [message(1, "in a channel nobody can name yet")];
+    stub.state.channelsStatus = 500;
+    await boot(true, { EINWEAVE_CHANNELS: "general" });
+    const body = JSON.parse((await call("read_deliveries")).text);
+    expect(body.entries).toEqual([]);
+    expect(body.unresolved).toBe(1);
+    expect(body.filtered).toBe(0);
+    expect(body.hint).toContain("not resolved yet");
+    expect(body.hint).not.toContain("excluded by EINWEAVE_CHANNELS");
+    await Bun.sleep(500);
+    expect(stub.acks).toEqual([]);
+    // Once the list can be read, the same entry is delivered.
+    stub.state.channelsStatus = 200;
+    await Bun.sleep(5300);
+    const later = JSON.parse((await call("read_deliveries")).text);
+    expect(later.entries.map((e: any) => e.id)).toEqual([id(1)]);
+    expect(later.unresolved).toBeUndefined();
   }, 60_000);
 
   test("a window that STANDS BY refuses: no fetch, no ack", async () => {
