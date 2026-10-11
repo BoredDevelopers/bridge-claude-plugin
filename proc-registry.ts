@@ -15,8 +15,7 @@
  *
  * fs / the clock / pid-liveness are one object each so tests can inject failures, a
  * fake time or fake processes — ESM namespace imports cannot be spied on. Same idiom as
- * auth/node/store.ts's `__io` and auth/node/lock.ts's `__lockIo`; production never
- * replaces them. Each module owns its own liveness check rather than importing
+ * the SDK node store's `__fsIo` and its lock's `__lockIo`; production never replaces them. Each module owns its own liveness check rather than importing
  * server.ts's (server.ts has no exports and runs top-level side effects).
  */
 import { procStartOf, legacyProcStartOf } from "./proc-start";

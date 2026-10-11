@@ -1,6 +1,6 @@
 /**
  * The STUB's side of RFC-016: parse + verify compact ES256 JWS, RFC 7638
- * thumbprints, `htu` normalisation — written INDEPENDENTLY of auth/core/ (node:crypto
+ * thumbprints, `htu` normalisation — written INDEPENDENTLY of the SDK core (node:crypto
  * with `dsaEncoding: "ieee-p1363"`, a hand-rolled canonical JSON, a hand-rolled URL
  * normaliser). A verifier that reused the client's own helpers would pass a client
  * bug on both sides: a DER signature, a wrong member order, a kept query string.

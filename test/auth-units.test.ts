@@ -1,96 +1,10 @@
 /**
- * Small pure-ish pieces of auth/ (RFC-016 §5): device polling, headless detection,
- * discovery. (The installation-lock tests live in installation-lock.test.ts.)
+ * Small pure-ish pieces of sign-in: headless detection, and the SDK core's discovery
+ * checks the plugin relies on before it opens a loopback login.
  */
 import { describe, test, expect } from "bun:test";
-import { pollDevice } from "../auth/device";
 import { isHeadless } from "../auth/browser";
-import { assertSameAuthority, supportsKeyCredentials, OAuthError, TransportError, type AuthMetadata, type EnrolGrant } from "../auth/core/protocol";
-
-/** One scripted token-endpoint answer per poll ("ok", "transport", or an OAuth error code; "rate_limited:<s>"). */
-function answers(list: string[]) {
-  let i = 0;
-  const grant: EnrolGrant = { installation_id: "i1", join_state: "brg_js_0_" + "a".repeat(49) };
-  return {
-    polls: () => i,
-    poll: async () => {
-      const a = list[Math.min(i++, list.length - 1)]!;
-      if (a === "ok") return grant;
-      if (a === "transport") throw new TransportError("no answer");
-      if (a.startsWith("rate_limited:")) throw new OAuthError({ error: "rate_limited", status: 429, retryAfterS: Number(a.split(":")[1]) });
-      throw new OAuthError({ error: a, status: 400 });
-    },
-    grant,
-  };
-}
-
-const auth = { device_code: "dc", user_code: "U", verification_uri: "v", expires_in: 600, interval: 5 };
-
-describe("device polling (RFC 8628 §3.5)", () => {
-  test("pending waits, slow_down adds 5 s for good, then success", async () => {
-    const s = answers(["authorization_pending", "slow_down", "authorization_pending", "ok"]);
-    const waits: number[] = [];
-    const r = await pollDevice(s.poll, auth, { sleep: async (ms) => void waits.push(ms) });
-    expect(r).toEqual({ ok: true, grant: s.grant });
-    expect(waits).toEqual([5000, 5000, 10000, 10000]);
-  });
-
-  test("access_denied ends the flow; the deadline ends it too", async () => {
-    expect(await pollDevice(answers(["access_denied"]).poll, auth, { sleep: async () => {} })).toEqual({ ok: false, error: "access_denied" });
-    let t = 0;
-    const r = await pollDevice(answers(["authorization_pending"]).poll, { ...auth, expires_in: 20 }, {
-      sleep: async (ms) => void (t += ms),
-      now: () => t,
-    });
-    expect(r).toEqual({ ok: false, error: "expired_token" });
-  });
-
-  test("no answer (transport) keeps polling; a 429 waits its Retry-After on top of the interval, once", async () => {
-    const s = answers(["transport", "rate_limited:3", "authorization_pending", "ok"]);
-    const waits: number[] = [];
-    const r = await pollDevice(s.poll, auth, { sleep: async (ms) => void waits.push(ms) });
-    expect(r).toEqual({ ok: true, grant: s.grant });
-    expect(waits).toEqual([5000, 5000, 8000, 5000]);
-  });
-
-  test("a cancelled poll stops as cancelled", async () => {
-    const ac = new AbortController();
-    const r = await pollDevice(answers(["authorization_pending"]).poll, auth, {
-      signal: ac.signal,
-      sleep: async () => ac.abort(),
-    });
-    expect(r).toEqual({ ok: false, error: "cancelled" });
-  });
-});
-
-describe("device polling — cancel", () => {
-  test("a cancel during the interval wait is prompt: no further poll, answered at once (not after the interval)", async () => {
-    const s = answers(["authorization_pending"]);
-    const ac = new AbortController();
-    setTimeout(() => ac.abort(), 100);
-    const t0 = Date.now();
-    const r = await pollDevice(s.poll, auth, { signal: ac.signal }); // the real (default) sleep: 5 s interval
-    expect(r).toEqual({ ok: false, error: "cancelled" });
-    expect(Date.now() - t0).toBeLessThan(1_000);
-    expect(s.polls()).toBe(0);
-  });
-});
-
-describe("device polling — listeners", () => {
-  test("each wait removes its abort listener when it ends (none accumulate over a long flow)", async () => {
-    let live = 0;
-    const signal = {
-      aborted: false,
-      addEventListener: () => void live++,
-      removeEventListener: () => void live--,
-    } as unknown as AbortSignal;
-    const s = answers(["authorization_pending", "ok"]);
-    const r = await pollDevice(s.poll, { ...auth, interval: 1 }, { signal });
-    expect(r.ok).toBe(true);
-    expect(s.polls()).toBe(2);
-    expect(live).toBe(0);
-  });
-});
+import { TokenClient, Clock, supportsKeyCredentials, type AuthMetadata } from "../vendor/bridge-agent-sdk/core/index.js";
 
 describe("headless detection", () => {
   test("SSH and CI are headless everywhere; Linux needs a display; macOS is not", () => {
@@ -125,17 +39,21 @@ describe("discovery authority (RFC 8414 §3.3)", () => {
     ...over,
   });
 
-  test("the API's own document is accepted (a trailing slash on the URL too; the web done-URI may differ)", () => {
-    expect(() => assertSameAuthority(api, meta())).not.toThrow();
-    expect(() => assertSameAuthority(`${api}/`, meta())).not.toThrow();
+  /** The discovery the login uses (auth/login.ts), answering `doc` — the authority check runs inside it. */
+  const discover = (url: string, doc: AuthMetadata) =>
+    new TokenClient({ clock: new Clock(), clientId: "t", fetch: (async () => Response.json(doc)) as never }).discover(url);
+
+  test("the API's own document is accepted (a trailing slash on the URL too; the web done-URI may differ)", async () => {
+    await expect(discover(api, meta())).resolves.toBeDefined();
+    await expect(discover(`${api}/`, meta())).resolves.toBeDefined();
   });
 
-  test("a different issuer is refused", () => {
-    expect(() => assertSameAuthority(api, meta({ issuer: "https://evil.example.test/api/agent-auth" }))).toThrow(/issuer/);
+  test("a different issuer is refused", async () => {
+    await expect(discover(api, meta({ issuer: "https://evil.example.test/api/agent-auth" }))).rejects.toThrow(/issuer/);
   });
 
-  test("a credential endpoint on another origin is refused, even with the right issuer", () => {
-    expect(() => assertSameAuthority(api, meta({ token_endpoint: "https://evil.example.test/token" }))).toThrow(/token_endpoint/);
-    expect(() => assertSameAuthority(api, meta({ revocation_endpoint: "http://bridge-api.example.test/revoke" }))).toThrow(/revocation_endpoint/);
+  test("a credential endpoint on another origin is refused, even with the right issuer", async () => {
+    await expect(discover(api, meta({ token_endpoint: "https://evil.example.test/token" }))).rejects.toThrow(/token_endpoint/);
+    await expect(discover(api, meta({ revocation_endpoint: "http://bridge-api.example.test/revoke" }))).rejects.toThrow(/revocation_endpoint/);
   });
 });

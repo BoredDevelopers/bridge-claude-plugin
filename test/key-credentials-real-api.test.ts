@@ -3,7 +3,7 @@
  *
  * Every other suite runs against test/agent-auth-stub.ts, which is written to be STRICTER
  * than the server. This file is the proof that the stub's strictness and the server agree:
- * the plugin's own code (server.ts over stdio, the CredentialManager, auth/core) against
+ * the plugin's own code (server.ts over stdio, the SDK's AgentClient and core) against
  * a real `packages/api` process on a scratch Postgres database.
  *
  * ── HOW TO RUN IT ─────────────────────────────────────────────────────────────────────
@@ -54,11 +54,9 @@ import {
   OAuthError,
   classifyTokenError,
   type Signer,
-} from "../auth/core";
-import { randomB64url } from "../auth/core/b64url";
-import { readInstallation, readKey, readState, readAttempt, writeKey, writeState, writeInstallation } from "../auth/node/store";
-import { CredentialManager } from "../auth/manager";
-import { resolveProfile } from "../auth/profile";
+} from "../vendor/bridge-agent-sdk/core/index.js";
+import type { AgentClient } from "../vendor/bridge-agent-sdk/index.js";
+import { readInstallation, readKey, readState, readAttempt, writeKey, writeState, writeInstallation, randomB64url, agentClientOn } from "./key-fixtures";
 import { PLUGIN_CLIENT_ID } from "../auth/client-id";
 import { startAuthStub } from "./agent-auth-stub";
 import pkg from "../package.json" with { type: "json" };
@@ -241,31 +239,14 @@ async function plugin(apiUrl: string, dir: string, env: Record<string, string>):
   };
 }
 
-/** A CredentialManager on `dir` in THIS process — a sibling Claude session on the same machine. */
-function sibling(apiUrl: string, dir: string, sessionKey: string): CredentialManager {
-  return new CredentialManager({
-    profile: resolveProfile(dir, undefined),
-    envApiUrl: apiUrl,
-    enrolmentKey: "",
-    sessionKey: () => sessionKey,
-    sessionKeyReady: async () => {},
-    platform: "test",
-    // RFC-017 S4 now enforces `minimum` for real against this file's actual server —
-    // "0.0.0" (this helper's version before that shipped) is refused `too_old` on
-    // every mint. This helper is for installation-lock/eviction/replay coverage, not
-    // version enforcement, so it reports the SAME real build as the plugin under test.
-    clientVersion: PLUGIN_VERSION,
-    env: {},
-    onAccessRotated: () => {},
-    onLoggedIn: () => {},
-    onLoggedOut: () => {},
-    notify: () => {},
-    log: () => {},
-    prompt: { available: () => false, show: () => {}, confirm: async () => false },
-  });
+/** An AgentClient on `dir` in THIS process — a sibling Claude session on the same machine.
+ * RFC-017 S4 enforces `minimum` against this file's real server, so it reports the SAME
+ * build as the plugin under test (this helper is for lock/eviction/replay coverage). */
+function sibling(apiUrl: string, dir: string, sessionKey: string): Promise<AgentClient> {
+  return agentClientOn(apiUrl, dir, sessionKey, PLUGIN_VERSION);
 }
 
-/** Enrol a profile directory through auth/core + the real store (what a completed login writes). */
+/** Enrol a profile directory through the SDK core + the store format (what a completed login writes). */
 async function enrolDir(apiUrl: string, dir: string): Promise<string> {
   const tc = new TokenClient({ clock: new Clock(), clientId: PLUGIN_CLIENT_ID });
   const meta = await tc.discover(apiUrl);
@@ -736,7 +717,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
     const dir = tmp("keys-real-race-");
     try {
       const inst = await enrolDir(api.url, dir);
-      const ms = [1, 2, 3, 4].map((i) => sibling(api.url, dir, `race-s${i}`));
+      const ms = await Promise.all([1, 2, 3, 4].map((i) => sibling(api.url, dir, `race-s${i}`)));
       const tokens = await Promise.all(ms.map((m) => m.accessToken()));
       for (const m of ms) m.stop();
       expect(new Set(tokens).size).toBe(4);
@@ -765,7 +746,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
         }
         return res;
       }) as typeof fetch;
-      const m = sibling(api.url, dir, "replay-s1");
+      const m = await sibling(api.url, dir, "replay-s1");
       await expect(m.accessToken()).rejects.toThrow();
       expect(lost).toBe(1);
       const attempt = readAttempt(dir);
@@ -867,7 +848,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
   test("the live-session cap evicts this session (AGENT_MAX_LIVE_SESSIONS=2): 4008 \"session evicted\" → a new session at once, no block, nothing told to the model", async () => {
     const dir = tmp("keys-real-evict-");
     const p = await plugin(api.url, dir, { EINWEAVE_ENROLMENT_KEY: enrolmentKey(), EINWEAVE_SESSION_KEY: "evict-s1" });
-    const sibs: CredentialManager[] = [];
+    const sibs: AgentClient[] = [];
     try {
       expect(await until(p.connected, 20_000), p.stderr()).toBe(true);
       const inst = readInstallation(dir)!.installationId;
@@ -875,13 +856,13 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       // the process keeps its access token in memory.
       await p.call("disconnect");
       expect(await until(async () => !(await p.connected()), 5_000)).toBe(true);
-      const s2 = sibling(api.url, dir, "evict-s2");
+      const s2 = await sibling(api.url, dir, "evict-s2");
       sibs.push(s2);
       await s2.accessToken(); // live: s1, s2 (= the cap)
       // The third session evicts the LRU socketless one (s1). The server's gate holds that
       // mint between the eviction and its commit — the plugin's socket registers under s1
       // meanwhile, so the commit's close reaches it (the server's own C20 test shape).
-      const s3 = sibling(api.url, dir, "evict-s3");
+      const s3 = await sibling(api.url, dir, "evict-s3");
       sibs.push(s3);
       arm("evict");
       const minting = s3.accessToken();

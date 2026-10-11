@@ -7,9 +7,8 @@
  * makes this machine signed in and pointed at its server:
  *
  * - each credential profile (the default one at the root, and `profiles/<name>/`):
- *   `key.json`, `state`, `attempt`, `installation.json`, `logged-out`,
- *   `upgrade-required.json`. `attempt` travels with `state`: the two are one unit
- *   (auth/node/store.ts E5), and a state copied without its in-flight attempt is
+ *   `key.json`, `state`, `attempt`, `installation.json`, `logged-out`. `attempt`
+ *   travels with `state`: the two are one unit (the SDK fileStore's E5), and a state copied without its in-flight attempt is
  *   exactly the stale-state lock E6d describes;
  * - `.env`, with every `BRIDGE_` key renamed `EINWEAVE_` (an installation without
  *   the API URL it was enrolled against is useless).
@@ -46,7 +45,7 @@ export function resolveStateDir(env: Record<string, string | undefined> = proces
   return env.EINWEAVE_STATE_DIR || join(homedir(), ".einweave");
 }
 
-const PROFILE_FILES = ["key.json", "state", "attempt", "installation.json", "logged-out", "upgrade-required.json"];
+const PROFILE_FILES = ["key.json", "state", "attempt", "installation.json", "logged-out"];
 
 export type MigrationResult =
   | { kind: "not-needed" }

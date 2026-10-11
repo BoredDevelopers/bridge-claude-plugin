@@ -7,7 +7,7 @@
  *
  * Task 7 ports the RFC-014 suite scenario for scenario (same names where the
  * behaviour is the same); Task 8 adds the RFC-016-only behaviour (C14 4001 re-mint,
- * "installation locked", 0.23 retirement at boot, …).
+ * "installation locked", …).
  */
 import { describe, test, expect } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, cpSync, lstatSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
@@ -17,11 +17,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { startAuthStub, type StubOptions } from "./agent-auth-stub";
-import { readInstallation, readState } from "../auth/node/store";
-import { joinStateSeq } from "../auth/core/join-state";
-import { enrolledProfile } from "./key-fixtures";
-import { CredentialManager } from "../auth/manager";
-import { resolveProfile } from "../auth/profile";
+import { joinStateSeq } from "../vendor/bridge-agent-sdk/core/index.js";
+import { enrolledProfile, readInstallation, readState, agentClientOn } from "./key-fixtures";
 
 /**
  * A copy of a state directory, as a thief or a backup tool would take it. A live plugin
@@ -95,26 +92,6 @@ async function withPlugin<T>(
 const enrolledIn = (stub: ReturnType<typeof startAuthStub>) => async (dir: string) => {
   await enrolledProfile(stub, dir);
 };
-
-/** Another holder of a profile directory: a thief's copy, or a sibling session on this machine. */
-function otherManager(stub: ReturnType<typeof startAuthStub>, dir: string, sessionKey: string): CredentialManager {
-  return new CredentialManager({
-    profile: resolveProfile(dir, undefined),
-    envApiUrl: stub.url,
-    enrolmentKey: "",
-    sessionKey: () => sessionKey,
-    sessionKeyReady: async () => {},
-    platform: "x",
-    clientVersion: "0.0.0",
-    env: {},
-    onAccessRotated: () => {},
-    onLoggedIn: () => {},
-    onLoggedOut: () => {},
-    notify: () => {},
-    log: () => {},
-    prompt: { available: () => false, show: () => {}, confirm: async () => false },
-  });
-}
 
 async function status(client: Client): Promise<any> {
   const r: any = await client.callTool({ name: "status", arguments: {} });
@@ -413,7 +390,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
           copyStateDir(dir, loot);
-          const thief = otherManager(stub, loot, "thief");
+          const thief = await agentClientOn(stub.url, loot, "thief");
           await thief.accessToken();
           thief.stop();
           stub.expireAccess(); // the plugin's next request must mint — with its now-stale state
@@ -449,7 +426,7 @@ describe("plugin on key credentials (RFC-016)", () => {
           stub.expireAccess();
           await client.callTool({ name: "list_channels", arguments: {} }); // this machine moves on to seq 2
           expect(stub.stats.mints).toBe(2);
-          const thief = otherManager(stub, loot, "thief");
+          const thief = await agentClientOn(stub.url, loot, "thief");
           await thief.accessToken().catch(() => {}); // seq 1 again, another attempt ⇒ E6d lock
           thief.stop();
           expect(stub.stats.locks).toBe(1);
@@ -479,10 +456,10 @@ describe("plugin on key credentials (RFC-016)", () => {
         async (client, dir, notices) => {
           expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
           copyStateDir(dir, loot);
-          const thief = otherManager(stub, loot, "thief");
+          const thief = await agentClientOn(stub.url, loot, "thief");
           await thief.accessToken();
           thief.stop();
-          const sibling = otherManager(stub, dir, "sibling"); // another Claude session on this machine
+          const sibling = await agentClientOn(stub.url, dir, "sibling"); // another Claude session on this machine
           await sibling.accessToken().catch(() => {});
           sibling.stop();
           expect(stub.stats.locks).toBe(1);
@@ -832,69 +809,6 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(stub.stats.wsOpens).toBe(0);
       },
       enrolledIn(stub)
-    );
-  }, 30_000);
-
-  test("upgrading from 0.23: the old files are retired at startup and status says to run /bridge:login", async () => {
-    const stub = startAuthStub();
-    await withPlugin(
-      stub,
-      {},
-      async (client, dir) => {
-        const s = await status(client);
-        expect(s.configured).toBe(false);
-        expect(s.auth.problem).toMatch(/plugin 0\.25 .* run \/bridge:login/);
-        // Retired once startup settles the session key.
-        expect(await until(() => !existsSync(join(dir, "credentials.json")), 10_000)).toBe(true);
-        expect((await status(client)).auth.problem).toMatch(/plugin 0\.25 .* run \/bridge:login/);
-        expect(existsSync(join(dir, "sessions", `${SESSION}.json`))).toBe(false);
-        // hooks/session-map.ts's file in the same directory is not an RFC-014 credential: kept.
-        expect(readFileSync(join(dir, "sessions", "pid-4242.json"), "utf8")).toBe("{}");
-        expect(stub.stats.mintBodies).toHaveLength(0);
-      },
-      (dir) => {
-        writeFileSync(join(dir, "credentials.json"), JSON.stringify({ apiUrl: stub.url, installationId: "old", installationToken: "brg_it_old" }));
-        mkdirSync(join(dir, "sessions"), { recursive: true });
-        writeFileSync(join(dir, "sessions", `${SESSION}.json`), JSON.stringify({ sessionId: "s", refreshToken: "brg_rt_old", installationId: "old" }));
-        writeFileSync(join(dir, "sessions", "pid-4242.json"), "{}");
-      }
-    );
-  }, 30_000);
-
-  test("startup retirement never touches a 0.25 sign-in: an enrolled profile next to a stray 0.23 file keeps its key and connects", async () => {
-    const stub = startAuthStub();
-    await withPlugin(
-      stub,
-      {},
-      async (_client, dir) => {
-        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-        expect(existsSync(join(dir, "credentials.json"))).toBe(false); // the 0.23 file retired…
-        expect(readInstallation(dir)).not.toBeNull(); // …the 0.25 one untouched
-        expect(existsSync(join(dir, "key.json"))).toBe(true);
-        expect(stub.stats.refusals).toEqual([]);
-      },
-      async (dir) => {
-        await enrolledProfile(stub, dir);
-        writeFileSync(join(dir, "credentials.json"), JSON.stringify({ apiUrl: stub.url, installationId: "old", installationToken: "brg_it_old" }));
-      }
-    );
-  }, 30_000);
-
-  test("a 0.23 retirement that throws (any fs error) does not abort startup: the session still connects", async () => {
-    const stub = startAuthStub();
-    await withPlugin(
-      stub,
-      {},
-      async (_client, dir) => {
-        // The rest of the boot sequence (enrolment key, connect) still ran.
-        expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-        expect(existsSync(join(dir, "credentials.json"))).toBe(true); // it really could not retire
-      },
-      async (dir) => {
-        await enrolledProfile(stub, dir);
-        writeFileSync(join(dir, "credentials.json"), JSON.stringify({ apiUrl: stub.url, installationId: "old", installationToken: "brg_it_old" }));
-        mkdirSync(join(dir, "upgrade-required.json")); // the marker cannot be written: retireLegacy throws
-      }
     );
   }, 30_000);
 

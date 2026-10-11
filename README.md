@@ -225,8 +225,7 @@ sync or restore these files — see *Credential copy detection* above.
 `/bridge:status` shows the installation, `key_storage` and `key_thumbprint`.
 Override the state directory with `EINWEAVE_STATE_DIR` env var.
 
-**Requirements** (`engines` in `package.json`): Bun ≥ 1.3, which runs the plugin;
-Node ≥ 20.3 for the runtime-neutral `auth/core` module (WebCrypto, `AbortSignal.any`).
+**Requirements** (`engines` in `package.json`): Bun ≥ 1.3, which runs the plugin.
 
 ## Troubleshooting
 

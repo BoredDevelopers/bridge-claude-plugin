@@ -53,13 +53,11 @@ import { describeClose, type CloseClass, type HolderIdentity } from "./reconnect
 import { writeProc, removeProc, updateProcState, listProcs, type ProcInfo } from "./proc-registry";
 import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersion, INITIAL_STALE_WATCH_STATE, type StaleWatchState } from "./stale-watcher";
 import { resolveProfile, profileLabel } from "./auth/profile";
-import { CredentialManager, CredentialError } from "./auth/manager";
+import { SignIn, describeCredential, waitFor } from "./auth/login";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
-import { assertNever, deadline } from "./auth/core";
 import { Session, createRuntime, type Entry, type PendingEntry, type SessionStatus, type SessionStop } from "./vendor/bridge-agent-sdk/index.js";
-import { isAddressed } from "./vendor/bridge-agent-sdk/core/index.js";
+import { isAddressed, deadline } from "./vendor/bridge-agent-sdk/core/index.js";
 import { sessionLock, fileSeqStore, type SessionLockHandle, type LockRecord } from "./vendor/bridge-agent-sdk/node.js";
-import { sessionClient, credentialCause } from "./link/client";
 import { channelAdapter } from "./link/adapter";
 import { MissedTracker } from "./delivery/missed";
 import { startCtlServer, sweepStaleCtlSockets, type CtlServer } from "./delivery/ctl-server";
@@ -407,47 +405,6 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 // literal type `${string}-${string}-…`, which a resolved session key (a repo
 // slug, an env override) does not satisfy.
 let SESSION_KEY: string = FALLBACK_SESSION_KEY;
-
-// ── Credentials (RFC-016) ───────────────────────────────────────────────────
-// This session's DPoP-bound access token, minted from the profile's installation
-// key + join state. See auth/manager.ts.
-const creds = new CredentialManager({
-  profile: PROFILE,
-  envApiUrl: ENV_API_URL,
-  // Presence only — never the value. Powers a "that's retired" hint when
-  // there is no real credential; the token itself is never read or sent.
-  enrolmentKey: process.env.EINWEAVE_ENROLMENT_KEY ?? "",
-  sessionKey: () => SESSION_KEY,
-  sessionKeyReady: () => sessionKeyReady ?? Promise.resolve(),
-  platform: `${process.platform}-${process.arch}`,
-  clientVersion: PLUGIN_VERSION,
-  env: process.env,
-  // A fresh access token replaced the one the live socket authenticated with: the
-  // Session sends it in-band (`reauth`, RFC-016 §3.4) so the server re-arms its expiry.
-  onAccessRotated: (frame) => linkClient?.rotate(frame),
-  onLoggedIn: () => {
-    wantConnected = true;
-    intentExplicitlySet = true;
-    writeConnectState(STATE_DIR, SESSION_KEY, true);
-    restartConnection();
-  },
-  onLoggedOut: () => {
-    stopConnection();
-  },
-  notify: (text) => notifyModel(text, "status"),
-  log: (text) => process.stderr.write(`${text}\n`),
-  prompt: {
-    available: () => !!mcp.getClientCapabilities()?.elicitation,
-    show: (message) => {
-      void mcp.elicitInput({ message, requestedSchema: { type: "object", properties: {} } }).catch(() => {});
-    },
-    confirm: (message) =>
-      mcp
-        .elicitInput({ message, requestedSchema: { type: "object", properties: {} } })
-        .then((r) => r.action === "accept")
-        .catch(() => false),
-  },
-});
 
 function apiUrl(): string {
   return creds.apiUrl();
@@ -918,35 +875,15 @@ function resetRefusalEpisode(): void {
   notifiedRefusal = null;
 }
 
-/** Exhaustive: a new CredentialError kind must decide here, or it would stop silently. */
-function waitFor(err: CredentialError): typeof waitingFor {
-  switch (err.kind) {
-    case "not_logged_in":
-    case "profile":
-    case "api_url":
-    case "logged_out":
-      return "files";
-    case "refused":
-    case "session_limit":
-    case "too_old":
-      return "stop-lift";
-    case "session_revoked":
-      return null;
-    case "network":
-      return null; // not terminal — retried by the reconnect schedule, never waits
-    default:
-      return assertNever(err.kind);
-  }
-}
-
 /**
  * TEST-ONLY override of the watch period (ms). Default 10 s. A lower value only makes
  * the watch notice files sooner; it cannot make a stopped session mint.
  */
 const CREDENTIAL_WATCH_MS = testKnob("EINWEAVE_TEST_CREDENTIAL_WATCH_MS", (n) => Number.isInteger(n) && n > 0) ?? 10_000;
-const credentialWatch = setInterval(() => {
+const credentialWatch = setInterval(async () => {
   if (waitingFor === null || !wantConnected || shuttingDown || creds.configError()) return;
-  if (waitingFor === "stop-lift" && creds.refreshStop() !== null) return;
+  if (waitingFor === "stop-lift" && (await creds.refreshStop()) !== null) return;
+  if (waitingFor === null || !wantConnected || shuttingDown) return;
   process.stderr.write(`bridge channel: ${waitingFor === "stop-lift" ? "a new sign-in on disk" : "credentials appeared"} — connecting\n`);
   restartConnection();
 }, CREDENTIAL_WATCH_MS);
@@ -1180,12 +1117,47 @@ const rt = (() => {
   });
 })();
 const seqStore = fileSeqStore(join(STATE_DIR, "seq"));
+// ── Credentials (RFC-016) ───────────────────────────────────────────────────
+// This session's DPoP-bound access token, minted by the SDK's AgentClient from the
+// profile's installation key + join state; login UX and wording are auth/login.ts.
+const creds = new SignIn({
+  rt,
+  profile: PROFILE,
+  envApiUrl: ENV_API_URL,
+  enrolmentKey: process.env.EINWEAVE_ENROLMENT_KEY ?? "",
+  sessionKey: async () => {
+    if (sessionKeyReady) await sessionKeyReady;
+    return SESSION_KEY;
+  },
+  clientVersion: PLUGIN_VERSION,
+  env: process.env,
+  onLoggedIn: () => {
+    wantConnected = true;
+    intentExplicitlySet = true;
+    writeConnectState(STATE_DIR, SESSION_KEY, true);
+    restartConnection();
+  },
+  onLoggedOut: () => {
+    stopConnection();
+  },
+  notify: (text) => notifyModel(text, "status"),
+  log: (text) => process.stderr.write(`${text}\n`),
+  prompt: {
+    available: () => !!mcp.getClientCapabilities()?.elicitation,
+    show: (message) => {
+      void mcp.elicitInput({ message, requestedSchema: { type: "object", properties: {} } }).catch(() => {});
+    },
+    confirm: (message) =>
+      mcp
+        .elicitInput({ message, requestedSchema: { type: "object", properties: {} } })
+        .then((r) => r.action === "accept")
+        .catch(() => false),
+  },
+});
 /** Entries pushed but not confirmed, for the missed notice (delivery/missed.ts). */
 const tracker = new MissedTracker<PendingEntry>();
 /** Entries handed to the host in this process — `status`'s "idle" until the first. */
 let pushedCount = 0;
-/** Built once SESSION_KEY is settled (boot, below). */
-let linkClient: ReturnType<typeof sessionClient> | null = null;
 let session: Session | null = null;
 let lock: SessionLockHandle | null = null;
 let ctl: CtlServer | null = null;
@@ -1267,8 +1239,10 @@ function pendingNotice(e: PendingEntry): NoticeEntry {
  * superseded; only `takeover` (the person's one-time choice) gets past it.
  */
 async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
-  if (!wantConnected || shuttingDown || !linkClient) return;
+  if (!wantConnected || shuttingDown) return;
   if (superseded && !opts.takeover) return;
+  const client = await creds.sessionClient();
+  if (!client || !wantConnected || shuttingDown) return;
   closeSession();
   const id = myIdentity();
   const myLock = sessionLock({
@@ -1298,7 +1272,7 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
     myLock.release();
     return;
   }
-  const s = new Session(rt, linkClient, {
+  const s = new Session(rt, client, {
     adapter,
     filter: broadcastFilter,
     seqStore,
@@ -1488,12 +1462,12 @@ function onStopped(stop: SessionStop): void {
     return;
   }
   updateProcState(STATE_DIR, process.pid, "disconnected");
-  if (stop.kind === "credential") {
-    const cause = credentialCause(stop.credential);
-    const msg = stop.credential?.message ?? "sign-in refused";
+  // A credential refusal — `too-old` too when it came from the mint, not a close.
+  if (stop.credential) {
+    const msg = describeCredential(stop.credential, PLUGIN_VERSION);
     lastClose = { cls: "revoked", reason: msg };
     lastServerError = msg;
-    waitingFor = cause ? waitFor(cause) : "stop-lift";
+    waitingFor = waitFor(stop.credential);
     feedStatus("stopped", msg);
     process.stderr.write(`bridge channel: no credential for auth: ${msg}\n`);
     // Each distinct refusal once per episode: the model already knows, and `status` shows it.
@@ -1565,13 +1539,13 @@ async function apiFetch(
   opts: RequestInit = {},
   retried = false
 ): Promise<Response> {
-  let auth: { token: string; headers: { Authorization: string; DPoP: string } };
+  let auth: Awaited<ReturnType<typeof creds.httpAuth>>;
   try {
     // RFC-016 §3.4 / C16: `Authorization: DPoP …` + a fresh proof per request, for
     // THIS method and the API origin + this path (the query is never signed).
     auth = await creds.httpAuth(opts.method ?? "GET", path);
   } catch (err) {
-    throw new Error(err instanceof Error ? err.message : String(err));
+    throw err instanceof Error ? err : new Error(String(err));
   }
   let res: Response;
   // Our own deadline only — when the caller already passed a `signal`, that alone
@@ -1622,11 +1596,11 @@ async function apiFetch(
   if (res.status === 401 && !retried && creds.source() === "installation") {
     const challenge = res.headers.get("www-authenticate") ?? "";
     if (/error="?use_dpop_nonce/.test(challenge) && res.headers.get("dpop-nonce")) {
-      creds.noteResourceNonce(res.headers.get("dpop-nonce"));
+      auth.client.noteResourceNonce(res.headers.get("dpop-nonce"));
     } else if (/error="?invalid_dpop_proof/.test(challenge)) {
-      creds.observeServerDate(res.headers.get("date"));
+      auth.client.observeServerDate(res.headers.get("date"));
     } else {
-      creds.invalidateAccess(auth.token);
+      auth.client.invalidateAccess(auth.token);
     }
     return apiFetch(path, opts, true);
   }
@@ -1639,13 +1613,6 @@ async function apiFetch(
   return res;
 }
 
-/** JSON over apiFetch for the SDK Session's few REST calls (link/client.ts). Throws on non-2xx. */
-async function apiJson(method: string, path: string, body?: unknown): Promise<unknown> {
-  const res = await apiFetch(path, { method, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Bridge API error ${res.status}: ${text}`);
-  return text ? JSON.parse(text) : null;
-}
 
 /**
  * A channel the agent named — by id, by name, or `#name` — as the id the join /
@@ -3356,7 +3323,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // RFC-016 E9: after a session revoke, THIS is the explicit user reconnect —
         // the next mint says so (reconnect=true) and the server opens a new session.
         // (0.24 behaviour: connect after a session revoke starts a new session.)
-        creds.requestSessionReconnect();
+        await creds.requestSessionReconnect();
         // Already open: re-persisting the intent above is enough — tearing down a healthy
         // socket to "reconnect" would restart a connection that does not need it. Anything
         // else (a backoff in progress, a stop, standing by) is replaced by a fresh Session:
@@ -3484,10 +3451,8 @@ function shutdown(): void {
   // RFC-022: tell an attached tail the session is going, and remove the socket file.
   // Detached — the exit below does not wait on a feed client.
   void feedTap?.stop();
-  // A mint in flight has already advanced the join state on the server; exiting
-  // before the new state is written leaves the old one + its attempt on disk. That
-  // still converges (E6b replay) — draining just saves the extra round trip.
-  void Promise.all([creds.drain(8_000), Bun.sleep(1000)]).finally(() => {
+  // A mint cut off here has left its attempt on disk: the next start replays it (E6b).
+  void Bun.sleep(1000).finally(() => {
     creds.stop();
     process.exit(0);
   });
@@ -3509,8 +3474,6 @@ process.on("SIGINT", shutdown);
 // resolved by the time it resumes, regardless of who started waiting first.
 sessionKeyReady = resolveSessionKey().then((resolved) => {
   SESSION_KEY = resolved.key;
-  // Built here, not after the rest of boot: a `connect` tool call awaits this same promise.
-  linkClient = sessionClient(creds, { sessionKey: () => SESSION_KEY, softwareId: PLUGIN_CLIENT_ID, softwareVersion: PLUGIN_VERSION, api: apiJson });
   return resolved;
 });
 const resolvedSessionKey = await sessionKeyReady;
@@ -3620,19 +3583,7 @@ try {
 }
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.
-// A 0.23 / 0.24 profile (RFC-014 files) is retired first, so it reads "run
-// /bridge:login", not "not signed in" — store.retireLegacy touches RFC-014 files
-// only, never a 0.25 installation. Headless machines enrol once from
-// EINWEAVE_ENROLMENT_KEY (never through chat) — which also re-enrols a retired
-// headless machine.
-try {
-  await creds.retireLegacyCredentials();
-} catch (err) {
-  // Never fatal. A rejected top-level await here would skip the rest of the boot
-  // (enrolment key, connect) — the unhandledRejection hook only logs it. configError()
-  // still reports the old files ("run /bridge:login"); the next start retries.
-  process.stderr.write(`bridge channel: could not retire the plugin-0.24 credentials: ${err instanceof Error ? err.message : String(err)}\n`);
-}
+// Headless machines enrol once from EINWEAVE_ENROLMENT_KEY (never through chat).
 await creds.enrolFromKeyIfNeeded();
 const startupProblem = creds.configError();
 if (startupProblem) {

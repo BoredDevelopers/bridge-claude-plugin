@@ -1,20 +1,35 @@
 /**
- * auth/core/protocol.ts `TokenClient` against the strict RFC-016 stub — and the
+ * The SDK core's `TokenClient` (vendored) against this plugin's strict RFC-016 stub — and the
  * stub's own strictness: each "refused" case below is a guard that must stay red
  * for a wrong client, or every higher-level suite is testing against a pushover.
  */
 import { describe, test, expect, afterEach } from "bun:test";
 import { createPrivateKey, sign as nodeSign } from "node:crypto";
 import { startAuthStub, STUB_CLIENT_ID } from "./agent-auth-stub";
-import { TokenClient, OAuthError, TransportError, DiscoveryError, MINT_BUDGET_MS, type AuthMetadata, type FetchLike } from "../auth/core/protocol";
-import { classifyTokenError } from "../auth/core/token-errors";
-import { STALE_MS } from "../auth/node/lock";
-import { Clock } from "../auth/core/clock";
-import { generateSoftwareKey, type Signer } from "../auth/core/signer";
-import { dpopProof } from "../auth/core/dpop";
-import { signJwt } from "../auth/core/jws";
-import { CLIENT_ASSERTION_TYPE } from "../auth/core/assertion";
+import {
+  TokenClient,
+  OAuthError,
+  TransportError,
+  DiscoveryError,
+  MINT_BUDGET_MS,
+  classifyTokenError,
+  Clock,
+  generateSoftwareKey,
+  dpopProof,
+  CLIENT_ASSERTION_TYPE,
+  type AuthMetadata,
+  type FetchLike,
+  type Signer,
+} from "../vendor/bridge-agent-sdk/core/index.js";
+import { STALE_MS } from "../vendor/bridge-agent-sdk/node.js";
 import { parseJws, verifyEs256 } from "./dpop-verify";
+
+/** Compact ES256 JWS — the SDK's internal `signJwt` (not exported), for hand-made bad proofs. */
+async function signJwt(signer: Signer, header: Record<string, unknown>, claims: Record<string, unknown>): Promise<string> {
+  const j = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
+  const input = `${j({ ...header, alg: signer.alg })}.${j(claims)}`;
+  return `${input}.${Buffer.from(await signer.sign(new TextEncoder().encode(input))).toString("base64url")}`;
+}
 
 const stops: (() => void)[] = [];
 afterEach(() => {

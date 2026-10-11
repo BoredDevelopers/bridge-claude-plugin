@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { writeInstallation } from "../auth/node/store";
+import { writeInstallation } from "./key-fixtures";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
 

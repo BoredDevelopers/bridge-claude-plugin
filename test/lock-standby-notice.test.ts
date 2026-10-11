@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { writeInstallation } from "../auth/node/store";
+import { writeInstallation } from "./key-fixtures";
 import pkg from "../package.json" with { type: "json" };
 
 /** The REAL running version — this holder record must equal it for a same-version

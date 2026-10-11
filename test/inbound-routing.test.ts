@@ -210,10 +210,9 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       expect(up, "bridge server did not start").toBe(true);
 
       // `other` signs in the real way (RFC-016): a fresh key, the enrolment-key grant with a
-      // DPoP proof, then a client_credentials mint — through the plugin's OWN auth/core,
-      // which is also what `@bridge/agent-sdk` will ship.
-      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../auth/core");
-      const { randomB64url } = await import("../auth/core/b64url");
+      // DPoP proof, then a client_credentials mint — through `@bridge/agent-sdk`'s core.
+      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/bridge-agent-sdk/core/index.js");
+      const { randomB64url } = await import("./key-fixtures");
       const clockOther = new Clock();
       const tc = new TokenClient({ clock: clockOther, clientId: "bridge-claude-plugin" });
       const meta = await tc.discover(URL_);

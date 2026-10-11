@@ -24,7 +24,7 @@ function root() {
 function seedLegacy(dir: string) {
   mkdirSync(join(dir, "profiles", "work"), { recursive: true });
   mkdirSync(join(dir, "locks"), { recursive: true });
-  for (const f of ["key.json", "state", "attempt", "installation.json", "logged-out", "upgrade-required.json"]) writeFileSync(join(dir, f), `root ${f}`, { mode: 0o600 });
+  for (const f of ["key.json", "state", "attempt", "installation.json", "logged-out"]) writeFileSync(join(dir, f), `root ${f}`, { mode: 0o600 });
   writeFileSync(join(dir, "profiles", "work", "key.json"), "work key", { mode: 0o600 });
   writeFileSync(join(dir, "profiles", "work", "installation.json"), "work inst", { mode: 0o600 });
   mkdirSync(join(dir, "profiles", "Bad Name"), { recursive: true });
@@ -41,7 +41,7 @@ describe("migrateLegacyState", () => {
     seedLegacy(legacy);
     expect(migrateLegacyState(fresh, legacy)).toEqual({ kind: "migrated", profiles: 2, env: true });
     expect(readdirSync(fresh).sort()).toEqual(
-      [".env", "attempt", "installation.json", "key.json", "logged-out", "profiles", "state", "upgrade-required.json"].sort(),
+      [".env", "attempt", "installation.json", "key.json", "logged-out", "profiles", "state"].sort(),
     );
     expect(readdirSync(join(fresh, "profiles"))).toEqual(["work"]);
     expect(readFileSync(join(fresh, "profiles", "work", "key.json"), "utf8")).toBe("work key");

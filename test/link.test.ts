@@ -1,69 +1,11 @@
 /**
- * RFC-027 T4a — the two seams between the plugin and the SDK `Session`:
- * link/client.ts (the plugin's credential as the Session's client) and
- * link/adapter.ts (entries → channel notifications, pending until the model has them).
+ * RFC-027 — link/adapter.ts, the seam between the SDK `Session` and the host:
+ * entries → channel notifications, pending until the model has them.
  */
 import { describe, test, expect } from "bun:test";
-import { isTerminalCredentialError, isAgentClientError, type Entry, type Inbound } from "../vendor/bridge-agent-sdk/index.js";
-import { CredentialError, type CredentialManager } from "../auth/manager";
-import { sessionClient, toAgentClientError, credentialCause } from "../link/client";
+import type { Entry, Inbound } from "../vendor/bridge-agent-sdk/index.js";
 import { channelAdapter, render, type AdapterDeps, type Rendered } from "../link/adapter";
 import { deliveredEntryId } from "../delivery/tags";
-
-const KINDS: CredentialError["kind"][] = ["not_logged_in", "profile", "api_url", "logged_out", "session_revoked", "session_limit", "too_old", "refused", "network"];
-
-describe("link/client — credential errors keep their meaning across the seam", () => {
-  test("every kind but network stops the Session; network retries", () => {
-    for (const kind of KINDS) {
-      const e = toAgentClientError(new CredentialError(kind, `msg ${kind}`));
-      expect(isTerminalCredentialError(e)).toBe(kind !== "network");
-      expect(e.message).toBe(`msg ${kind}`);
-      expect(credentialCause(e)?.kind).toBe(kind);
-    }
-  });
-
-  test("too_old stays too_old (the Session's own too-old stop); anything not a CredentialError retries", () => {
-    expect(toAgentClientError(new CredentialError("too_old", "x")).code).toBe("too_old");
-    const other = toAgentClientError(new Error("discovery 503"));
-    expect(other.code).toBe("network");
-    expect(isTerminalCredentialError(other)).toBe(false);
-    expect(credentialCause(other)).toBeNull();
-  });
-
-  function fakeCreds(over: Partial<CredentialManager> = {}): CredentialManager {
-    return { apiUrl: () => "https://b.example", wsAuth: async () => ({ token: "t", dpop: "p" }), grant: () => null, ...over } as unknown as CredentialManager;
-  }
-
-  test("wsAuth rejects with an AgentClientError carrying the CredentialError", async () => {
-    const c = sessionClient(fakeCreds({ wsAuth: () => Promise.reject(new CredentialError("logged_out", "signed out")) }), { sessionKey: () => "k", softwareId: "s", softwareVersion: "0.30.0", api: async () => ({}) });
-    const err = await c.wsAuth().catch((e) => e);
-    expect(isAgentClientError(err)).toBe(true);
-    expect(credentialCause(err)?.kind).toBe("logged_out");
-  });
-
-  test("rotate reaches the subscribed Session only until it unsubscribes", () => {
-    const c = sessionClient(fakeCreds(), { sessionKey: () => "k", softwareId: "s", softwareVersion: "v", api: async () => ({}) });
-    const got: string[] = [];
-    const off = c.onAccessRotated((f) => got.push(f.token));
-    c.rotate({ token: "a", dpop: "p" });
-    off();
-    c.rotate({ token: "b", dpop: "p" });
-    expect(got).toEqual(["a"]);
-  });
-
-  test("api subset → the plugin's own JSON helper, on the server's paths", async () => {
-    const calls: unknown[] = [];
-    const c = sessionClient(fakeCreds(), { sessionKey: () => "k", softwareId: "s", softwareVersion: "v", api: async (...a) => (calls.push(a), { id: "x" }) });
-    await c.api.messages.create("ch1", { content: "hi" });
-    await c.api.threads.reply("t/1", { content: "yo" });
-    await c.api.deliveries.list();
-    expect(calls).toEqual([
-      ["POST", "/api/messages", { channelId: "ch1", content: "hi" }],
-      ["POST", "/api/threads/t%2F1/messages", { content: "yo" }],
-      ["GET", "/api/deliveries", undefined],
-    ]);
-  });
-});
 
 const ME = { grant: "01992f6e-0000-7000-8000-00000000aaaa", agent: "agent-me" };
 

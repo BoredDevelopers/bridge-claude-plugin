@@ -8,7 +8,7 @@ merging to `main` ships nothing until `bun run release`.
 
 ```bash
 bun test               # full suite (~14 min); target files while iterating
-bun run typecheck      # tsc + the auth/core purity gate (tsconfig.core.json)
+bun run typecheck      # tsc (server, auth, link, delivery, tests)
 bun run release        # on main, after the version-bump PR merged + CI green: tag, pin listing (--dry-run first)
 EINWEAVE_API_DIR=<bridge checkout>/packages/api bun test test/key-credentials-real-api.test.ts   # real-API gate
 ```
