@@ -19,6 +19,7 @@ import {
   isAddressed,
   isKeyAlreadyEnrolled,
   isOAuthError,
+  joinStateSeq,
   randomB64url,
   reconnectDelay,
   softwareSigner,
@@ -808,7 +809,7 @@ function pendingMeta(entry) {
 }
 
 // src/runtime/sdk-version.generated.ts
-var SDK_VERSION = "0.5.1";
+var SDK_VERSION = "0.6.0";
 
 // src/runtime/api.ts
 var HTTP_TIMEOUT_MS = 20000;
@@ -891,7 +892,10 @@ function createApi(rt, client) {
   };
   return {
     channels: {
-      list: () => req("GET", "/api/channels"),
+      list: (p = {}) => req("GET", `/api/channels${p.includeArchived ? "?includeArchived=true" : ""}`),
+      join: (channelId) => req("POST", `/api/channels/${encodeURIComponent(channelId)}/join`, { body: {} }),
+      leave: (channelId) => req("POST", `/api/channels/${encodeURIComponent(channelId)}/leave`, { body: {} }),
+      audience: (channelId) => req("GET", `/api/channels/${encodeURIComponent(channelId)}/audience`),
       readState: () => req("GET", "/api/channels/read-state"),
       markRead: (channelId, body) => req("POST", `/api/channels/${encodeURIComponent(channelId)}/read`, { body: body ?? {} })
     },
@@ -926,7 +930,8 @@ function createApi(rt, client) {
       claim: (messageId) => req("POST", `/api/tasks/${encodeURIComponent(messageId)}/claim`),
       updateStatus: (messageId, body) => req("PUT", `/api/tasks/${encodeURIComponent(messageId)}/status`, { body }),
       cancel: (messageId, reason) => req("POST", `/api/tasks/${encodeURIComponent(messageId)}/cancel`, { body: reason ? { reason } : {} }),
-      list: (p = {}) => req("GET", `/api/tasks${qs(p)}`)
+      list: (p = {}) => req("GET", `/api/tasks${qs(p)}`),
+      audience: (messageId) => req("GET", `/api/tasks/${encodeURIComponent(messageId)}/audience`)
     }
   };
 }
@@ -1167,11 +1172,7 @@ class AgentClient {
     if (signer.jkt !== record.installation.jkt) {
       throw new AgentClientError({ code: "refused", message: "the store's key does not match its installation" });
     }
-    let attempt = await this.opts.store.readAttempt();
-    if (attempt === null) {
-      attempt = randomB64url(16);
-      await this.opts.store.writeAttempt(attempt);
-    }
+    const attempt = await this.opts.store.createAttempt(randomB64url(32));
     const reconnect = this.reconnectNext;
     let g;
     try {
@@ -1292,31 +1293,37 @@ class AgentClient {
       return "deleted";
     }, this.lockOpts());
   }
-  async enrolWithKey(enrolmentKey, installationName) {
-    const meta = await this.discoverOrRefuse();
-    let key = await generateSoftwareKey();
-    let g;
-    try {
-      g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName });
-    } catch (e) {
-      if (!isKeyAlreadyEnrolled(e))
-        throw this.toClientError(e);
-      key = await generateSoftwareKey();
-      g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName });
-    }
-    await this.writeEnrolment(meta, installationName, g, key);
-    return g;
+  async enrolWithKey(enrolmentKey, installationName, opts = {}) {
+    return this.opts.store.withLock(async (signal) => {
+      if (await this.opts.store.read())
+        return null;
+      const meta = await this.discoverOrRefuse(signal);
+      let key = await generateSoftwareKey();
+      let g;
+      try {
+        g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName }, { signal });
+      } catch (e) {
+        if (!isKeyAlreadyEnrolled(e))
+          throw this.toClientError(e);
+        key = await generateSoftwareKey();
+        g = await this.tokens.enrolWithKey(meta, key.signer, { enrolmentKey, installationName }, { signal }).catch((e2) => {
+          throw this.toClientError(e2);
+        });
+      }
+      await this.writeEnrolmentLocked(signal, meta, installationName, g, key, opts);
+      return g;
+    }, this.lockOpts());
   }
-  async enrolWithAuthorizationCode(p, installationName) {
+  async enrolWithAuthorizationCode(p, installationName, opts = {}) {
     const meta = await this.discoverOrRefuse();
-    const key = await generateSoftwareKey();
+    const key = opts.key ?? await generateSoftwareKey();
     const g = await this.tokens.exchangeCode(meta, key.signer, p).catch((e) => {
       throw this.toClientError(e);
     });
-    await this.writeEnrolment(meta, installationName, g, key);
+    await this.writeEnrolment(meta, installationName, g, key, opts);
     return g;
   }
-  async deviceAuthorization(installationName) {
+  async deviceAuthorization(installationName, opts = {}) {
     const meta = await this.discoverOrRefuse();
     const auth = await this.tokens.deviceAuthorization(meta, installationName).catch((e) => {
       throw this.toClientError(e);
@@ -1334,17 +1341,22 @@ class AgentClient {
         return await this.tokens.pollDeviceCode(meta, key.signer, auth.device_code);
       }
     };
-    const complete = async (opts = {}) => {
-      const r = await pollDeviceCode(this.rt, poll, auth, opts);
+    const complete = async (o = {}) => {
+      const r = await pollDeviceCode(this.rt, poll, auth, o);
       if (!r.ok)
         throw new AgentClientError({ code: r.error === "cancelled" ? "aborted" : "refused", message: r.error });
-      await this.writeEnrolment(meta, installationName, r.grant, key);
+      const confirm = opts.confirm;
+      if (confirm && !await Promise.resolve().then(() => confirm(r.grant)).catch(() => false)) {
+        await this.revokeGrant(meta, key.signer, r.grant).catch(() => {});
+        throw new AgentClientError({ code: "declined", message: "the person declined binding this machine to that agent" });
+      }
+      await this.writeEnrolment(meta, installationName, r.grant, key, opts);
       return r.grant;
     };
     return { auth, complete };
   }
-  async discoverOrRefuse() {
-    const meta = await this.tokens.discover(this.opts.apiUrl).catch((e) => {
+  async discoverOrRefuse(signal) {
+    const meta = await this.tokens.discover(this.opts.apiUrl, signal).catch((e) => {
       throw this.toClientError(e);
     });
     if (!supportsKeyCredentials(meta)) {
@@ -1352,42 +1364,52 @@ class AgentClient {
     }
     return meta;
   }
-  async writeEnrolment(meta, name, g, key) {
-    await this.opts.store.withLock(async (signal) => {
-      const old = await this.opts.store.read();
-      const oldAttempt = old ? await this.opts.store.readAttempt() : null;
-      try {
-        await this.opts.store.write({
-          installation: {
-            installationId: g.installation_id,
-            installationName: name,
-            apiUrl: this.opts.apiUrl,
-            jkt: key.signer.jkt,
-            keyStorage: key.signer.keyStorage,
-            ...g.agent ? { agent: g.agent } : {},
-            ...g.workspace ? { workspace: g.workspace } : {}
-          },
-          privateJwk: key.privateJwk,
-          joinState: g.join_state
-        });
-        await this.opts.store.clearAttempt();
-      } catch (e) {
-        await this.revokeGrant(meta, key.signer, g, signal).catch(() => {});
-        if (old && old.installation.installationId !== g.installation_id) {
-          await this.revokeRecord(old, oldAttempt, signal).catch(() => {});
-        }
-        throw e;
-      }
-      this.access = null;
-      this.stopped = null;
-      this.sessionBlocked = false;
-      this.reconnectNext = false;
-      this.mintNotBefore = 0;
-      this.resourceNonce = undefined;
+  async writeEnrolment(meta, name, g, key, opts = {}) {
+    await this.opts.store.withLock((signal) => this.writeEnrolmentLocked(signal, meta, name, g, key, opts), this.lockOpts());
+  }
+  async writeEnrolmentLocked(signal, meta, name, g, key, opts) {
+    const old = await this.opts.store.read();
+    const oldAttempt = old ? await this.opts.store.readAttempt() : null;
+    try {
+      await this.opts.store.write({
+        installation: {
+          installationId: g.installation_id,
+          installationName: name,
+          apiUrl: this.opts.apiUrl,
+          jkt: key.signer.jkt,
+          keyStorage: key.signer.keyStorage,
+          ...g.agent ? { agent: g.agent } : {},
+          ...g.workspace ? { workspace: g.workspace } : {}
+        },
+        privateJwk: key.privateJwk,
+        joinState: g.join_state
+      });
+      await this.opts.store.clearAttempt();
+    } catch (e) {
+      await this.revokeGrant(meta, key.signer, g, signal).catch(() => {});
       if (old && old.installation.installationId !== g.installation_id) {
         await this.revokeRecord(old, oldAttempt, signal).catch(() => {});
       }
-    }, this.lockOpts());
+      throw e;
+    }
+    this.access = null;
+    this.stopped = null;
+    this.sessionBlocked = false;
+    this.reconnectNext = false;
+    this.mintNotBefore = 0;
+    this.resourceNonce = undefined;
+    try {
+      await opts.onWritten?.();
+    } catch {}
+    if (old && old.installation.installationId !== g.installation_id) {
+      try {
+        await this.revokeRecord(old, oldAttempt, signal);
+      } catch (e) {
+        try {
+          opts.onPreviousRevokeFailed?.(old.installation, e);
+        } catch {}
+      }
+    }
   }
   async revokeGrant(meta, signer, g, signal) {
     await this.tokens.revoke(meta, signer, { installationId: g.installation_id, joinState: g.join_state, attempt: null, scope: "installation" }, { signal });
@@ -1399,16 +1421,22 @@ class AgentClient {
   }
   async logout(opts = {}) {
     const revoke = opts.revoke ?? true;
-    await this.opts.store.withLock(async (signal) => {
+    const result = await this.opts.store.withLock(async (signal) => {
       const record = await this.opts.store.read();
+      let outcome = "skipped";
       if (record && revoke) {
         try {
           const meta = await this.tokens.discover(record.installation.apiUrl, signal);
           const signer = this.opts.signer ?? await softwareSigner(record.privateJwk);
           await this.tokens.revoke(meta, signer, { installationId: record.installation.installationId, joinState: record.joinState, attempt: await this.opts.store.readAttempt(), scope: "installation" }, { signal });
-        } catch {}
+          outcome = "revoked";
+        } catch (e) {
+          const a = classifyTokenError(e);
+          outcome = a.kind === "installation_gone" ? a.reason === "installation_locked" ? "locked" : "revoked" : { failed: e instanceof Error ? e.message : String(e) };
+        }
       }
       await this.opts.store.clear();
+      return { installation: record?.installation ?? null, revoke: outcome };
     }, this.lockOpts());
     this.access = null;
     this.stopped = null;
@@ -1416,6 +1444,7 @@ class AgentClient {
     this.reconnectNext = false;
     this.mintNotBefore = 0;
     this.resourceNonce = undefined;
+    return result;
   }
   session(opts = {}) {
     return new Session(this.rt, this, opts);
@@ -1496,8 +1525,16 @@ function memoryCredentialStore() {
       record = r;
     },
     async writeJoinState(joinState) {
-      if (record)
-        record = { ...record, joinState };
+      if (!record)
+        return false;
+      const next = joinStateSeq(joinState);
+      const cur = joinStateSeq(record.joinState);
+      if (next === null)
+        throw new Error("refusing to write a malformed join state");
+      if (cur !== null && cur > next)
+        return false;
+      record = { ...record, joinState };
+      return true;
     },
     async clear() {
       record = null;
@@ -1506,8 +1543,10 @@ function memoryCredentialStore() {
     async readAttempt() {
       return attempt;
     },
-    async writeAttempt(a) {
-      attempt = a;
+    async createAttempt(candidate) {
+      if (attempt === null)
+        attempt = candidate;
+      return attempt;
     },
     async clearAttempt() {
       attempt = null;

@@ -7,7 +7,7 @@
 export { createRuntime } from "./runtime";
 export type { Runtime, RuntimePorts, RuntimeIdentity, Timer, TimerHandle, WallClock, RandomFn, WebSocketLike, WebSocketCtor, FetchLike } from "./ports";
 export { WS_READY_STATE } from "./ports";
-export { AgentClient, type AgentClientOptions } from "./client";
+export { AgentClient, type AgentClientOptions, type EnrolOptions, type LogoutResult } from "./client";
 export { AgentClientError, isAgentClientError, isTerminalCredentialError, type AgentClientErrorCode, type AgentClientErrorInit } from "./errors";
 export { type Api, ApiRequestError, isApiRequestError, type ChannelSummary, type ReadStateEntry, type MarkReadResult, type MessageEnvelope, type SendBody, type SendResult, type ThreadSummary, type ThreadResult, type ThreadMessagesResult, type AgentSummary, type ContextSummary, type PresencePrincipal, type PresenceList, type TaskResult, } from "./api";
 export { Session, type ReceiptEvent, type SessionClient, type SessionOptions, type SessionStatus, type SessionStop, type StopKind } from "./session";

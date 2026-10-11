@@ -166,9 +166,16 @@ export interface TaskResult {
 export type Api = ReturnType<typeof createApi>;
 export declare function createApi(rt: Runtime, client: AgentClient): {
     channels: {
-        list: () => Promise<{
+        /** `includeArchived`: an archived channel resolves too (so join/leave can say "archived", not "no such channel"). */
+        list: (p?: {
+            includeArchived?: boolean;
+        }) => Promise<{
             channels: ChannelSummary[];
         }>;
+        join: (channelId: string) => Promise<unknown>;
+        leave: (channelId: string) => Promise<unknown>;
+        /** Who will read what is posted here (decision 17). */
+        audience: (channelId: string) => Promise<unknown>;
         readState: () => Promise<{
             channels: ReadStateEntry[];
         }>;
@@ -255,5 +262,7 @@ export declare function createApi(rt: Runtime, client: AgentClient): {
         }) => Promise<{
             tasks: TaskResult[];
         }>;
+        /** Who can see this task's thread (decision 17). */
+        audience: (messageId: string) => Promise<unknown>;
     };
 };

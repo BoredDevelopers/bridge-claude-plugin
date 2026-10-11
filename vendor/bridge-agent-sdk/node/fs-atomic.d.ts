@@ -24,6 +24,9 @@ export declare const __fsIo: {
 /** Synchronous sleep for the writers below (all synchronous, like the plugin's originals):
  * `Atomics.wait` on a private buffer — no timer, no Bun-only sleep API. */
 export declare function sleepSync(ms: number): void;
+export declare function writeAllAndSync(fd: number, content: string): void;
+/** fsync a DIRECTORY, so a create/rename/unlink in it survives a crash. Unsupported (Windows: EPERM/EISDIR) is not an error. */
+export declare function fsyncDir(dir: string): void;
 export declare function removeQuiet(path: string): void;
 /**
  * tmp (0600) → write → [fsync when `durable`] → rename → [fsync the directory when

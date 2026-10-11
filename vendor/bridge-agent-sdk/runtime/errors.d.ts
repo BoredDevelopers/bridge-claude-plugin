@@ -14,6 +14,8 @@
  */
 import type { InstallationGoneReason } from "../core";
 export type AgentClientErrorCode = "not_enrolled" | "installation_gone" | "clock" | "session_revoked" | "session_limit" | "corrupt_state" | "update_required" | "rate_limited" | "too_old" | "refused" | "network" | "aborted"
+/** The person declined binding this machine to the approved agent (device flow `confirm`). */
+ | "declined"
 /** The store's installation was enrolled against a DIFFERENT server than this client's
  * own `apiUrl` (`AgentClient.mintInside`'s own check, origins compared via `apiOrigin`)
  * — never minted at all, so never a real server refusal, and never a 4001: retrying
