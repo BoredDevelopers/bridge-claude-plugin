@@ -53,6 +53,8 @@ type Stub = {
   setError: (status: number, body: string) => void;
   /** Every `POST /api/channels/:id/read` as { channelId, body }, in order. */
   marks: { channelId: string; body: any }[];
+  /** Every `ack` frame the plugin sent over the socket (RFC-027 D4), in order. */
+  acks: { ids: string[]; how: string }[];
   stop: () => void;
 };
 
@@ -79,6 +81,7 @@ function startStub(): Stub {
   let failWith: { status: number; body: string } | null = null;
   const queries: string[] = [];
   const marks: { channelId: string; body: any }[] = [];
+  const acks: { ids: string[]; how: string }[] = [];
   let cursor = 0; // the stored channel read position
   const agentAuth = createAgentAuthRoutes();
   agentAuth.addEnrolmentKey(ENROLMENT_KEY);
@@ -133,6 +136,7 @@ function startStub(): Stub {
       message(ws, raw2) {
         let frame: any = {};
         try { frame = JSON.parse(String(raw2)); } catch { return; }
+        if (frame.type === "ack") acks.push({ ids: frame.ids, how: frame.how });
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
@@ -151,6 +155,7 @@ function startStub(): Stub {
     connected: () => socket !== null,
     queries,
     marks,
+    acks,
     setChannel: (r) => { channel = r; raw = null; failWith = null; cursor = 0; },
     setRawResponse: (r) => { raw = r; },
     setError: (status, body) => { failWith = { status, body }; },
@@ -312,6 +317,17 @@ describe("read_messages resumes exactly, or says why it cannot", () => {
       "00000000-0000-7000-9000-000000000008",
       "00000000-0000-7000-9000-000000000009",
     ]);
+  });
+
+  test("RFC-027 D4: what a read RETURNED is acked `model` — a peek (mark_read: false) too", async () => {
+    stub.setChannel(channelOf(5));
+    const body = await read({ since_seq: 2, mark_read: false });
+    const returned = body.messages.map((m: any) => m.id);
+    expect(returned).toHaveLength(3);
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && stub.acks.length === 0) await Bun.sleep(25);
+    expect(stub.acks).toEqual([{ ids: returned, how: "model" }]);
+    expect(stub.marks).toHaveLength(0); // read position untouched: a peek is still a delivery
   });
 
   test("since_seq: 0 is a real cursor, and reads from the beginning", async () => {

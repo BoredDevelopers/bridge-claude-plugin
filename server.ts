@@ -1748,6 +1748,19 @@ function requireBridge(): { content: { type: "text"; text: string }[] } | null {
  * A failure is REPORTED, never thrown: the read itself succeeded, and failing it
  * over bookkeeping would make the model retry a read that already worked.
  */
+/**
+ * RFC-027 D4: a read tool that RETURNED entries is evidence the model has them — ack them
+ * `model` (✓✓), mark_read or not (read position is a different thing from delivery). Any of
+ * this agent's ids; the Session queues it while offline and the server ignores ids it does
+ * not owe. Their missed-tracking ends here too.
+ */
+function confirmReturned(ids: unknown[]): void {
+  const list = ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+  if (list.length === 0) return;
+  session?.ack(list, "model");
+  for (const id of list) tracker.settled(id);
+}
+
 async function markReadUpTo(
   path: string,
   fromSeq: number,
@@ -2930,6 +2943,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 Math.max(...returnedSeqs)
               )
             : {};
+        confirmReturned(messages.map((m: any) => m.id));
 
         return {
           content: [
@@ -3035,6 +3049,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 Math.max(...returnedSeqs)
               )
             : {};
+        confirmReturned([...(includeParent ? [data.parent.id] : []), ...replies.map((r: any) => r.id)]);
 
         // RFC-015 timeline — the thread's lifecycle history (renames, resolves, answers
         // marked or withdrawn), on the FIRST page only, like the root: it is context.
