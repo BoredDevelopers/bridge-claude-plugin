@@ -248,11 +248,13 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("C14 flap guard: a 4001 soon after the immediate re-mint's auth is NOT immediate again; one after the socket stayed up long enough is", async () => {
+  // The re-arm after a socket stayed up REMINT_REARM_MS (30 s) is the SDK Session's, proven
+  // there on a fake clock (agent-sdk test/runtime/session.test.ts "M2").
+  test("C14 flap guard: a 4001 soon after the immediate re-mint's auth is NOT immediate again; /bridge:connect re-arms it", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
-      { EINWEAVE_TEST_REMINT_REARM_MS: "1500" },
+      {},
       async (client) => {
         const connected = async () => (await status(client)).websocket === "connected";
         expect(await until(connected, 5_000)).toBe(true);
@@ -267,41 +269,14 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(await until(connected, 5_000)).toBe(true);
         stub.closeAll(4001, "Invalid token"); // spends the re-armed immediate re-mint
         expect(await until(() => stub.stats.authTokens.length >= 4, 2_000)).toBe(true);
-        expect(await until(connected, 5_000)).toBe(true);
-        await Bun.sleep(1_800); // stable past the (test) re-arm window: re-armed without anyone acting
-        stub.closeAll(4001, "Invalid token");
-        expect(await until(() => stub.stats.authTokens.length >= 5, 2_000)).toBe(true);
       },
       enrolledIn(stub)
     );
   }, 30_000);
 
-  test("C14 re-arm is per socket: a long-lived socket the liveness watchdog detached does not lend its uptime to the next socket's pre-auth 4001", async () => {
-    const stub = startAuthStub();
-    await withPlugin(
-      stub,
-      { EINWEAVE_TEST_REMINT_REARM_MS: "1500", EINWEAVE_TEST_LIVENESS_MS: "3000" },
-      async (client) => {
-        const connected = async () => (await status(client)).websocket === "connected";
-        expect(await until(connected, 5_000)).toBe(true);
-        stub.closeAll(4001, "Invalid token"); // spends the one immediate re-mint
-        expect(await until(() => stub.stats.authTokens.length >= 2, 2_000)).toBe(true);
-        expect(await until(connected, 5_000)).toBe(true);
-        const opens = stub.stats.wsOpens;
-        // The stub sends nothing after `authenticated`: the watchdog detaches this socket
-        // (> 1.5 s up) after ~3 s of silence and reconnects. That reconnect's auth is refused 4001.
-        stub.rejectNextWsAuths(1);
-        expect(await until(() => stub.stats.wsOpens > opens, 8_000)).toBe(true);
-        expect(await until(() => stub.stats.authTokens.length >= 3, 5_000)).toBe(true);
-        // Not re-armed (this socket was never authenticated): the slow step, not an immediate re-mint.
-        await Bun.sleep(1_000); // a negative
-        expect(stub.stats.authTokens).toHaveLength(3);
-        expect(String((await status(client)).websocket)).toContain("4001");
-      },
-      enrolledIn(stub)
-    );
-  }, 30_000);
-
+  // "C14 re-arm is per socket" (a watchdog-detached socket must not lend its uptime) is the
+  // SDK Session's now — agent-sdk test/runtime/session.test.ts "liveness watchdog
+  // detach-before-close" and "M2".
   test("a 4008 on the AUTH path (the server's grant re-check): its error frame is not told as a server error; the lock notice is told exactly once", async () => {
     const stub = startAuthStub();
     await withPlugin(
@@ -837,27 +812,24 @@ describe("plugin on key credentials (RFC-016)", () => {
       stub,
       { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" },
       async (client, dir, notices) => {
+        // The SDK Session mints BEFORE it opens a socket: against a server that cannot mint,
+        // no socket is ever opened. Each new try is visible as a new notice (a new episode).
         expect(await until(() => told(notices) === 1, 5_000)).toBe(true);
-        const opens = stub.stats.wsOpens;
         await Bun.sleep(1_000); // a negative across five credential-watch ticks
         expect(told(notices)).toBe(1);
-        expect(stub.stats.wsOpens).toBe(opens);
         expect(stub.stats.mintBodies).toHaveLength(0);
         // A login in ANOTHER session: the refusal was about the old installation — the
         // new one is tried (a new episode: refused again, so told again).
         await enrolledProfile(stub, dir);
-        expect(await until(() => stub.stats.wsOpens > opens, 5_000)).toBe(true);
         expect(await until(() => told(notices) === 2, 5_000)).toBe(true);
         // …and then it stops again: no retry loop on the new installation either.
-        const opens2 = stub.stats.wsOpens;
         await Bun.sleep(1_000);
-        expect(stub.stats.wsOpens).toBe(opens2);
         expect(told(notices)).toBe(2);
         // The person asks explicitly: tried again, and answered.
         await client.callTool({ name: "connect", arguments: {} });
-        expect(await until(() => stub.stats.wsOpens > opens2, 5_000)).toBe(true);
         expect(await until(() => told(notices) === 3, 5_000)).toBe(true);
         expect(stub.stats.mintBodies).toHaveLength(0);
+        expect(stub.stats.wsOpens).toBe(0);
       },
       enrolledIn(stub)
     );
