@@ -131,8 +131,9 @@ function startStub() {
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
+            v: 2,
             type: "authenticated",
-            data: { agentId: "scout", agentName: "Scout", contextId: "ctx-under-test" },
+            payload: { agentId: "scout", agentName: "Scout", contextId: "ctx-under-test" },
           }));
         }
       },

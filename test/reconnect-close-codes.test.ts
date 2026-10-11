@@ -65,8 +65,9 @@ function startStub(firstClose: Close | null, opts: { channels429?: boolean; clos
           return;
         }
         ws.send(JSON.stringify({
+          v: 2,
           type: "authenticated",
-          data: { agentId: "a", agentName: "A", contextId: "ctx" },
+          payload: { agentId: "a", agentName: "A", contextId: "ctx" },
         }));
       },
     },
@@ -290,7 +291,7 @@ function startTakeoverThenDropStub() {
           return;
         }
         liveSocket = ws;
-        ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "ctx" } }));
+        ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "ctx" } }));
         onAuthenticated?.();
       },
     },

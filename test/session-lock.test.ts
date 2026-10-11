@@ -407,7 +407,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type === "auth") {
             authFrame = frame;
-            ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "ctx" } }));
+            ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "ctx" } }));
           }
         },
       },
@@ -469,7 +469,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
             ws.close(4006, "Authentication timeout"); // transient — retries fast, on its own
             return;
           }
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -523,7 +523,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type !== "auth") return;
           // Deliberately NOT SESSION_ID — the server renamed us despite `supersede`.
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "some-connection-id" } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "some-connection-id" } }));
         },
       },
     });
@@ -609,7 +609,7 @@ describe("F2: a holder in reconnect backoff re-validates the lock before its OWN
           auths++;
           if (auths === 1) liveFirstSocket = ws;
           else bAuthFrames.push(frame);
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
           if (auths === 1) onFirstAuthenticated?.();
         },
         close(ws) {
@@ -726,7 +726,7 @@ describe("finding 5: lock renewal never renews a record that no longer names thi
           let frame: any = {};
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type !== "auth") return;
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -798,7 +798,7 @@ describe("finding 11a: a superseded window invalidates its access token and stop
             return;
           }
           auths++;
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -885,7 +885,7 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
           auths++;
           if (auths === 1) liveFirstSocket = ws;
           else bAuthFrames.push(frame);
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
           if (auths === 1) onFirstAuthenticated?.();
         },
         close(ws) {
@@ -1027,7 +1027,7 @@ describe("finding 3 (2026-09-27 re-review): a live holder's renewal must go supe
           liveSocket = ws;
           // Deliberately never sends a 4008 — the fix must notice on its OWN, via the
           // lock file, rather than wait for a server-driven close this stub never sends.
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
         close(ws) {
           if (liveSocket === ws) socketClosed = true;
@@ -1103,7 +1103,7 @@ describe("finding 2 (2026-09-27 re-review): the pre-send lock re-check", () => {
           try { frame = JSON.parse(String(raw)); } catch { return; }
           if (frame.type !== "auth") return;
           authFrames.push(frame);
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: SESSION_ID } }));
         },
       },
     });
@@ -1237,7 +1237,7 @@ describe("finding 7 (2026-09-27 re-review): an explicit takeover against a still
           if (frame.type !== "auth") return;
           authFrames.push(frame);
           // Deliberately NEVER SESSION_ID — every attempt is renamed to a connection id.
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "some-connection-id" } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "some-connection-id" } }));
         },
       },
     });

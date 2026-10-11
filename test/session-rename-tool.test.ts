@@ -62,8 +62,9 @@ function startStub() {
           authFrame = frame;
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
@@ -185,8 +186,9 @@ function startLabelStub() {
           authFrames.push(frame);
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: {
+              payload: {
                 agentId: "jorgen-mac",
                 agentName: "Jörgen (Mac)",
                 contextId: "ctx",

@@ -114,7 +114,7 @@ describe("finding 11b: proc state says \"connected\" only once authenticated, ne
           // window finding 11b is about: the lock is already won, but the socket has not
           // authenticated yet.
           new Promise<void>((r) => (releaseAuth = r)).then(() => {
-            ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "a", agentName: "A", contextId: "session-hold" } }));
+            ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "a", agentName: "A", contextId: "session-hold" } }));
           });
         },
       },

@@ -177,8 +177,9 @@ function startStub(): Stub {
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
+            v: 2,
             type: "authenticated",
-            data: { agentId: "bellman", agentName: "Bellman", contextId: "ctx-under-test" },
+            payload: { agentId: "bellman", agentName: "Bellman", contextId: "ctx-under-test" },
           }));
         }
       },

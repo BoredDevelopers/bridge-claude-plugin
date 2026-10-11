@@ -31,8 +31,8 @@
  *
  * THE SEAM. These drive the plugin from a stub server, so they pin the plugin
  * against the WIRE CONTRACT rather than against a particular server build:
- *   live frame  { type: "message", data: {...}, deliveryReasons: ["thread"] }
- *   replay      { type: "replay", data: { messages: [ {..., deliveryReasons } ] } }
+ *   { v: 2, type: "message", seq, payload: { message: {...}, deliveryReasons: ["thread"], redelivery? } }
+ *   (a resume replays missed frames the same way, flagged `redelivery`)
  * The server half of the same contract is pinned in the bridge repo by
  * `packages/api/test/delivery-reasons.test.ts`, which asserts the frame it emits
  * has exactly this shape — including that `deliveryReasons` is an ARRAY beside
@@ -82,8 +82,9 @@ function startStub(): Stub {
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
+            v: 2,
             type: "authenticated",
-            data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx-under-test" },
+            payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx-under-test" },
           }));
         }
       },
@@ -109,6 +110,21 @@ const message = (id: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
+/** A protocol-v2 `message` frame (RFC-027): sequenced, the reasons beside the message. */
+let seq = 0;
+const msgFrame = (m: Record<string, unknown>, deliveryReasons?: string[], redelivery = false) => ({
+  v: 2,
+  type: "message",
+  seq: ++seq,
+  payload: { message: { senderContextId: null, threadId: null, ...m }, ...(deliveryReasons ? { deliveryReasons } : {}), ...(redelivery ? { redelivery: true } : {}) },
+});
+
+/** The host's MCP handshake — channel pushes wait for `initialized`. */
+function handshake(stdin: any): void {
+  stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } }) + "\n");
+  stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+}
+
 describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
   let dir = "";
   let stub: Stub;
@@ -132,6 +148,7 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
     out = "";
+    handshake(plugin.stdin);
     (async () => {
       const dec = new TextDecoder();
       for await (const chunk of plugin.stdout as any) out += dec.decode(chunk, { stream: true });
@@ -159,11 +176,7 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
   }
 
   test("a thread reply in a filtered channel SURFACES with its thread id in meta", async () => {
-    stub.send({
-      type: "message",
-      data: message("msg-thread-1", { threadId: "thr-1" }),
-      deliveryReasons: ["thread"],
-    });
+    stub.send(msgFrame(message("msg-thread-1", { threadId: "thr-1" }), ["thread"]));
     expect(await surfaced("msg-thread-1")).toBe(true);
     // RFC-012 slice 5.2: the surrogate thread id rides the inbound meta as
     // `thread_id` (from msg.threadId, not the legacy parent id), so the model can
@@ -176,15 +189,16 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
     // row stored before the server learned to). The host renders escape sequences in
     // channel content, so what matters is the notification on stdout.
     const ESC = "\x1b";
-    stub.send({
-      type: "message",
-      data: message("msg-ansi-1", {
-        // OSC 52 clipboard write, a colour code, and a bare CR that would overwrite the line.
-        content: `${ESC}]52;c;aGVsbG8=\x07${ESC}[31mAlert${ESC}[0m: deploy failed\rFAKE`,
-        agentName: `${ESC}[8maio${ESC}[28m`,
-      }),
-      deliveryReasons: ["mention"],
-    });
+    stub.send(
+      msgFrame(
+        message("msg-ansi-1", {
+          // OSC 52 clipboard write, a colour code, and a bare CR that would overwrite the line.
+          content: `${ESC}]52;c;aGVsbG8=\x07${ESC}[31mAlert${ESC}[0m: deploy failed\rFAKE`,
+          agentName: `${ESC}[8maio${ESC}[28m`,
+        }),
+        ["mention"]
+      )
+    );
     expect(await surfaced("msg-ansi-1")).toBe(true);
     // Wait for the COMPLETE JSON-RPC line, then read the payload the host receives.
     let notification: any = null;
@@ -202,11 +216,7 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
   }, 30_000);
 
   test("a mention in a filtered channel SURFACES", async () => {
-    stub.send({
-      type: "message",
-      data: message("msg-mention-1"),
-      deliveryReasons: ["mention"],
-    });
+    stub.send(msgFrame(message("msg-mention-1"), ["mention"]));
     expect(await surfaced("msg-mention-1")).toBe(true);
   }, 30_000);
 
@@ -215,29 +225,21 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
     // because it is IN THE ADDRESSED TIER, not because anything here names it.
     // If someone re-implements this as `if (reason === "thread" || ...)`, this is
     // the test that goes red.
-    stub.send({
-      type: "message",
-      data: message("msg-assignee-1", { type: "task" }),
-      deliveryReasons: ["assignee"],
-    });
+    stub.send(msgFrame(message("msg-assignee-1", { type: "task" }), ["assignee"]));
     expect(await surfaced("msg-assignee-1")).toBe(true);
   }, 30_000);
 
   test("THE CONTROL: broadcast-only traffic in a filtered channel is still DROPPED", async () => {
     // Without this, "addressed messages arrive" could just as well mean "the
     // filter stopped working", which is a different bug with the same green test.
-    stub.send({
-      type: "message",
-      data: message("msg-broadcast-1"),
-      deliveryReasons: ["channel"],
-    });
+    stub.send(msgFrame(message("msg-broadcast-1"), ["channel"]));
     expect(await surfaced("msg-broadcast-1", 2000)).toBe(false);
   }, 30_000);
 
   test("no reasons at all — an older server — keeps the old channel-only behaviour", async () => {
     // No version negotiation: a server that predates this sends no field, the
     // bypass is false, and the filter applies exactly as before.
-    stub.send({ type: "message", data: message("msg-legacy-1", { threadId: "thr-1" }) });
+    stub.send(msgFrame(message("msg-legacy-1", { threadId: "thr-1" })));
     expect(await surfaced("msg-legacy-1", 2000)).toBe(false);
   }, 30_000);
 
@@ -257,46 +259,23 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
     // before the own-message check ever runs: it would have passed against a
     // plugin with no echo guard at all. The message has to CLEAR the filter so
     // that the own-message skip is the only thing left that can stop it.
-    stub.send({
-      type: "message",
-      data: message("msg-own-1", { agentId: "jorgen-mac", channelId: "general", threadId: "thr-1" }),
-      deliveryReasons: [],
-    });
+    stub.send(msgFrame(message("msg-own-1", { agentId: "jorgen-mac", channelId: "general", threadId: "thr-1" }), []));
     expect(await surfaced("msg-own-1", 2000)).toBe(false);
 
     // Proof the channel was not what stopped it: the same channel, a different
     // sender, surfaces.
-    stub.send({
-      type: "message",
-      data: message("msg-own-control", { channelId: "general" }),
-      deliveryReasons: ["channel"],
-    });
+    stub.send(msgFrame(message("msg-own-control", { channelId: "general" }), ["channel"]));
     expect(await surfaced("msg-own-control", 3000), "general must be deliverable").toBe(true);
   }, 30_000);
 
-  test("REPLAY: an addressed message surfaces on catch-up too", async () => {
-    // Catch-up is the second place the same message can be lost — a reconnecting
-    // client runs the identical filter over replayed rows. In a batch the reason
-    // rides ON each message rather than beside it.
-    //
-    // BOTH messages go in ONE batch on purpose. Replay is held behind a gate and
-    // flushed on the first tool call or after a 10s fallback, so a short wait
-    // makes the negative VACUOUS — the broadcast message would be "absent"
-    // merely because nothing had flushed yet, and this test would pass against a
-    // plugin that surfaced neither. Pairing them means the thread message
-    // arriving is proof the flush happened, and only then does the broadcast
-    // message still being absent mean the filter ran. Found by writing the
-    // negative first and watching it pass for the wrong reason.
-    stub.send({
-      type: "replay",
-      data: {
-        messages: [
-          message("msg-replay-thread", { threadId: "thr-9", deliveryReasons: ["thread"] }),
-          message("msg-replay-broadcast", { deliveryReasons: ["channel"] }),
-        ],
-      },
-    });
-    expect(await surfaced("msg-replay-thread", 15_000), "flush did not happen").toBe(true);
-    expect(await surfaced("msg-replay-broadcast", 1000), "same flushed batch").toBe(false);
+  test("RESUME: an addressed redelivery surfaces; a broadcast one is still filtered", async () => {
+    // A resume (RFC-027 D5) replays what this session missed as ordinary sequenced frames
+    // flagged `redelivery` — the SAME filter runs over them as over live ones. Paired, so
+    // the addressed one arriving proves the frames were processed: only then does the
+    // broadcast one being absent mean the filter ran (not that nothing was delivered yet).
+    stub.send(msgFrame(message("msg-replay-thread", { threadId: "thr-9" }), ["thread"], true));
+    stub.send(msgFrame(message("msg-replay-broadcast"), ["channel"], true));
+    expect(await surfaced("msg-replay-thread", 5_000), "redelivery not processed").toBe(true);
+    expect(await surfaced("msg-replay-broadcast", 1000), "same resume").toBe(false);
   }, 40_000);
 });

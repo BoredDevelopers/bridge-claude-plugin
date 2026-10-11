@@ -216,7 +216,7 @@ export function createAuthCore(opts: StubOptions = {}) {
     const frame: Record<number, string> = { 4001: "Invalid token", 1011: "grant check failed", 4009: "Access token expired", 4008: reason };
     if (frame[code]) {
       try {
-        ws.send(JSON.stringify({ type: "error", data: { message: frame[code] } }));
+        ws.send(JSON.stringify({ v: 2, type: "error", payload: { message: frame[code] } }));
       } catch {}
     }
     ws.close(code, reason);
@@ -756,14 +756,14 @@ export function startAuthStub(opts: StubOptions = {}) {
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
           ws.data.session = a.session;
           const s = core.sessions.get(a.session)!;
-          ws.send(JSON.stringify({ type: "authenticated", data: { agentId: "agent-1", agentName: "Agent", contextId: s.key } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "agent-1", agentName: "Agent", contextId: s.key } }));
         } else if (f.type === "reauth") {
           const a = core.wsCheck(origin, f);
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
           core.stats.reauths++;
           core.stats.reauthTokens.push(f.token);
           ws.data.session = a.session;
-          ws.send(JSON.stringify({ type: "reauthenticated", data: { expiresAt: a.exp } }));
+          ws.send(JSON.stringify({ v: 2, type: "reauthenticated", payload: { expiresAt: a.exp } }));
         }
       },
     },

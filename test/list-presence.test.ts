@@ -59,8 +59,9 @@ function startStub(): Stub {
         if (frame.type === "auth") {
           socket = ws;
           ws.send(JSON.stringify({
+            v: 2,
             type: "authenticated",
-            data: { agentId: "aio", agentName: "Aio", handle: "aio", contextId: "ctx-under-test" },
+            payload: { agentId: "aio", agentName: "Aio", handle: "aio", contextId: "ctx-under-test" },
           }));
         }
       },

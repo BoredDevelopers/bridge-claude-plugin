@@ -1139,7 +1139,8 @@ const LOCK_RETRY_MS = testKnob("EINWEAVE_TEST_LOCK_RETRY_MS", (n) => Number.isIn
 const REMINT_REARM_MS = 30_000;
 /**
  * Notifications sent before the host has finished its MCP handshake are lost. The
- * first tool call proves it is ready; this is the fallback when none comes.
+ * host's `initialized` notification opens the gate (mcp.oninitialized, below); the
+ * first tool call proves it too; this is the fallback when neither is seen.
  */
 const HOST_READY_FALLBACK_MS = 10_000;
 
@@ -1744,6 +1745,9 @@ const mcp = new Server(
     ].join("\n"),
   }
 );
+
+// The host finished the handshake: channel pushes may flow (the gate in the link core).
+mcp.oninitialized = () => openHostGate();
 
 // RFC-022 D2 — THE ONE CHOKE POINT for text that reaches the host's terminal.
 // Every `notifications/claude/channel` goes out through `mcp.notification`, so the

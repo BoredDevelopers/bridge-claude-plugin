@@ -40,8 +40,9 @@ function startAdviceStub(clients: Array<Record<string, unknown> | undefined>) {
         const client = clients[Math.min(auths, clients.length - 1)];
         auths++;
         ws.send(JSON.stringify({
+          v: 2,
           type: "authenticated",
-          data: { agentId: "a", agentName: "A", contextId: "ctx", ...(client ? { client } : {}) },
+          payload: { agentId: "a", agentName: "A", contextId: "ctx", ...(client ? { client } : {}) },
         }));
       },
     },

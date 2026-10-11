@@ -100,8 +100,9 @@ function startAuthStub() {
           authFrame = frame;
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
@@ -235,8 +236,9 @@ function startToolStub() {
           authFrames.push(frame);
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
@@ -654,8 +656,9 @@ function startGuardStub() {
           authFrame = frame;
           ws.send(
             JSON.stringify({
+              v: 2,
               type: "authenticated",
-              data: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
+              payload: { agentId: "jorgen-mac", agentName: "Jörgen (Mac)", contextId: "ctx" },
             })
           );
         }
