@@ -14,14 +14,16 @@
  *
  * The server is found through `<state>/ctl/c$CLAUDE_PID.sock` (`ctl-path.ts`).
  *
- * FAIL OPEN, ALWAYS. No CLAUDE_PID, no socket, a slow or broken server, bad stdin:
+ * FAIL OPEN, ALWAYS. No CLAUDE_PID, no socket, a socket directory that is not ours, a slow or broken server, bad stdin:
  * exit 0 and print nothing. This runs on every prompt the user types; it may cost
  * a Bridge confirmation, never the user's prompt. And stdout is model context:
  * the only thing ever written there is the one JSON object below.
  */
 import { writeSync } from "node:fs";
+import { dirname } from "node:path";
 import { deliveredEntryId } from "../delivery/tags";
 import { ctlSocketPath } from "../delivery/ctl-path";
+import { checkPrivateDir } from "../delivery/private-dir";
 import { resolveStateDir } from "../state-dir";
 import type { CtlRequest } from "../delivery/ctl-protocol";
 
@@ -107,6 +109,9 @@ async function main(): Promise<void> {
   const payload = await readPayload();
   if (!pid) return;
   const path = ctlSocketPath(stateDir, pid);
+  // What the socket answers is printed into the model's context: never talk to one in a
+  // directory that is not ours alone (a shared tmp fallback another user may have made).
+  if (!checkPrivateDir(dirname(path)).ok) return;
 
   if (mode === "stop") {
     await ask(path, { op: "stop" });

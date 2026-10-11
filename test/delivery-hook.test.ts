@@ -6,9 +6,9 @@
  * hands it a notice.
  */
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { mkdtempSync, rmSync, mkdirSync, existsSync, chmodSync, symlinkSync, realpathSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
+import { join, dirname, basename } from "node:path";
 import { ctlSocketPath } from "../delivery/ctl-path";
 
 const HOOK = join(import.meta.dir, "..", "hooks", "delivery.ts");
@@ -49,8 +49,9 @@ function fakeServer(dir: string, reply: (req: any) => unknown) {
   return { requests, path };
 }
 
-async function runHook(mode: string, opts: { dir: string; stdin?: string; pid?: string | null }) {
+async function runHook(mode: string, opts: { dir: string; stdin?: string; pid?: string | null; tmp?: string }) {
   const env: Record<string, string> = { ...(process.env as Record<string, string>), EINWEAVE_STATE_DIR: opts.dir };
+  if (opts.tmp) env.TMPDIR = opts.tmp;
   delete env.CLAUDE_PID;
   if (opts.pid !== null) env.CLAUDE_PID = opts.pid ?? String(PID);
   const started = Date.now();
@@ -154,5 +155,85 @@ describe("ctlSocketPath", () => {
     expect(Buffer.byteLength(a)).toBeLessThanOrEqual(100);
     expect(a.startsWith(tmpdir())).toBe(true);
     expect(a).not.toBe(ctlSocketPath(longB, 7));
+  });
+});
+
+describe("hooks/delivery.ts refuses a socket directory that is not ours (S1)", () => {
+  // A state dir too deep for a socket path → the socket lives in tmpdir()/ew-ctl-<uid>/.
+  const LONG = "/" + "s".repeat(120);
+  const uid = userInfo().uid;
+
+  function withTmp(): { tmp: string; fallback: string } {
+    const tmp = realpathSync(mkdtempSync(join("/tmp", "ewt-")));
+    const prev = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    cleanups.push(() => {
+      if (prev === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = prev;
+      rmSync(tmp, { recursive: true, force: true });
+    });
+    return { tmp, fallback: join(tmp, `ew-ctl-${uid}`) };
+  }
+  const listen = (fallback: string) => {
+    const path = ctlSocketPath(LONG, PID);
+    expect(dirname(path)).toBe(fallback);
+    const requests: any[] = [];
+    const server = Bun.listen({
+      unix: path,
+      socket: {
+        data(s, chunk) {
+          requests.push(JSON.parse(chunk.toString().trim()));
+          s.write(JSON.stringify({ ok: true, op: "prompt", confirmed: false, context: "INJECTED" }) + "\n");
+        },
+      },
+    });
+    cleanups.push(() => server.stop(true));
+    return requests;
+  };
+
+  test("control: a 0700 directory of ours is used", async () => {
+    const { tmp, fallback } = withTmp();
+    mkdirSync(fallback, { mode: 0o700 });
+    const requests = listen(fallback);
+    const r = await runHook("prompt", { dir: LONG, tmp, stdin: ups(TAG(ID)) });
+    expect(requests).toHaveLength(1);
+    expect(r.stdout).toContain("INJECTED");
+  });
+
+  for (const mode of [0o777, 0o755, 0o770]) {
+    test(`mode ${mode.toString(8)} directory: nothing printed, the socket is never contacted`, async () => {
+      const { tmp, fallback } = withTmp();
+      mkdirSync(fallback, { mode: 0o700 });
+      const requests = listen(fallback);
+      chmodSync(fallback, mode);
+      const r = await runHook("prompt", { dir: LONG, tmp, stdin: ups(TAG(ID)) });
+      expect(r).toMatchObject({ code: 0, stdout: "" });
+      expect(requests).toEqual([]);
+    });
+  }
+
+  test("a symlink in place of the directory: nothing printed, the socket is never contacted", async () => {
+    const { tmp, fallback } = withTmp();
+    const real = join(tmp, "real");
+    mkdirSync(real, { mode: 0o700 });
+    symlinkSync(real, fallback);
+    const requests = (() => {
+      const path = join(real, basename(ctlSocketPath(LONG, PID)));
+      const reqs: any[] = [];
+      const server = Bun.listen({
+        unix: path,
+        socket: {
+          data(s, chunk) {
+            reqs.push(JSON.parse(chunk.toString().trim()));
+            s.write(JSON.stringify({ ok: true, op: "prompt", confirmed: false, context: "INJECTED" }) + "\n");
+          },
+        },
+      });
+      cleanups.push(() => server.stop(true));
+      return reqs;
+    })();
+    const r = await runHook("prompt", { dir: LONG, tmp, stdin: ups(TAG(ID)) });
+    expect(r).toMatchObject({ code: 0, stdout: "" });
+    expect(requests).toEqual([]);
   });
 });

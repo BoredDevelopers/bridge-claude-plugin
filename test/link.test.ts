@@ -3,7 +3,7 @@
  * entries → channel notifications, pending until the model has them.
  */
 import { describe, test, expect } from "bun:test";
-import type { Entry, Inbound } from "../vendor/bridge-agent-sdk/index.js";
+import { Pending, type Entry, type Inbound } from "../vendor/bridge-agent-sdk/index.js";
 import { channelAdapter, render, type AdapterDeps, type Rendered } from "../link/adapter";
 import { deliveredEntryId } from "../delivery/tags";
 
@@ -39,6 +39,7 @@ function harness(over: Partial<AdapterDeps> = {}) {
   const dismissed: string[] = [];
   const pushed: string[] = [];
   const failed: string[] = [];
+  const unheld: string[] = [];
   const deps: AdapterDeps = {
     notify: async (r) => void notified.push(r),
     ready: async () => {},
@@ -47,10 +48,11 @@ function harness(over: Partial<AdapterDeps> = {}) {
     isOwnSend: () => false,
     dismiss: (id) => void dismissed.push(id),
     pushed: (e) => void pushed.push(e.id),
+    unhold: (id) => void unheld.push(id),
     failed: (e) => void failed.push(e.id),
     ...over,
   };
-  return { adapter: channelAdapter(deps), notified, dismissed, pushed, failed };
+  return { adapter: channelAdapter(deps), notified, dismissed, pushed, failed, unheld };
 }
 
 describe("link/adapter — what reaches the model", () => {
@@ -108,10 +110,40 @@ describe("link/adapter — what reaches the model", () => {
     expect(h.pushed).toEqual(["c1"]);
   });
 
-  test("a notification that fails is reported and the push rejects (the entry stays pending, unpushed)", async () => {
+  test("a notification that fails is reported, the push rejects, and the entry is released from pending (unacked)", async () => {
     const h = harness({ notify: async () => Promise.reject(new Error("transport closed")) });
     await expect(h.adapter.push!(asEntry(msg("d1")))).rejects.toThrow("transport closed");
     expect(h.failed).toEqual(["d1"]);
+    expect(h.unheld).toEqual(["d1"]);
     expect(h.pushed).toEqual([]);
+    expect(h.dismissed).toEqual([]);
+  });
+
+  test("after a failed push, a redelivery is pushed again (the SDK skips anything it still holds as pending)", async () => {
+    const pending = new Pending();
+    let failNext = true;
+    const h = harness({
+      notify: async () => {
+        if (failNext) throw new Error("transport closed");
+      },
+      unhold: (id) => pending.remove([id]),
+    });
+    const entry = asEntry(msg("d2"));
+    // What Session.deliver does: skip a held id, otherwise hold it and push.
+    const deliver = async () => {
+      if (pending.has(entry.id)) return "skipped";
+      pending.add({ id: entry.id, kind: "message", pushedAt: null, redelivery: false } as never);
+      try {
+        await h.adapter.push!(entry);
+        pending.markPushed(entry.id, 1);
+        return "pushed";
+      } catch {
+        return "failed";
+      }
+    };
+    expect(await deliver()).toBe("failed");
+    failNext = false;
+    expect(await deliver()).toBe("pushed");
+    expect(h.pushed).toEqual(["d2"]);
   });
 });

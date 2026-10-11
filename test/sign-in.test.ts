@@ -653,3 +653,104 @@ describe("logout and enrolment keys", () => {
     expect(stub.stats.locks).toBe(0);
   });
 });
+
+describe("logout from the installation's own API URL (S4)", () => {
+  test("EINWEAVE_API_URL that is not a bare origin: logout still revokes, deletes the files, and never says 'not signed in'", async () => {
+    const { stub, dir } = setup();
+    const inst = await enrolledProfile(stub, dir);
+    const { m, events } = signIn(dir, `${stub.url}/bridge`);
+    expect(m.configError()).toBeTruthy();
+    const text = await m.logout(false);
+    expect(text).toMatch(/revoked in Bridge/);
+    expect(text).not.toMatch(/not signed in/);
+    expect(stub.isRevoked(inst)).toBe("installation_revoked");
+    for (const f of ["installation.json", "key.json", "state"]) expect(existsSync(join(dir, f))).toBe(false);
+    expect(events.loggedOut).toBe(1);
+  });
+
+  test("credential files this plugin cannot use (a newer format) are never reported as 'not signed in', and are left alone", async () => {
+    const { stub, dir } = setup();
+    await enrolledProfile(stub, dir);
+    writeFileSync(join(dir, "installation.json"), JSON.stringify({ format: 99, from: "the future" }));
+    const { m } = signIn(dir, stub.url);
+    const text = await m.logout(false);
+    expect(text).not.toMatch(/was not signed in/);
+    expect(text).toMatch(/still holds sign-in files/);
+    expect(existsSync(join(dir, "key.json"))).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, "installation.json"), "utf8")).format).toBe(99);
+  });
+});
+
+describe("a login is cancellable from its first moment (m6)", () => {
+  /** A sessionKey the test releases: the login (and the logout) both wait in `client()` for it. */
+  function gate() {
+    let open!: () => void;
+    const p = new Promise<string>((r) => (open = () => r("session-a")));
+    return { sessionKey: () => p, open };
+  }
+
+  for (const mode of ["browser", "device"] as const) {
+    test(`${mode}: a logout while the login is still starting cancels it — no URL, no code, nothing lands`, async () => {
+      const { stub, dir } = setup({ deviceIntervalS: 1 });
+      const g = gate();
+      const { m, events } = signIn(dir, stub.url, { sessionKey: g.sessionKey });
+      const started = m.login(mode);
+      await Bun.sleep(150); // login is parked awaiting the session key
+      const out = m.logout(true);
+      await Bun.sleep(50);
+      g.open();
+      const text = await started;
+      await out;
+      expect(text).toMatch(/cancelled/);
+      expect(text).not.toMatch(/https?:\/\//);
+      expect(await until(() => stub.stats.enrols > 0, 1_500)).toBe(false);
+      expect(readInstallation(dir)).toBeNull();
+      expect(events.loggedIn).toBe(0);
+      expect(m.status().login).toBeUndefined();
+    }, 15_000);
+  }
+
+  /** Login A, its code in flight (slow exchange); a newer login B supersedes it; A lands late. */
+  async function supersededLanding(m: SignIn, stub: ReturnType<typeof startAuthStub>, dir: string) {
+    const cbA = (await fetch(urlIn(await m.login("browser")), { redirect: "manual" })).headers.get("location")!;
+    const exchangeA = fetch(cbA, { redirect: "manual" });
+    expect(await until(() => (stub.stats.tokenRequests["authorization_code"] ?? 0) >= 1)).toBe(true);
+    const urlB = urlIn(await m.login("browser")); // B supersedes A while A's code is being exchanged
+    await exchangeA.catch(() => null);
+    expect(await until(() => readInstallation(dir) !== null)).toBe(true); // A landed, late, unasked
+    return urlB;
+  }
+
+  test("a cancelled login that lands late stays 'unasked': a later LOCAL logout revokes it on the server", async () => {
+    const { stub, dir } = setup({ codeDelayMs: 600 });
+    const { m } = signIn(dir, stub.url);
+    await supersededLanding(m, stub, dir);
+    const text = await m.logout(true);
+    expect(text).not.toMatch(/STAYS ENROLLED/);
+    expect(stub.stats.revokes).toHaveLength(1);
+  }, 20_000);
+
+  test("…and a NEWER login starting clears it too: logging out of that one is local", async () => {
+    const { stub, dir } = setup({ codeDelayMs: 600 });
+    const { m } = signIn(dir, stub.url);
+    await supersededLanding(m, stub, dir);
+    await m.login("browser"); // C starts, never completes
+    const text = await m.logout(true);
+    expect(text).toMatch(/Signed out locally.*STAYS ENROLLED/);
+    expect(stub.stats.revokes).toHaveLength(0);
+  }, 20_000);
+
+  test("…but a login that was NOT cancelled landing afterwards clears it: its local logout revokes nothing", async () => {
+    const { stub, dir } = setup({ codeDelayMs: 600 });
+    const { m } = signIn(dir, stub.url);
+    const urlB = await supersededLanding(m, stub, dir);
+    const done = await drive(urlB); // B completes normally (not cancelled)
+    expect(done.headers.get("location")).toContain("connected");
+    expect(await until(() => (stub.stats.enrols ?? 0) >= 2)).toBe(true);
+    await Bun.sleep(900);
+    const before = stub.stats.revokes.length;
+    const text = await m.logout(true);
+    expect(text).toMatch(/Signed out locally.*STAYS ENROLLED/);
+    expect(stub.stats.revokes).toHaveLength(before);
+  }, 30_000);
+});

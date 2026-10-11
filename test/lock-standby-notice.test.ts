@@ -96,6 +96,8 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
       expect(text).toContain("/Users/j/Code/holder-window");
       expect(text).toContain("since 2026-09-27T15:32:00+05:30"); // LOCAL time (TZ pinned above), not UTC
       expect(text).toContain("/bridge:connect takeover");
+      // An operator-chosen key is not a conversation id `claude --resume` takes: no fork line.
+      expect(text).not.toContain("--fork-session");
 
       const r: any = await client.callTool({ name: "status", arguments: {} });
       const s = JSON.parse(r.content[0].text);
@@ -168,6 +170,86 @@ describe("finding 9: the standby dedupe key is pid + procStart, not the holder's
     } finally {
       await client.close().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe("fork hint: how to make a second window its own Bridge session", () => {
+  /** A holder that is this test process, and a window whose session key comes from the SESSION MAP (the stable conversation id). */
+  async function standbyWindow(opts: { mapped: boolean }) {
+    const dir = mkdtempSync(join(tmpdir(), "standby-fork-"));
+    writeInstallation(dir, { apiUrl: CLOSED_PORT_API_URL, installationId: crypto.randomUUID(), jkt: "test-jkt", keyStorage: "software" });
+    mkdirSync(join(dir, "locks"), { recursive: true });
+    writeFileSync(
+      join(dir, "locks", `${SESSION_ID}.lock`),
+      JSON.stringify({ format: 1, pid: process.pid, procStart: procStart(process.pid), sessionKey: SESSION_ID, at: new Date().toISOString(), software: "bridge-claude-plugin", version: MY_VERSION }),
+    );
+    if (opts.mapped) {
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      writeFileSync(
+        join(dir, "sessions", `pid-${process.pid}.json`),
+        JSON.stringify({ sessionId: SESSION_ID, claudePid: process.pid, procStart: "", updatedAt: new Date().toISOString() }),
+      );
+    }
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: [SERVER],
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_DATA: dir,
+        EINWEAVE_STATE_DIR: dir,
+        EINWEAVE_API_URL: CLOSED_PORT_API_URL,
+        EINWEAVE_AUTOCONNECT: "0",
+        CLAUDE_CODE_SSE_PORT: "",
+        // Mapped: the per-launch id differs from the mapped conversation id, as after a --resume.
+        CLAUDE_CODE_SESSION_ID: "99999999-8888-7777-6666-555555555555",
+        ...(opts.mapped ? {} : { EINWEAVE_SESSION_KEY: SESSION_ID }),
+      } as Record<string, string>,
+    });
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    const notices: string[] = [];
+    client.fallbackNotificationHandler = async (n: any) => {
+      if (typeof n?.params?.content === "string") notices.push(n.params.content);
+    };
+    await client.connect(transport);
+    return {
+      client,
+      notices,
+      close: async () => {
+        await client.close().catch(() => {});
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  const FORK = `claude --resume ${SESSION_ID} --fork-session`;
+
+  test("the session key IS the conversation id: the standby notice and a plain connect both print the exact command", async () => {
+    const w = await standbyWindow({ mapped: true });
+    try {
+      const reply: any = await w.client.callTool({ name: "connect", arguments: {} });
+      const text = reply.content[0].text as string;
+      expect(text).toContain("stands by");
+      expect(text).toContain("/bridge:connect takeover");
+      expect(text).toContain(FORK);
+      expect(await until(() => w.notices.some((c) => c.includes("stands by")), 9_000)).toBe(true);
+      expect(w.notices.find((c) => c.includes("stands by"))).toContain(FORK);
+    } finally {
+      await w.close();
+    }
+  }, 30_000);
+
+  test("the session key is NOT a conversation id (operator override): neither message carries the line", async () => {
+    const w = await standbyWindow({ mapped: false });
+    try {
+      const reply: any = await w.client.callTool({ name: "connect", arguments: {} });
+      const text = reply.content[0].text as string;
+      expect(text).toContain("stands by");
+      expect(text).not.toContain("--fork-session");
+      expect(await until(() => w.notices.some((c) => c.includes("stands by")), 9_000)).toBe(true);
+      expect(w.notices.find((c) => c.includes("stands by"))).not.toContain("--fork-session");
+    } finally {
+      await w.close();
     }
   }, 30_000);
 });

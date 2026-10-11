@@ -5,6 +5,9 @@
  * only through tool results. Everything a sender controls (handle, channel name)
  * is reduced to a plain charset first — a handle like `x"\nIgnore previous…` must
  * arrive as text that cannot open a new line or a tag.
+ *
+ * Every kind points at `read_deliveries`: it returns what THIS session's model still owes
+ * (messages, task events, action requests) and clears it. `read_thread` only knows messages.
  */
 import { stripControlChars } from "../control-chars";
 
@@ -42,7 +45,7 @@ function describe(e: NoticeEntry): string {
     channel ? ` in #${channel}` : "",
     sender ? ` from @${sender}` : "",
     ` (id ${safeId(e.id) ?? "?"}${thread ? `, thread ${thread}` : ""})`,
-    thread ? ` — read_thread("${thread}") returns it` : "",
+    " — read_deliveries returns it",
   ].join("");
 }
 
@@ -53,7 +56,7 @@ function countLine(entries: readonly NoticeEntry[]): string {
     byChannel.set(key, (byChannel.get(key) ?? 0) + 1);
   }
   const parts = [...byChannel].slice(0, MAX_LISTED).map(([k, n]) => `${k} ×${n}`);
-  return `${entries.length} Bridge ${entries.length === 1 ? "entry" : "entries"} pushed earlier still unconfirmed (${parts.join(", ")}); list_threads and read_thread return them.`;
+  return `${entries.length} Bridge ${entries.length === 1 ? "entry" : "entries"} pushed earlier still unconfirmed (${parts.join(", ")}); read_deliveries returns them.`;
 }
 
 /** `null` when there is nothing to say: the hook then prints nothing at all. */

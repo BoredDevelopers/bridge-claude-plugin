@@ -109,30 +109,40 @@ export interface AdapterDeps {
   dismiss(id: string): void;
   /** The host accepted it — the missed tracker and the feed tap hang off this. */
   pushed(entry: Entry, rendered: Rendered): void;
+  /**
+   * A push threw: drop the entry from the SDK's pending set WITHOUT acking, so a redelivery or
+   * the reconcile re-pushes it (the Session skips anything it still holds as pending).
+   */
+  unhold(id: string): void;
   /** A push threw: surface it (a silent inbound failure looks exactly like a quiet channel). */
   failed(entry: Entry, err: unknown): void;
+}
+
+/**
+ * An entry that is never surfaced to the model: our own send coming back (even targeted at us
+ * — the model can pass its own context_id to `reply`), the agent's other sessions' broadcasts,
+ * and anything targeted at ANOTHER session of this agent (the server routes targets itself, RFC-027 D2;
+ * this is the client's own check that a mis-route never surfaces in the wrong window). Shared by
+ * the push path and `read_deliveries`, so both treat the same entries the same way.
+ */
+export function shouldDismiss(entry: Entry, d: Pick<AdapterDeps, "myGrant" | "myAgentId" | "isOwnSend">): boolean {
+  if (entry.kind !== "message") return false;
+  const mine = d.myGrant();
+  const m = entry.message;
+  const ownSend = (mine && senderGrant(m) === mine) || d.isOwnSend(entry.id);
+  const ownAgentBroadcast = !!m.agentId && m.agentId === d.myAgentId() && !isAddressed(m.deliveryReasons);
+  const meta = parseMetadata(m.metadata);
+  const forOtherSession = !!mine && str(meta.contextId) !== "" && str(meta.contextId) !== mine && meta.contextAgentId === d.myAgentId();
+  return !!(ownSend || ownAgentBroadcast || forOtherSession);
 }
 
 export function channelAdapter(d: AdapterDeps): DeliveryAdapter {
   return {
     mode: "channel",
     async push(entry) {
-      if (entry.kind === "message") {
-        const mine = d.myGrant();
-        const m = entry.message;
-        // Our own send coming back — even when targeted at us (the model can pass its own
-        // context_id to `reply`). And the agent's other sessions' broadcasts: never
-        // surfaced unless the server addressed them here.
-        const ownSend = (mine && senderGrant(m) === mine) || d.isOwnSend(entry.id);
-        const ownAgentBroadcast = !!m.agentId && m.agentId === d.myAgentId() && !isAddressed(m.deliveryReasons);
-        // Targeted at ANOTHER session of this agent. The server routes targets itself (RFC-027
-        // D2); this is the client's own check that a mis-route never surfaces in the wrong window.
-        const meta = parseMetadata(m.metadata);
-        const forOtherSession = !!mine && str(meta.contextId) !== "" && str(meta.contextId) !== mine && meta.contextAgentId === d.myAgentId();
-        if (ownSend || ownAgentBroadcast || forOtherSession) {
-          d.dismiss(entry.id);
-          return;
-        }
+      if (shouldDismiss(entry, d)) {
+        d.dismiss(entry.id);
+        return;
       }
       await d.ready();
       let rendered: Rendered;
@@ -140,7 +150,11 @@ export function channelAdapter(d: AdapterDeps): DeliveryAdapter {
         rendered = render(entry);
         await d.notify(rendered);
       } catch (err) {
-        d.failed(entry, err);
+        try {
+          d.unhold(entry.id);
+        } finally {
+          d.failed(entry, err);
+        }
         throw err;
       }
       d.pushed(entry, rendered);

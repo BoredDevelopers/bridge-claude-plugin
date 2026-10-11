@@ -172,6 +172,34 @@ export function waitFor(e: unknown): null | "files" | "stop-lift" {
   }
 }
 
+/**
+ * One login, registered the moment it starts — BEFORE its first await — so a logout (or a
+ * newer login) cancels it however early it is. Each flow hangs its own teardown on it.
+ */
+interface LoginHandle {
+  cancel: () => void;
+  cancelled: () => boolean;
+  /** Run `fn` on cancel — at once if already cancelled. */
+  onCancel: (fn: () => void) => void;
+  unrevoked?: string[];
+}
+
+function newLoginHandle(): LoginHandle {
+  let cancelled = false;
+  const hooks: Array<() => void> = [];
+  return {
+    cancel: () => {
+      if (cancelled) return;
+      cancelled = true;
+      for (const fn of hooks.splice(0)) fn();
+    },
+    cancelled: () => cancelled,
+    onCancel: (fn) => (cancelled ? fn() : void hooks.push(fn)),
+  };
+}
+
+const LOGIN_CANCELLED = "The sign-in was cancelled (a logout or a newer login replaced it).";
+
 export class SignIn {
   /** One AgentClient per API URL (the URL can only change while signed out). */
   private live: { apiUrl: string; client: Promise<AgentClient> } | null = null;
@@ -180,7 +208,7 @@ export class SignIn {
    * while it still holds it (endLogin): a stale flow finishing late must never
    * unregister its successor, or a logout could not cancel it.
    */
-  private pendingLogin: { cancel: () => void; cancelled: () => boolean } | null = null;
+  private pendingLogin: LoginHandle | null = null;
   /** A login's exchange that may still write an installation (a logout waits for it). */
   private landing: Promise<unknown> | null = null;
   /** A cancelled login's exchange wrote an installation anyway: nobody asked for it, so the logout revokes it even when local. */
@@ -267,9 +295,9 @@ export class SignIn {
   }
 
   /** The AgentClient for the current API URL, or null when there is none to use. */
-  async client(): Promise<AgentClient | null> {
+  async client(apiUrlOverride?: string): Promise<AgentClient | null> {
     const p = this.profile;
-    const apiUrl = this.apiUrl();
+    const apiUrl = apiUrlOverride ?? this.apiUrl();
     if (!p || !apiUrl) return null;
     try {
       apiOrigin(apiUrl);
@@ -422,43 +450,53 @@ export class SignIn {
     // D8: a newer plugin's sign-in can never be replaced from this window — say so before
     // the person approves anything.
     if (this.newerInstallation()) return NEWER_INSTALLATION_MESSAGE;
+    // Registered NOW, before the first await: a logout during discovery, key generation or
+    // the browser launch must cancel this login, not race it and land afterwards.
+    this.pendingLogin?.cancel();
+    this.landedAfterCancel = false; // a newer login: whatever an older cancelled one wrote is superseded with it
+    const mine = newLoginHandle();
+    this.pendingLogin = mine;
     let meta: AuthMetadata;
     try {
       apiOrigin(apiUrl);
       meta = await this.discovery.discover(apiUrl);
     } catch (e) {
+      this.endLogin(mine);
       return errDetail(e);
     }
-    if (!supportsKeyCredentials(meta)) return `Cannot sign in: ${SERVER_TOO_OLD}.`;
+    if (!supportsKeyCredentials(meta)) {
+      this.endLogin(mine);
+      return `Cannot sign in: ${SERVER_TOO_OLD}.`;
+    }
     const client = (await this.client())!;
-    this.pendingLogin?.cancel();
-    this.pendingLogin = null;
+    if (mine.cancelled()) return LOGIN_CANCELLED;
     const name = this.installationName();
 
     const device = mode === "device" || (mode === "auto" && isHeadless(this.d.env));
-    if (device) return this.startDevice(client, name);
+    if (device) return this.startDevice(client, name, mine);
     // C7: the code is bound to the key whose thumbprint is in the authorize URL — so the
     // key is made FIRST and handed to the exchange; any other key burns the code.
     const key = await generateSoftwareKey();
+    if (mine.cancelled()) return LOGIN_CANCELLED;
     let lb: LoopbackLogin;
     try {
       lb = await startLoopback(meta, name, { dpopJkt: key.signer.jkt });
     } catch (e) {
       this.d.log(`bridge auth: loopback listener failed (${e}); using a device code`);
-      return this.startDevice(client, name);
+      return this.startDevice(client, name, mine);
     }
+    mine.onCancel(() => lb.close());
+    if (mine.cancelled()) return LOGIN_CANCELLED;
     let opened = false;
     if (!browserDisabled(this.d.env)) opened = await openBrowser(lb.authorizeUrl);
+    if (mine.cancelled()) return LOGIN_CANCELLED;
     if (!opened && !browserDisabled(this.d.env) && mode === "auto") {
       lb.close();
-      return this.startDevice(client, name);
+      return this.startDevice(client, name, mine);
     }
-    let cancelled = false;
-    const mine = { cancel: () => ((cancelled = true), lb.close()), cancelled: () => cancelled };
-    this.pendingLogin = mine;
     this.landing = (async () => {
       const a = await lb.answer;
-      if (cancelled) return;
+      if (mine.cancelled()) return;
       if ("error" in a) {
         lb.finish(a.error === "access_denied" ? "denied" : "error");
         return this.loginFailed(a.error, mine);
@@ -476,15 +514,16 @@ export class SignIn {
       : `Open this URL in a browser on this machine to connect it to Bridge:\n${lb.authorizeUrl}`;
   }
 
-  private async startDevice(client: AgentClient, name: string): Promise<string> {
+  private async startDevice(client: AgentClient, name: string, mine: LoginHandle): Promise<string> {
     const canPrompt = this.d.prompt.available();
     // Without a direct line to the person, a device code in the tool result is readable
     // (and relayable) by the model. Tolerable only when there is no sign-in to lose.
     if (!canPrompt && this.installation()) {
+      this.endLogin(mine);
       return "Device sign-in needs to show its code to you directly, and this client can't prompt you. Use /bridge:login in a session with a browser, or /bridge:logout first.";
     }
     const ac = new AbortController();
-    const mine = { cancel: () => ac.abort(), cancelled: () => ac.signal.aborted };
+    mine.onCancel(() => ac.abort());
     let flow;
     try {
       flow = await client.deviceAuthorization(name, {
@@ -498,9 +537,10 @@ export class SignIn {
         ...this.enrolHooks(mine),
       });
     } catch (e) {
+      this.endLogin(mine);
       return `Could not start a device sign-in: ${errDetail(isAgentClientError(e) ? (e.cause ?? e) : e)}`;
     }
-    this.pendingLogin = mine;
+    if (mine.cancelled()) return LOGIN_CANCELLED;
     this.landing = flow.complete({ signal: ac.signal }).then(
       () => {},
       (e) => {
@@ -547,8 +587,11 @@ export class SignIn {
         this.forgetInstallationState();
         this.endLogin(mine);
         // Cancelled while its code was being exchanged: the logout waiting on this landing
-        // signs out of it (and revokes it) next — no reconnect, no "connected".
+        // signs out of it (and revokes it) next — no reconnect, no "connected". The flag stays
+        // until a logout consumes it, a newer login starts, or a login that was NOT cancelled
+        // lands (that sign-in is wanted: nothing is owed a revoke).
         if (mine.cancelled()) return void (this.landedAfterCancel = true);
+        this.landedAfterCancel = false;
         try {
           this.d.onLoggedIn();
         } catch (e) {
@@ -622,7 +665,9 @@ export class SignIn {
     if (this.landing) await Promise.race([this.landing.catch(() => {}), new Promise((r) => setTimeout(r, LANDING_WAIT_MS))]);
     const unasked = this.landedAfterCancel;
     this.landedAfterCancel = false;
-    const client = await this.client();
+    // The configured URL may be unusable (a path, a typo) while the files on disk are fine:
+    // sign out through the installation's OWN API URL (what the revoke goes to anyway).
+    const client = (await this.client()) ?? (await this.client(this.installation()?.apiUrl));
     const r = client ? await client.logout({ revoke: !local || unasked }) : { installation: null, revoke: "skipped" as const };
     // An enrolment key still in .env must not silently sign the machine back in at the
     // next start; a login clears this.
@@ -630,7 +675,13 @@ export class SignIn {
     this.forgetInstallationState();
     this.d.onLoggedOut();
     const inst = r.installation;
-    if (!inst) return `Profile ${profileLabel(p)} was not signed in.`;
+    if (!inst) {
+      // Never "not signed in" while credential files are still there (logout could not read or reach them).
+      const left = ["key.json", "installation.json"].filter((f) => existsSync(join(p.dir, f)));
+      if (left.length > 0)
+        return `Profile ${profileLabel(p)} still holds sign-in files (${left.join(", ")} in ${p.dir}) that logout could not use${this.configError() ? ` — ${this.configError()}` : ""}. Nothing was revoked; fix that, or remove the profile directory by hand.`;
+      return `Profile ${profileLabel(p)} was not signed in.`;
+    }
     const machine = inst.installationName ?? inst.installationId;
     // C17.
     if (local && !unasked) return `Signed out locally (profile ${profileLabel(p)}). ⚠️ This machine STAYS ENROLLED in Bridge until you revoke "${machine}" in Settings → Agents → Machines.`;
