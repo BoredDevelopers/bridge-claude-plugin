@@ -13,10 +13,10 @@ import type { DeliveryAdapter, Entry, Inbound } from "../vendor/bridge-agent-sdk
 import { isAddressed } from "../vendor/bridge-agent-sdk/core/index.js";
 
 export type ChannelMeta = Record<string, string>;
-export interface Rendered {
+export type Rendered = {
   content: string;
   meta: ChannelMeta;
-}
+};
 
 function parseMetadata(raw: unknown): Record<string, unknown> {
   if (typeof raw === "string") {

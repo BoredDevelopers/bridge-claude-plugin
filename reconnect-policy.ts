@@ -1,108 +1,11 @@
 /**
- * How long to wait before reconnecting, by WHY the socket closed.
- *
- * Pure (no I/O, randomness injected) so every bound is unit-testable.
- *
- * ⚠️ JITTER IS THE POINT, NOT A NICETY. The old delay was `min(1s × attempt,
- * 30s)` — identical for every session — so a server restart made every
- * connected session retry in lockstep at 1s, 2s, 3s… That herd is what the
- * server's per-IP upgrade limit (bridge#190, burst 30) now refuses in bulk.
- * Exponential with EQUAL jitter (`b/2 + rand·b/2`) spreads them, and matches
- * the web client (`packages/web/src/lib/api.ts`), so both clients follow one
- * policy.
- *
- * Classes, by what fixes the refusal:
- * - transient   (1000/1001/1006/1011/4006/anything unknown): the network or a
- *               restart; retry soon. 1011 "grant check failed" (RFC-016) is the
- *               server's grant re-check hitting a database error — its fault, not
- *               the token's: same token, retry soon.
- * - session-cap (4007): this agent already has the server's maximum live
- *               sockets. A slot frees when a sibling session closes or a dead
- *               socket is swept — not within a second — and every refused
- *               retry spends the machine's per-IP upgrade budget that its
- *               HEALTHY sessions need. So: slow.
- * - credential  (4001 token or proof refused, 4003 deregistered/workspace
- *               archived): a 4001 gets ONE immediate re-mint (RFC-016 C14, in
- *               server.ts); after that, and for 4003 (undone by someone else:
- *               reactivate, workspace restore), keep retrying — slowly — so the
- *               session recovers without anyone touching the terminal.
- * - expired     (4009, D9 — kept by RFC-016): the access token ran out before a reauth. The
- *               credential manager mints a new token on the way back in, so retry soon.
- * - evicted     (4008 "session evicted", bridge#209): the agent hit its live-session
- *               cap and the server evicted THIS session to make room. Nothing is
- *               wrong with the credential: mint a new session (no reconnect=true,
- *               no block — E9's stop is for a session a PERSON revoked) and
- *               reconnect soon.
- * - revoked     (4008): the session or the machine's installation was revoked
- *               ("session revoked" / "installation revoked") or LOCKED because a
- *               copy of its credential was used ("installation locked", RFC-016 E8)
- *               and will never work again. Retrying is pointless; stop and tell the
- *               user.
- * - superseded  (4008 "session superseded: …", RFC-017 D3/D6): a newer (or explicitly
- *               taking-over) Bridge plugin claimed this session in another window.
- *               Nothing is wrong with the credential — stop; only a person acting —
- *               `/bridge:connect takeover`, or `/bridge:disconnect` then a plain
- *               `/bridge:connect` — resumes this window (finding 6: NOT takeover alone).
- * - too-old     (4008 "client too old: …" / "client version withdrawn: …", RFC-017 D5/D6):
- *               the server's `minimum` (or `blocked`) refuses this build outright.
- *               Retrying changes nothing until the plugin itself is updated; stop.
- *
- * D6: `superseded` and `too-old` are matched on the REASON PREFIX before the first `:` —
- * the server packs its own detail after it (D6's "each reason must instruct on its own"),
- * and a 0.25 client (test/fixtures/v025/reconnect-policy.ts, C6) never coded either
- * prefix, so both fall through to its `revoked` case and stop just the same. The exact
- * `session evicted` reason (no colon) stays a full-string match, unchanged.
+ * What the PERSON is told about a closed socket (`status`, notices). The
+ * classification (which close is which class) and the reconnect schedule are the
+ * SDK's (`classifyClose` / `reconnectDelay` in vendor/bridge-agent-sdk/core) — the
+ * SDK reconnects; this file only words it.
  */
-
-export type CloseClass = "transient" | "expired" | "evicted" | "session-cap" | "credential" | "revoked" | "superseded" | "too-old";
-
-const SCHEDULE: Record<Exclude<CloseClass, "revoked" | "superseded" | "too-old">, { baseMs: number; capMs: number }> = {
-  transient: { baseMs: 1_000, capMs: 30_000 },
-  expired: { baseMs: 1_000, capMs: 30_000 },
-  evicted: { baseMs: 1_000, capMs: 30_000 },
-  "session-cap": { baseMs: 30_000, capMs: 300_000 },
-  credential: { baseMs: 60_000, capMs: 300_000 },
-};
-
-/** The part of a 4008 reason before its first `:` (D6) — the whole string when there is none. */
-function reasonPrefix(reason: string | undefined): string {
-  if (!reason) return "";
-  const i = reason.indexOf(":");
-  return i === -1 ? reason : reason.slice(0, i);
-}
-
-export function classifyClose(code: number | undefined, reason?: string): CloseClass {
-  switch (code) {
-    case 4007:
-      return "session-cap";
-    case 4001:
-    case 4003:
-      return "credential";
-    case 4008: {
-      if (reason === "session evicted") return "evicted";
-      const prefix = reasonPrefix(reason);
-      if (prefix === "session superseded") return "superseded";
-      if (prefix === "client too old" || prefix === "client version withdrawn") return "too-old";
-      return "revoked";
-    }
-    case 4009:
-      return "expired";
-    default:
-      return "transient";
-  }
-}
-
-/**
- * Delay before reconnect attempt `attempt` (1-based), or `null` = do not
- * reconnect. `rand` in [0, 1).
- */
-export function reconnectDelay(attempt: number, cls: CloseClass, rand: () => number = Math.random): number | null {
-  if (cls === "revoked" || cls === "superseded" || cls === "too-old") return null;
-  const { baseMs, capMs } = SCHEDULE[cls];
-  const n = Math.max(1, Math.floor(attempt));
-  const backoff = Math.min(capMs, baseMs * 2 ** (n - 1));
-  return Math.round(backoff / 2 + rand() * (backoff / 2));
-}
+import type { CloseClass } from "./vendor/bridge-agent-sdk/core/index.js";
+export type { CloseClass };
 
 /**
  * Just enough of the new holder's identity (RFC-017 D2/D3's lock record) to name it in a
@@ -194,6 +97,8 @@ export function describeClose(
     }
     case "too-old":
       return `this plugin is too old for Bridge (${tail}) — /plugin update bridge, then /reload-plugins`;
+    case "session-in-use":
+      return `this session is already connected from another process (${tail}) — /bridge:status shows which; /bridge:connect takeover moves it here`;
     default:
       return `connection closed (${tail})`;
   }
