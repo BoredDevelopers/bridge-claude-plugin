@@ -808,7 +808,7 @@ function pendingMeta(entry) {
 }
 
 // src/runtime/sdk-version.generated.ts
-var SDK_VERSION = "0.5.0";
+var SDK_VERSION = "0.5.1";
 
 // src/runtime/api.ts
 var HTTP_TIMEOUT_MS = 20000;
