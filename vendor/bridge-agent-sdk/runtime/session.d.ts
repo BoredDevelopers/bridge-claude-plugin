@@ -26,11 +26,24 @@ import { type AckHow, type CatchupPayload, type CloseClass, type CloseOutcome, t
 import type { Runtime } from "./ports";
 import type { AgentClient } from "./client";
 import type { LockHolderInfo, SeqStore, SessionLock } from "./store";
-import type { SendBody, SendResult } from "./api";
+import type { Api, SendBody, SendResult } from "./api";
 import { AgentClientError } from "./errors";
 import { Pending } from "./pending";
 import type { DeliveryAdapter, Inbound } from "./delivery";
 export type { Inbound } from "./delivery";
+/**
+ * What a `Session` needs from its credential holder — `AgentClient` is one; a consumer
+ * with its own credential code (the Claude plugin until it moves onto `AgentClient`)
+ * passes its own. `wsAuth` must reject with an `AgentClientError` for a credential
+ * failure, or the session cannot tell a terminal one from a transient one and retries.
+ */
+export type SessionClient = Pick<AgentClient, "apiUrl" | "sessionKey" | "softwareId" | "softwareVersion" | "wsAuth" | "grant" | "invalidateAccess" | "sessionRevoked" | "installationRevoked" | "onAccessRotated"> & {
+    readonly api: {
+        readonly messages: Pick<Api["messages"], "create">;
+        readonly threads: Pick<Api["threads"], "reply">;
+        readonly deliveries: Pick<Api["deliveries"], "list">;
+    };
+};
 export type StopKind = "superseded" | "too-old" | "revoked" | "session-in-use" | "credential" | "drain";
 /** Why this `Session` will never reconnect again. `close` is present for the WS-close stop
  * classes (superseded / too-old / revoked / session-in-use); `credential` for a terminal
@@ -146,7 +159,7 @@ export declare class Session {
     private readonly statusChannel;
     private readonly unsubscribeRotation;
     private readonly unsubscribeLockLost;
-    constructor(rt: Runtime, client: AgentClient, opts?: SessionOptions);
+    constructor(rt: Runtime, client: SessionClient, opts?: SessionOptions);
     /** Begin connecting — once. Only needed with `autoConnect: false`. */
     start(): void;
     status(): AsyncIterable<SessionStatus>;
