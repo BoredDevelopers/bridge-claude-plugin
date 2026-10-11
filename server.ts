@@ -1144,7 +1144,22 @@ const REMINT_REARM_MS = 30_000;
  */
 const HOST_READY_FALLBACK_MS = 10_000;
 
-const rt = createRuntime();
+/**
+ * TEST-ONLY: scales every one-shot timer of the Session (its reconnect backoff and standby
+ * retry; never the liveness watchdog or reconcile, which are intervals) — an e2e test
+ * reaches the slow credential schedule's first retry in seconds; its SHAPE is unchanged.
+ */
+const BACKOFF_SCALE = testKnob("EINWEAVE_TEST_BACKOFF_SCALE", (n) => n > 0 && n <= 1) ?? 1;
+const rt = (() => {
+  const base = createRuntime();
+  if (BACKOFF_SCALE === 1) return base;
+  return createRuntime({
+    timer: {
+      setTimeout: (fn, ms, o) => base.timer.setTimeout(fn, Math.round(ms * BACKOFF_SCALE), o),
+      setInterval: (fn, ms, o) => base.timer.setInterval(fn, ms, o),
+    },
+  });
+})();
 const seqStore = fileSeqStore(join(STATE_DIR, "seq"));
 /** Entries pushed but not confirmed, for the missed notice (delivery/missed.ts). */
 const tracker = new MissedTracker<PendingEntry>();
@@ -1341,12 +1356,14 @@ function onStatus(st: SessionStatus): void {
       }
       return;
     }
-    case "reconnecting":
+    case "reconnecting": {
+      const delayMs = Math.round(st.delayMs * BACKOFF_SCALE); // what the timer actually waits
       reconnectAttempt = st.attempt;
-      nextReconnectAt = Date.now() + st.delayMs;
+      nextReconnectAt = Date.now() + delayMs;
       feedStatus("reconnecting");
-      process.stderr.write(`bridge channel: reconnecting in ${(st.delayMs / 1000).toFixed(1)}s (attempt ${st.attempt})\n`);
+      process.stderr.write(`bridge channel: reconnecting in ${(delayMs / 1000).toFixed(1)}s (attempt ${st.attempt})\n`);
       return;
+    }
     case "standby": {
       authenticated = false;
       updateProcState(STATE_DIR, process.pid, "standby");
@@ -1427,13 +1444,25 @@ function onStopped(stop: SessionStop): void {
   if (stop.kind === "drain") return;
   if (stop.kind === "superseded") {
     superseded = true;
-    const rec = stop.close?.holder;
-    const holder: HolderIdentity | undefined = rec && rec.pid !== process.pid ? rec : undefined;
-    lastClose = { cls: "superseded", code: stop.close?.code, reason: stop.close?.reason, ...(holder ? { supersededBy: holder } : {}) };
     updateProcState(STATE_DIR, process.pid, "superseded");
     feedStatus("stopped", "another window took over this session");
-    process.stderr.write(`bridge channel: superseded${holder ? ` by pid ${holder.pid}${holder.version ? ` (v${holder.version})` : ""}` : ""} — this window stops\n`);
-    notifyModel(`⚠️ Bridge disconnected this session: ${describeClose("superseded", undefined, undefined, { supersededBy: holder, myVersion: PLUGIN_VERSION })}`, "error");
+    // From the server (a 4008 "session superseded", holder read by the SDK) or from the
+    // LOCAL lock (another live process now holds the file — no close at all): then the
+    // holder is read here, best-effort.
+    const local = !stop.close;
+    const lostLock = lock;
+    void (async () => {
+      const rec: HolderIdentity | null | undefined = stop.close ? stop.close.holder : await lostLock?.holder().catch(() => null);
+      const holder: HolderIdentity | undefined = rec && rec.pid !== process.pid ? rec : undefined;
+      lastClose = { cls: "superseded", code: stop.close?.code, reason: stop.close?.reason, ...(holder ? { supersededBy: holder } : {}) };
+      const who = holder ? ` to pid ${holder.pid}${holder.version ? ` (v${holder.version})` : ""}` : "";
+      process.stderr.write(
+        local
+          ? `bridge channel: session lock LOST for ${SESSION_KEY}${who} — this window is now superseded\n`
+          : `bridge channel: session superseded by the server${who} — this window stops\n`
+      );
+      notifyModel(`⚠️ Bridge disconnected this session: ${describeClose("superseded", undefined, undefined, { supersededBy: holder, myVersion: PLUGIN_VERSION })}`, "error");
+    })();
     return;
   }
   updateProcState(STATE_DIR, process.pid, "disconnected");
