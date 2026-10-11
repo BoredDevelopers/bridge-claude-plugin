@@ -95,7 +95,8 @@ var TERMINAL = new Set([
   "update_required",
   "too_old",
   "refused",
-  "server_mismatch"
+  "server_mismatch",
+  "clock"
 ]);
 function isTerminalCredentialError(e) {
   return isAgentClientError(e) && TERMINAL.has(e.code);
@@ -809,7 +810,7 @@ function pendingMeta(entry) {
 }
 
 // src/runtime/sdk-version.generated.ts
-var SDK_VERSION = "0.6.0";
+var SDK_VERSION = "0.6.1";
 
 // src/runtime/api.ts
 var HTTP_TIMEOUT_MS = 20000;
@@ -992,6 +993,8 @@ async function pollDeviceCode(rt, poll, auth, opts = {}) {
 
 // src/runtime/client.ts
 var EXPIRY_SLACK_MS = 60000;
+var STOP_CODES = new Set(["refused", "session_limit", "too_old", "server_mismatch", "corrupt_state", "update_required", "clock"]);
+var UNUSABLE_FILE = new Set(["EACCES", "EPERM", "EISDIR"]);
 
 class AgentClient {
   rt;
@@ -1127,7 +1130,7 @@ class AgentClient {
       return await this.mintLocked();
     } catch (e) {
       const err = this.toClientError(e);
-      if (err.code === "refused" || err.code === "session_limit" || err.code === "too_old" || err.code === "server_mismatch")
+      if (STOP_CODES.has(err.code))
         this.stopped = err;
       throw err;
     }
@@ -1172,7 +1175,16 @@ class AgentClient {
     if (signer.jkt !== record.installation.jkt) {
       throw new AgentClientError({ code: "refused", message: "the store's key does not match its installation" });
     }
-    const attempt = await this.opts.store.createAttempt(randomB64url(32));
+    let attempt;
+    try {
+      attempt = await this.opts.store.createAttempt(randomB64url(32));
+    } catch (e) {
+      const code = e?.code;
+      if (typeof code === "string" && UNUSABLE_FILE.has(code)) {
+        throw new AgentClientError({ code: "refused", message: `the store's write-ahead attempt is unusable (${code}) — fix its permissions, or log in again`, cause: e });
+      }
+      throw e;
+    }
     const reconnect = this.reconnectNext;
     let g;
     try {
@@ -1264,7 +1276,8 @@ class AgentClient {
         return;
       const late = this.rt.clock.now() - this.access.refreshAt > 60000;
       if (late) {
-        this.lateRefreshTimer?.clear();
+        if (this.lateRefreshTimer)
+          return;
         this.lateRefreshTimer = this.rt.timer.setTimeout(() => {
           this.lateRefreshTimer = null;
           go();
@@ -1295,7 +1308,7 @@ class AgentClient {
   }
   async enrolWithKey(enrolmentKey, installationName, opts = {}) {
     return this.opts.store.withLock(async (signal) => {
-      if (await this.opts.store.read())
+      if (await this.opts.store.read() || await this.opts.store.isNewer?.())
         return null;
       const meta = await this.discoverOrRefuse(signal);
       let key = await generateSoftwareKey();
@@ -1315,6 +1328,7 @@ class AgentClient {
     }, this.lockOpts());
   }
   async enrolWithAuthorizationCode(p, installationName, opts = {}) {
+    await this.refuseOverNewer();
     const meta = await this.discoverOrRefuse();
     const key = opts.key ?? await generateSoftwareKey();
     const g = await this.tokens.exchangeCode(meta, key.signer, p).catch((e) => {
@@ -1324,6 +1338,7 @@ class AgentClient {
     return g;
   }
   async deviceAuthorization(installationName, opts = {}) {
+    await this.refuseOverNewer();
     const meta = await this.discoverOrRefuse();
     const auth = await this.tokens.deviceAuthorization(meta, installationName).catch((e) => {
       throw this.toClientError(e);
@@ -1345,15 +1360,32 @@ class AgentClient {
       const r = await pollDeviceCode(this.rt, poll, auth, o);
       if (!r.ok)
         throw new AgentClientError({ code: r.error === "cancelled" ? "aborted" : "refused", message: r.error });
+      const discard = async (err) => {
+        if (!await this.revokeGrant(meta, key.signer, r.grant).then(() => true, () => false)) {
+          try {
+            opts.onUnrevoked?.([{ installationId: r.grant.installation_id }]);
+          } catch {}
+        }
+        throw err;
+      };
+      const cancelled = () => new AgentClientError({ code: "aborted", message: "cancelled" });
+      if (o.signal?.aborted)
+        return discard(cancelled());
       const confirm = opts.confirm;
       if (confirm && !await Promise.resolve().then(() => confirm(r.grant)).catch(() => false)) {
-        await this.revokeGrant(meta, key.signer, r.grant).catch(() => {});
-        throw new AgentClientError({ code: "declined", message: "the person declined binding this machine to that agent" });
+        return discard(new AgentClientError({ code: "declined", message: "the person declined binding this machine to that agent" }));
       }
+      if (o.signal?.aborted)
+        return discard(cancelled());
       await this.writeEnrolment(meta, installationName, r.grant, key, opts);
       return r.grant;
     };
     return { auth, complete };
+  }
+  async refuseOverNewer() {
+    if (await this.opts.store.isNewer?.()) {
+      throw new AgentClientError({ code: "refused", message: "this store holds an installation written by a newer build — update before signing in here" });
+    }
   }
   async discoverOrRefuse(signal) {
     const meta = await this.tokens.discover(this.opts.apiUrl, signal).catch((e) => {
@@ -1386,9 +1418,18 @@ class AgentClient {
       });
       await this.opts.store.clearAttempt();
     } catch (e) {
-      await this.revokeGrant(meta, key.signer, g, signal).catch(() => {});
+      const left = [];
+      if (!await this.revokeGrant(meta, key.signer, g, signal).then(() => true, () => false))
+        left.push({ installationId: g.installation_id });
       if (old && old.installation.installationId !== g.installation_id) {
-        await this.revokeRecord(old, oldAttempt, signal).catch(() => {});
+        if (!await this.revokeRecord(old, oldAttempt, signal).then(() => true, () => false)) {
+          left.push({ installationId: old.installation.installationId, ...old.installation.installationName !== undefined ? { installationName: old.installation.installationName } : {} });
+        }
+      }
+      if (left.length > 0) {
+        try {
+          opts.onUnrevoked?.(left);
+        } catch {}
       }
       throw e;
     }
@@ -1541,7 +1582,7 @@ function memoryCredentialStore() {
       attempt = null;
     },
     async readAttempt() {
-      return attempt;
+      return attempt !== null && /^[A-Za-z0-9_-]{22,128}$/.test(attempt) ? attempt : null;
     },
     async createAttempt(candidate) {
       if (attempt === null)

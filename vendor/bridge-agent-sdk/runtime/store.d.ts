@@ -53,8 +53,12 @@ export interface CredentialStore {
      * racer's), and the caller carries on — it must never re-write it older. Read-check-write:
      * callers hold `withLock`. */
     writeJoinState(joinState: string): Promise<boolean>;
-    /** Delete everything — logout, or a terminal `installation_gone`. */
+    /** Delete everything — logout, or a terminal `installation_gone`. Callers hold `withLock`. */
     clear(): Promise<void>;
+    /** RFC-017 D8: the store holds a credential a NEWER build wrote — `read()` answers null for
+     * it, but nothing may be written over it. Optional: a store with no format versioning
+     * (the in-memory one) never has one. */
+    isNewer?(): Promise<boolean>;
     /** E5's write-ahead attempt: created before a mint request leaves the process, read back
      * on the retry after a lost answer, deleted once the new join-state is durable. */
     readAttempt(): Promise<string | null>;

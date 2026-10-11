@@ -388,10 +388,17 @@ function fileStore(dir) {
       removeQuiet(keyFile(dir));
       removeQuiet(stateFile(dir));
       removeQuiet(attemptFile(dir));
+      sweepOrphanTemps(dir, 0);
+      try {
+        fsyncDir(dir);
+      } catch {}
+    },
+    async isNewer() {
+      return isNewerInstallation(dir);
     },
     async readAttempt() {
       const t = readText(attemptFile(dir))?.trim() ?? "";
-      return t.length > 0 ? t : null;
+      return ATTEMPT.test(t) ? t : null;
     },
     async createAttempt(candidate) {
       return createOrReadAttempt(dir, candidate);

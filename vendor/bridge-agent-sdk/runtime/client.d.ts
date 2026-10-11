@@ -37,6 +37,16 @@ export interface EnrolOptions {
     onWritten?: () => void | Promise<void>;
     /** The previous installation could not be revoked: it stays enrolled server-side. */
     onPreviousRevokeFailed?: (previous: Installation, err: unknown) => void;
+    /**
+     * Installations this enrolment had to give up but could NOT revoke — they STAY enrolled
+     * server-side with no key left here: after a failed write, the new one and/or the previous
+     * one; after a declined or cancelled device approval, the new one. Called before the
+     * enrolment rejects; the caller tells the person where to revoke them.
+     */
+    onUnrevoked?: (left: Array<{
+        installationId: string;
+        installationName?: string;
+    }>) => void;
 }
 /** What a logout did server-side; the store is cleared in every case. */
 export interface LogoutResult {
@@ -182,6 +192,9 @@ export declare class AgentClient {
             signal?: AbortSignal;
         }) => Promise<EnrolGrant>;
     }>;
+    /** RFC-017 D8: a newer build's installation can never be replaced from here — refuse BEFORE
+     * the person approves anything or a code is spent (the write would refuse only after). */
+    private refuseOverNewer;
     private discoverOrRefuse;
     /**
      * M3, mirroring the plugin's `completeLogin` choreography (`auth/manager.ts`): under
