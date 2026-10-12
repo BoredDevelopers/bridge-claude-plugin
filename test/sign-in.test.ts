@@ -5,6 +5,7 @@
  * logged-out marker, D8's newer-format refusal. Mint, lock and chain mechanics are the
  * SDK's own tests; end-to-end behaviour through server.ts is agent-login-e2e.test.ts.
  */
+import { UPDATE_HOWTO } from "../update-howto";
 import { describe, test, expect, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -91,7 +92,7 @@ describe("credential errors in this plugin's words", () => {
   test("the SDK's codes become the plugin's sentences", () => {
     expect(describeCredential(new AgentClientError({ code: "installation_gone", reason: "installation_locked" }), "1.0.0")).toStartWith("credential copy detected");
     expect(describeCredential(new AgentClientError({ code: "too_old", minimum: "0.31.0" }), "1.0.0")).toBe(
-      "this plugin (1.0.0) is older than Bridge accepts (>= 0.31.0) — /plugin update bridge, then /reload-plugins"
+      "this plugin (1.0.0) is older than Bridge accepts (>= 0.31.0) — " + UPDATE_HOWTO
     );
     expect(describeCredential(new AgentClientError({ code: "refused", message: "this Bridge server does not support key credentials (RFC-016)" }), "1.0.0")).toMatch(/must be upgraded/);
     expect(describeCredential(new AgentClientError({ code: "clock" }), "1.0.0")).toMatch(/check the system clock/);
@@ -256,7 +257,7 @@ describe("RFC-017 P5: too_old", () => {
     const { stub, dir } = setup({ tooOldMints: 1 });
     await enrolledProfile(stub, dir);
     const { m } = signIn(dir, stub.url);
-    await expect(use(m)).rejects.toThrow("this plugin (9.9.9) is older than Bridge accepts (>= 0.26.0) — /plugin update bridge, then /reload-plugins");
+    await expect(use(m)).rejects.toThrow("this plugin (9.9.9) is older than Bridge accepts (>= 0.26.0) — " + UPDATE_HOWTO);
     expect(readInstallation(dir)).not.toBeNull();
     expect(readKey(dir)).not.toBeNull();
     expect(readState(dir)).not.toBeNull();
@@ -265,10 +266,10 @@ describe("RFC-017 P5: too_old", () => {
   });
 
   test("a description with no `>= x.y.z` (client_blocked) falls back gracefully", async () => {
-    const { stub, dir } = setup({ tooOldMints: 1, tooOldReason: "client_blocked: bridge-claude-plugin 9.9.9 is withdrawn — /plugin update bridge" });
+    const { stub, dir } = setup({ tooOldMints: 1, tooOldReason: "client_blocked: bridge-claude-plugin 9.9.9 is withdrawn — open /plugin → Installed → bridge → Update now, then /reload-plugins" });
     await enrolledProfile(stub, dir);
     const { m } = signIn(dir, stub.url);
-    await expect(use(m)).rejects.toThrow("this plugin (9.9.9) is older than Bridge accepts — /plugin update bridge, then /reload-plugins");
+    await expect(use(m)).rejects.toThrow("this plugin (9.9.9) is older than Bridge accepts — " + UPDATE_HOWTO);
   });
 });
 

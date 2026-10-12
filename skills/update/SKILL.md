@@ -45,13 +45,13 @@ Arguments passed: `$ARGUMENTS`
 
 4. **Give exactly ONE next step**, in this priority order:
    - `advice` is `update_required_by <date>` or `too old` was seen elsewhere →
-     **`/plugin update bridge`, then `/reload-plugins`** (urgent — a deadline
+     **`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`** (urgent — a deadline
      or an outright refusal).
    - `stale_since` is set (this window's own files are gone from disk) →
      **`/reload-plugins`** to switch this window onto what's actually
      installed.
-   - `advice` is `update_available` → `/plugin update bridge`, then
-     `/reload-plugins` (optional, not urgent).
+   - `advice` is `update_available` → `/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`
+     (optional, not urgent). There is no `/plugin update` command.
    - Another window in `other_processes` is on a version below this one, and
      the person seems to want Bridge active there → name it: "close or
      `/reload-plugins` the window on `tty` (`termProgram`, `cwd`)".

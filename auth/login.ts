@@ -15,6 +15,7 @@
  * - stop-lift: a stop-class refusal is about ONE installation — a login in another
  *   window (a different installation on disk) lifts it.
  */
+import { UPDATE_HOWTO } from "../update-howto";
 import { hostname } from "os";
 import { join } from "path";
 import { existsSync, unlinkSync, writeFileSync } from "fs";
@@ -51,7 +52,7 @@ import { profileLabel, type Profile } from "./profile";
 const SERVER_TOO_OLD = "this Bridge server does not support key credentials yet (no client_credentials grant, RFC-016) — it must be upgraded before this plugin can sign in";
 
 const UPDATE_REQUIRED =
-  "Bridge refused this plugin's sign-in protocol — the plugin and the Bridge server disagree on it; update the plugin (/plugin update bridge), then run /bridge:login";
+  "Bridge refused this plugin's sign-in protocol — the plugin and the Bridge server disagree on it; update the plugin (" + UPDATE_HOWTO + "), then run /bridge:login";
 
 const SESSION_REVOKED = "this session was revoked in Bridge — /bridge:connect starts a new one";
 
@@ -117,7 +118,7 @@ export function describeCredential(e: unknown, clientVersion: string): string {
     case "rate_limited":
       return `Bridge sign-in is rate-limited — retrying in ${e.retryAfterS ?? "a few "}s`;
     case "too_old":
-      return `this plugin (${clientVersion}) is older than Bridge accepts${e.minimum ? ` (>= ${e.minimum})` : ""} — /plugin update bridge, then /reload-plugins`;
+      return `this plugin (${clientVersion}) is older than Bridge accepts${e.minimum ? ` (>= ${e.minimum})` : ""} — ${UPDATE_HOWTO}`;
     case "refused":
       // The SDK's own refusals carry no OAuth cause: a server that cannot mint for a key, a
       // key that does not match its installation.

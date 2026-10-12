@@ -4,6 +4,7 @@
  * process, and `status`'s `server_versions`/`advice` (P8) kept in step with whatever the
  * server last said. Same stub-server + MCP-client harness as reconnect-close-codes.test.ts.
  */
+import { UPDATE_HOWTO } from "../update-howto";
 import { describe, test, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -118,7 +119,7 @@ describe("RFC-017 D5/P6: client.advice from the authenticated frame", () => {
       await Bun.sleep(300);
       const matches = notices().filter((c) => c.includes("0.27.0 is available"));
       expect(matches).toHaveLength(1);
-      expect(matches[0]).toContain("/plugin update bridge");
+      expect(matches[0]).toContain(UPDATE_HOWTO);
       expect(matches[0]).toContain("/reload-plugins");
       const s = await status(client);
       expect(s.advice).toBe("update_available");
@@ -133,7 +134,7 @@ describe("RFC-017 D5/P6: client.advice from the authenticated frame", () => {
       const matches = notices().filter((c) => c.includes("2026-12-01"));
       expect(matches).toHaveLength(1);
       expect(matches[0]).toContain("Bridge will stop accepting plugin");
-      expect(matches[0]).toContain("/plugin update bridge");
+      expect(matches[0]).toContain(UPDATE_HOWTO);
     });
   }, 40_000);
 

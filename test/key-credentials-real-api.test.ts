@@ -33,6 +33,7 @@
  * Seeding runs in a SUBPROCESS (fixtures/real-api-seed.ts), through the API's own modules:
  * `bun test` shares one process across files, and the API's db module binds its pool at import.
  */
+import { UPDATE_HOWTO } from "../update-howto";
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, cpSync, lstatSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -1011,7 +1012,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       // Same machine, same installation — "upgraded" to THIS (blocked) build.
       const p2 = await plugin(blocked.url, dir, { EINWEAVE_SESSION_KEY: "blocked-s1" });
       try {
-        expect(await until(() => p2.notices.some((n) => /plugin update bridge/.test(n)), 15_000), p2.stderr()).toBe(true);
+        expect(await until(() => p2.notices.some((n) => n.includes(UPDATE_HOWTO)), 15_000), p2.stderr()).toBe(true);
         expect(await p2.connected()).toBe(false);
         // S4/P5: a too-old/blocked refusal must not touch anything on disk.
         expect(readKey(dir)).toEqual(keyBefore);
