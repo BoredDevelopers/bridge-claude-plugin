@@ -522,7 +522,7 @@ export function createAuthCore(opts: StubOptions = {}) {
           // nothing below this line runs (no chain read, no lock, no session).
           if ((opts.tooOldMints ?? 0) > 0) {
             opts.tooOldMints!--;
-            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: bridge-claude-plugin >= 0.26.0 required — /plugin update bridge", 400);
+            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: bridge-claude-plugin >= 0.26.0 required — open /plugin → Installed → bridge → Update now, then /reload-plugins", 400);
           }
           if ((opts.rateLimitMints ?? 0) > 0) {
             opts.rateLimitMints!--;
@@ -750,7 +750,7 @@ export function startAuthStub(opts: StubOptions = {}) {
           // RFC-027 §5, as the server: a v1 frame (no `v: 2`, or a `since` cursor) is a client too old.
           if (f.v !== 2 || f.since !== undefined) {
             core.stats.refusals.push("ws:v1");
-            return core.closeLikeServer(ws, 4008, "client too old: run /plugin update bridge, then /reload-plugins");
+            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins");
           }
           const forced = core.takeForcedAuthClose();
           if (forced) {

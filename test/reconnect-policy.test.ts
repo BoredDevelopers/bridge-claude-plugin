@@ -2,6 +2,7 @@
  * reconnect-policy.ts — what the person is told about a close. Pure. (Which close is
  * which class, and when to reconnect, are the SDK's — tested there.)
  */
+import { UPDATE_HOWTO } from "../update-howto";
 import { describe, test, expect } from "bun:test";
 import { describeClose } from "../reconnect-policy";
 
@@ -51,8 +52,8 @@ describe("describeClose", () => {
   });
 
   test("describeClose: too-old always says the update instruction", () => {
-    const text = describeClose("too-old", 4008, "client too old: run /plugin update bridge, then /reload-plugins");
-    expect(text).toContain("/plugin update bridge");
+    const text = describeClose("too-old", 4008, "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins");
+    expect(text).toContain(UPDATE_HOWTO);
     expect(text).toContain("/reload-plugins");
   });
   test("4008 says what to do, by reason", () => {

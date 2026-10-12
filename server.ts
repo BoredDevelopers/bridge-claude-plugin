@@ -17,6 +17,7 @@
  * frame carries a fresh DPoP proof.
  */
 
+import { UPDATE_HOWTO } from "./update-howto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import pkg from "./package.json" with { type: "json" };
@@ -641,13 +642,13 @@ function noteServerAdvice(client: unknown): void {
   notifiedAdviceValues.add(advice);
   if (advice === "update_available") {
     notifyModel(
-      `Bridge plugin ${serverVersions.recommended ?? "a newer version"} is available (this window runs ${PLUGIN_VERSION}) — /plugin update bridge, then /reload-plugins`,
+      `Bridge plugin ${serverVersions.recommended ?? "a newer version"} is available (this window runs ${PLUGIN_VERSION}) — ${UPDATE_HOWTO}`,
       "status"
     );
   } else if (advice.startsWith("update_required_by ")) {
     const date = advice.slice("update_required_by ".length);
     notifyModel(
-      `Bridge will stop accepting plugin ${PLUGIN_VERSION} on ${date} — /plugin update bridge, then /reload-plugins`,
+      `Bridge will stop accepting plugin ${PLUGIN_VERSION} on ${date} — ${UPDATE_HOWTO}`,
       "status"
     );
   }

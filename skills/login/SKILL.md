@@ -37,7 +37,7 @@ Arguments passed: `$ARGUMENTS`
   they check the machine (and rotate its other secrets), then run `/bridge:login` again.
   Never suggest restoring or copying the credential files.
 - **"Bridge refused this plugin's sign-in protocol … update the plugin"** → the user runs
-  `/plugin update bridge`, restarts, then `/bridge:login`.
+  updates the plugin (`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`), then `/bridge:login`.
 - **"the Bridge API URL must be an origin …"** → `EINWEAVE_API_URL` must be the bare origin
   (scheme, host, port — no path), exactly the server's public URL origin; fix it with
   `/bridge:configure <url>`.

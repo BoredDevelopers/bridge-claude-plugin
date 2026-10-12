@@ -5,6 +5,7 @@
  * later one, so "did it reconnect, how soon, and what does `status` say" is
  * observable through the real WebSocket and the real MCP tool surface.
  */
+import { UPDATE_HOWTO } from "../update-howto";
 import { describe, test, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -205,12 +206,12 @@ describe("close codes", () => {
   }, 40_000);
 
   test("RFC-017 D5/D6: 4008 'client too old' stops (never reconnects on its own), and says the update instruction", async () => {
-    const stub = startStub({ code: 4008, reason: "client too old: run /plugin update bridge, then /reload-plugins" });
+    const stub = startStub({ code: 4008, reason: "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins" });
     await withPlugin(stub, async (client) => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
       await Bun.sleep(300);
       const s = await status(client);
-      expect(s.websocket).toContain("/plugin update bridge");
+      expect(s.websocket).toContain(UPDATE_HOWTO);
       expect(s.websocket).toContain("/reload-plugins");
       expect(s.websocket).not.toContain("reconnect attempt");
       // Unlike "superseded", too-old is not gated by the extra `superseded` flag — a
@@ -223,12 +224,12 @@ describe("close codes", () => {
   }, 40_000);
 
   test("RFC-017 D6: 'client version withdrawn' (blocked) maps to the SAME too-old stop, not a new class", async () => {
-    const stub = startStub({ code: 4008, reason: "client version withdrawn: run /plugin update bridge, then /reload-plugins" });
+    const stub = startStub({ code: 4008, reason: "client version withdrawn: open /plugin → Installed → bridge → Update now, then /reload-plugins" });
     await withPlugin(stub, async (client) => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
       await Bun.sleep(300);
       const s = await status(client);
-      expect(s.websocket).toContain("/plugin update bridge");
+      expect(s.websocket).toContain(UPDATE_HOWTO);
       expect(s.websocket).not.toContain("reconnect attempt");
     });
   }, 40_000);

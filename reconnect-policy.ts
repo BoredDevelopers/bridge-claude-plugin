@@ -4,6 +4,7 @@
  * SDK's (`classifyClose` / `reconnectDelay` in vendor/bridge-agent-sdk/core) — the
  * SDK reconnects; this file only words it.
  */
+import { UPDATE_HOWTO } from "./update-howto";
 import type { CloseClass } from "./vendor/bridge-agent-sdk/core/index.js";
 export type { CloseClass };
 
@@ -96,7 +97,7 @@ export function describeClose(
         : `another window took over Bridge (${tail}) — /bridge:connect takeover moves it back`;
     }
     case "too-old":
-      return `this plugin is too old for Bridge (${tail}) — /plugin update bridge, then /reload-plugins`;
+      return `this plugin is too old for Bridge (${tail}) — ${UPDATE_HOWTO}`;
     case "session-in-use":
       return `this session is already connected from another process (${tail}) — /bridge:status shows which; /bridge:connect takeover moves it here`;
     default:

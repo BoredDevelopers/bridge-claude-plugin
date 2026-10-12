@@ -77,13 +77,27 @@ By default, messages from all Bridge channels are delivered. To limit to specifi
 
 Or set `EINWEAVE_CHANNELS=general,frontend` in `~/.einweave/.env`.
 
+## Updating
+
+There is no `/plugin update` command in a session. To update:
+
+- **In a session:** `/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`.
+- **Every release automatically (recommended):** `/plugin` → Marketplaces →
+  bored-marketplace → **Enable auto-update** — once. Third-party marketplaces have it off
+  by default; with it on, Claude Code updates the plugin after a session starts and tells
+  you to `/reload-plugins`.
+- **From a shell:** `claude plugin marketplace update bored-marketplace`, then
+  `claude plugin update bridge@bored-marketplace`, then `/reload-plugins` (or a new session).
+- If **Update now** says it is already at the latest version while a newer release exists,
+  refresh the listing first: `/plugin` → Marketplaces → bored-marketplace → **Update marketplace**.
+
 ## Upgrading to 0.30
 
 0.30 speaks Bridge's delivery protocol v2 (RFC-027) and is a single cutover with the
 server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server first.
 
-1. **Update the plugin, then `/reload-plugins` in every window.** A window still on
-   0.29 stops with "client too old: run /plugin update bridge, then /reload-plugins".
+1. **Update the plugin (`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`) in every window.** A window
+   still on 0.29 stops with "client too old: …" (see *Updating*).
 2. **Nothing to sign in again.** At its first start 0.30 moves the state from
    `~/.claude/channels/bridge` to `~/.einweave`: each profile's credentials and the
    `.env`, with every `BRIDGE_*` key renamed `EINWEAVE_*`. The old directory is left
@@ -263,10 +277,10 @@ delivery as "hooks not reporting".
 
 **"Bridge refused this plugin's sign-in protocol … update the plugin".** The plugin
 and the server disagree on the sign-in protocol (typically a server that retired the
-plugin's version). Run `/plugin update bridge`, restart, then `/bridge:login`.
+plugin's version). Update it (`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`), then `/bridge:login`.
 
-**"client too old: run /plugin update bridge, then /reload-plugins"**. The server is on
-delivery v2 and this window runs 0.29 or older. Do exactly that; see *Upgrading to 0.30*.
+**"client too old: …"**. The server no longer accepts this plugin's version. Update it
+(`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`); see *Updating*.
 
 **"this Bridge server does not support key credentials yet".** The server predates
 RFC-016; upgrade it before using plugin 0.25.
