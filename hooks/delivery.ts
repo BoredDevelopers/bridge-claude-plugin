@@ -25,11 +25,9 @@ import { deliveredEntryId } from "../delivery/tags";
 import { ctlSocketPath } from "../delivery/ctl-path";
 import { checkPrivateDir } from "../delivery/private-dir";
 import { resolveStateDir } from "../state-dir";
-import type { CtlRequest } from "../delivery/ctl-protocol";
+import { askCtl } from "../delivery/ctl-client";
 
 const STDIN_TIMEOUT_MS = 1000;
-const SOCKET_TIMEOUT_MS = 1500;
-const MAX_RESPONSE_BYTES = 64 * 1024;
 
 const stateDir = resolveStateDir();
 
@@ -56,52 +54,6 @@ async function readPayload(): Promise<Record<string, unknown>> {
   }
 }
 
-/** One request, one response line; null on any failure or timeout. */
-function ask(path: string, req: CtlRequest): Promise<Record<string, unknown> | null> {
-  return new Promise((resolve) => {
-    let buf = "";
-    let done = false;
-    const finish = (v: Record<string, unknown> | null) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(v);
-    };
-    const timer = setTimeout(() => finish(null), SOCKET_TIMEOUT_MS);
-    Bun.connect({
-      unix: path,
-      socket: {
-        open(s) {
-          s.write(JSON.stringify(req) + "\n");
-        },
-        data(s, chunk) {
-          buf += chunk.toString();
-          // Settle BEFORE end(): end() runs close() synchronously, which would
-          // settle null first and drop the answer.
-          if (buf.length > MAX_RESPONSE_BYTES) {
-            finish(null);
-            return void s.end();
-          }
-          const nl = buf.indexOf("\n");
-          if (nl < 0) return;
-          let v: unknown = null;
-          try {
-            v = JSON.parse(buf.slice(0, nl));
-          } catch {}
-          finish(v && typeof v === "object" ? (v as Record<string, unknown>) : null);
-          s.end();
-        },
-        close() {
-          finish(null);
-        },
-        error() {
-          finish(null);
-        },
-      },
-    }).catch(() => finish(null));
-  });
-}
-
 async function main(): Promise<void> {
   const mode = process.argv[2];
   if (mode !== "prompt" && mode !== "stop") return;
@@ -114,10 +66,10 @@ async function main(): Promise<void> {
   if (!checkPrivateDir(dirname(path)).ok) return;
 
   if (mode === "stop") {
-    await ask(path, { op: "stop" });
+    await askCtl(path, { op: "stop" });
     return;
   }
-  const res = await ask(path, { op: "prompt", id: deliveredEntryId(payload.prompt) });
+  const res = await askCtl(path, { op: "prompt", id: deliveredEntryId(payload.prompt) });
   if (res?.ok === true && typeof res.context === "string" && res.context.length > 0) {
     writeSync(
       1,
