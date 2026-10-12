@@ -160,6 +160,7 @@ var DEFAULT_LIVENESS_MS = 90000;
 var DEFAULT_STANDBY_RETRY_MS = 30000;
 var DEFAULT_BUFFER_SIZE = 1000;
 var DEFAULT_RECONCILE_MS = 15 * 60000;
+var RECONCILE_PAGE = 200;
 var DEFAULT_STATUS_BUFFER_SIZE = 100;
 var SETTLED_MAX = 1e4;
 var OWN_SENT_MAX = 1000;
@@ -185,6 +186,8 @@ class Session {
   watchdogTimer = null;
   standbyTimer = null;
   reconcileTimer = null;
+  reconcileRunning = false;
+  reconcileQueued = null;
   lock;
   reconnectAttempt = 0;
   lastClose = { cls: "transient" };
@@ -627,21 +630,71 @@ class Session {
       if (this.authenticatedAt === null || this.rt.clock.now() - this.lastSequencedAt < after)
         return;
       this.lastSequencedAt = this.rt.clock.now();
-      this.reconcile();
+      this.reconcile().catch(() => {});
     }, Math.max(1, Math.min(after, 60000)), { unref: true });
   }
-  async reconcile() {
-    let res;
-    try {
-      res = await this.client.api.deliveries.list();
-    } catch {
-      return;
+  reconcile() {
+    if (this.stopped)
+      return Promise.resolve({ delivered: 0 });
+    if (!this.reconcileRunning)
+      return this.runReconcile();
+    if (!this.reconcileQueued) {
+      let resolve;
+      let reject;
+      const promise = new Promise((res, rej) => (resolve = res, reject = rej));
+      this.reconcileQueued = { promise, resolve, reject };
     }
+    return this.reconcileQueued.promise;
+  }
+  runReconcile() {
+    this.reconcileRunning = true;
+    const run = this.fetchOwed();
+    const next = () => {
+      const queued = this.reconcileQueued;
+      this.reconcileQueued = null;
+      if (!queued || this.stopped) {
+        this.reconcileRunning = false;
+        queued?.resolve({ delivered: 0 });
+        return;
+      }
+      this.runReconcile().then(queued.resolve, queued.reject);
+    };
+    run.then(next, next);
+    return run;
+  }
+  async fetchOwed() {
+    let delivered = 0;
+    let after;
+    for (;; ) {
+      const res = await this.client.api.deliveries.list({ limit: RECONCILE_PAGE, after });
+      if (this.stopped)
+        return { delivered };
+      for (const e of res.entries ?? []) {
+        const entry = entryFrom(e.kind, e.payload, true);
+        if (entry && this.deliver(entry))
+          delivered++;
+      }
+      const next = typeof res.next === "string" ? res.next : null;
+      if (next === null || next === after)
+        return { delivered };
+      after = next;
+    }
+  }
+  async readDeliveries(opts = {}) {
+    if (this.stopped)
+      throw new Error("session stopped");
+    const res = await this.client.api.deliveries.list(opts);
+    if (this.stopped)
+      throw new Error("session stopped");
+    const entries = [];
     for (const e of res.entries ?? []) {
-      const entry = entryFrom(e.kind, e.payload, true);
+      if (!e || typeof e.payload !== "object" || e.payload === null)
+        continue;
+      const entry = entryFrom(e.kind, e.payload, e.payload.redelivery === true);
       if (entry)
-        this.deliver(entry);
+        entries.push(entry);
     }
+    return { entries, next: typeof res.next === "string" ? res.next : null };
   }
   onFrame(raw) {
     let env;
@@ -728,15 +781,15 @@ class Session {
     if (settled) {
       this.acks[settled].add(entry.id);
       this.flushAcks();
-      return;
+      return false;
     }
     if (this.pending.has(entry.id))
-      return;
+      return false;
     if (entry.kind === "message" && !isAddressed(entry.message.deliveryReasons) && this.opts.filter && !this.opts.filter(entry.message))
-      return;
+      return false;
     this.pending.add(pendingMeta(entry));
     if (this.adapter.mode !== "channel" || !this.adapter.push)
-      return;
+      return true;
     this.pushQueue.push(entry);
     const max = this.opts.bufferSize ?? DEFAULT_BUFFER_SIZE;
     while (this.pushQueue.length > max) {
@@ -745,6 +798,7 @@ class Session {
       this.emitStatus({ kind: "slow-consumer", droppedId: dropped.id });
     }
     this.drainPushQueue();
+    return true;
   }
   async drainPushQueue() {
     if (this.pushing)
@@ -810,7 +864,7 @@ function pendingMeta(entry) {
 }
 
 // src/runtime/sdk-version.generated.ts
-var SDK_VERSION = "0.6.1";
+var SDK_VERSION = "0.6.3";
 
 // src/runtime/api.ts
 var HTTP_TIMEOUT_MS = 20000;
@@ -925,7 +979,15 @@ function createApi(rt, client) {
       list: () => req("GET", "/api/presence")
     },
     deliveries: {
-      list: () => req("GET", "/api/deliveries")
+      list: (opts = {}) => {
+        const qs2 = new URLSearchParams;
+        if (opts.limit !== undefined)
+          qs2.set("limit", String(opts.limit));
+        if (opts.after !== undefined)
+          qs2.set("after", opts.after);
+        const q = qs2.toString();
+        return req("GET", q ? `/api/deliveries?${q}` : "/api/deliveries");
+      }
     },
     tasks: {
       claim: (messageId) => req("POST", `/api/tasks/${encodeURIComponent(messageId)}/claim`),

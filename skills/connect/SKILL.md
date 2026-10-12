@@ -49,3 +49,6 @@ Arguments passed: `$ARGUMENTS`
 - If another window of this same Claude session already holds the lock (an equal or
   newer plugin), a plain `/bridge:connect` stands by and retries — it does not take
   over. Use `/bridge:connect takeover` to move Bridge here explicitly.
+- If this window should be its **own** Bridge session instead of fighting another window for
+  this one, restart it with `claude --resume <session id> --fork-session` — the standby message
+  prints the exact command when the session id is the conversation's own.

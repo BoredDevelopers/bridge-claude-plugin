@@ -415,6 +415,20 @@ describe("read_thread / list_threads", () => {
     expect(r.isError).toBe(true);
   });
 
+  test("a read_thread that fails AFTER fetching the replies acks nothing (the model never received them)", async () => {
+    stub.set({ eventsStatus: 500 });
+    const failed = await callTool("read_thread", { thread_id: THREAD, mark_read: false });
+    expect(failed.isError).toBe(true);
+    await Bun.sleep(400);
+    expect(stub.acks).toEqual([]);
+    // The ack path itself is alive: the retry that succeeds is acked, once.
+    stub.set({ eventsStatus: 200 });
+    const body = await ok("read_thread", { thread_id: THREAD, mark_read: false });
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && stub.acks.length === 0) await Bun.sleep(25);
+    expect(stub.acks).toEqual([{ ids: [body.root.id, ...body.replies.map((r: any) => r.id)], how: "model" }]);
+  });
+
   test("set_thread_kind PUTs the kind and reports the result (RFC-015 slice 5)", async () => {
     const r = await ok("set_thread_kind", { thread_id: THREAD, kind: "question" });
     expect(r).toEqual({ thread_id: THREAD, kind: "question", status: "open", answer_message_id: null });

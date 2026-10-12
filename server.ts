@@ -45,8 +45,8 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync, mkdirSync, chmodSync, existsSync } from "fs";
-import { homedir, hostname } from "os";
-import { join } from "path";
+import { homedir, hostname, tmpdir } from "os";
+import { dirname, join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
 import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
 import { describeClose, type CloseClass, type HolderIdentity } from "./reconnect-policy";
@@ -55,20 +55,23 @@ import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersio
 import { resolveProfile, profileLabel } from "./auth/profile";
 import { SignIn, describeCredential, waitFor } from "./auth/login";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
-import { Session, createRuntime, type Entry, type PendingEntry, type SessionStatus, type SessionStop } from "./vendor/bridge-agent-sdk/index.js";
+import { Session, createRuntime, type DeliveryAdapter, type Entry, type PendingEntry, type SessionStatus, type SessionStop } from "./vendor/bridge-agent-sdk/index.js";
 import { isAddressed, deadline } from "./vendor/bridge-agent-sdk/core/index.js";
 import { sessionLock, fileSeqStore, type SessionLockHandle, type LockRecord } from "./vendor/bridge-agent-sdk/node.js";
-import { channelAdapter } from "./link/adapter";
+import { channelAdapter, render, shouldDismiss } from "./link/adapter";
 import { MissedTracker } from "./delivery/missed";
-import { startCtlServer, sweepStaleCtlSockets, type CtlServer } from "./delivery/ctl-server";
+import { sweepCtlDirs, removeLegacyCtlDir, type CtlServerOptions } from "./delivery/ctl-server";
+import { CtlManager } from "./delivery/ctl-manager";
 import { ctlSocketPath } from "./delivery/ctl-path";
+import { legacyEnvProblem } from "./legacy-env";
+import { ReturnedAcks } from "./delivery/returned-acks";
 import type { NoticeEntry } from "./delivery/notice";
 import { deliveryState } from "./delivery/state";
 import { localIso } from "./local-time";
 import { sanitizeChannelParams } from "./control-chars";
 import { startFeedTap, sweepStaleFeedSockets, writeLauncher, launcherPath, type FeedTap } from "./feed-tap";
 import { procStartOf, procStartMatches } from "./proc-start";
-import { resolveStateDir, migrateLegacyState } from "./state-dir";
+import { resolveStateDir, migrateLegacyState, sweepMigrationTemps } from "./state-dir";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -108,7 +111,13 @@ const SESSION_LABEL_OVERRIDE = (process.env.EINWEAVE_SESSION_LABEL ?? "").trim()
 // Same real-env-before-.env rule: the profile picks WHICH agent this session is,
 // so it comes from the session's own environment (per project via
 // .claude/settings.local.json), never from the machine-global .env.
-const PROFILE = resolveProfile(STATE_DIR, process.env.EINWEAVE_PROFILE);
+// A leftover BRIDGE_PROFILE (or any pre-0.30 BRIDGE_ variable) would be silently ignored and
+// the session would connect as the DEFAULT agent: refuse instead (legacy-env.ts). Same
+// real-env-before-.env capture, and it travels as a profile error so every surface that
+// reports one (status `problem`, tool errors, login/logout) reports this.
+const LEGACY_ENV_PROBLEM = legacyEnvProblem(process.env);
+const PROFILE = LEGACY_ENV_PROBLEM ? { error: LEGACY_ENV_PROBLEM } : resolveProfile(STATE_DIR, process.env.EINWEAVE_PROFILE);
+const PROFILE_LABEL = "error" in PROFILE ? "(invalid)" : profileLabel(PROFILE);
 
 // Resolved once SESSION_KEY is (see bottom of file); read by
 // minimalSessionInfo(). Mutable because the set_session_label tool updates it
@@ -405,6 +414,19 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 // literal type `${string}-${string}-…`, which a resolved session key (a repo
 // slug, an env override) does not satisfy.
 let SESSION_KEY: string = FALLBACK_SESSION_KEY;
+/** SESSION_KEY is the conversation's own stable id (from the session map), the one `claude --resume` takes. */
+let SESSION_KEY_IS_CONVERSATION_ID = false;
+
+/**
+ * The line that tells a person how to make a second window its OWN Bridge session instead of
+ * fighting for this one. Only when SESSION_KEY really is the conversation id — a per-launch id,
+ * an operator override or the random fallback is not something `--resume` accepts.
+ */
+function forkHint(): string {
+  return SESSION_KEY_IS_CONVERSATION_ID
+    ? ` If this window should be its own Bridge session, restart it with \`claude --resume ${SESSION_KEY} --fork-session\`.`
+    : "";
+}
 
 function apiUrl(): string {
   return creds.apiUrl();
@@ -1020,15 +1042,17 @@ function connectionStatus(): Record<string, unknown> {
 /** RFC-027 D7: did what this session was handed reach the model? (delivery/state.ts) */
 function deliveryStatus(): Record<string, unknown> {
   const pending = session?.pending.list() ?? [];
+  const ctl = ctlMgr?.current() ?? null;
   const stats = ctl?.stats() ?? null;
   const missed = tracker.missed(pending);
-  const { state, hint } = deliveryState({ ctl: !!ctl, pushed: pushedCount, missed, confirmed: stats?.confirmed ?? 0, lastHookAt: stats?.lastHookAt ?? null });
+  const { state, hint } = deliveryState({ ctl: !!ctl, ctlProblem: ctlMgr?.problem() ?? undefined, pushed: pushedCount, missed, confirmed: stats?.confirmed ?? 0, lastHookAt: stats?.lastHookAt ?? null });
   return {
     state,
     pending: pending.length,
     missed,
     confirmed: stats?.confirmed ?? 0,
     last_hook_at: stats?.lastHookAt ? localIso(stats.lastHookAt) : null,
+    ...(ctlMgr && ctlMgr.reclaims() > 0 ? { ctl_reclaims: ctlMgr.reclaims() } : {}),
     ...(hint ? { hint } : {}),
   };
 }
@@ -1132,12 +1156,14 @@ const creds = new SignIn({
   clientVersion: PLUGIN_VERSION,
   env: process.env,
   onLoggedIn: () => {
+    returnedAcks.clear(); // held acks belong to the sign-in that was replaced
     wantConnected = true;
     intentExplicitlySet = true;
     writeConnectState(STATE_DIR, SESSION_KEY, true);
     restartConnection();
   },
   onLoggedOut: () => {
+    returnedAcks.clear();
     stopConnection();
   },
   notify: (text) => notifyModel(text, "status"),
@@ -1156,11 +1182,16 @@ const creds = new SignIn({
 });
 /** Entries pushed but not confirmed, for the missed notice (delivery/missed.ts). */
 const tracker = new MissedTracker<PendingEntry>();
+/** Read-tool acks that found no live Session (delivery/returned-acks.ts). */
+const returnedAcks = new ReturnedAcks();
 /** Entries handed to the host in this process — `status`'s "idle" until the first. */
 let pushedCount = 0;
 let session: Session | null = null;
 let lock: SessionLockHandle | null = null;
-let ctl: CtlServer | null = null;
+/** Who serves the control socket (delivery/ctl-manager.ts); null when Claude Code's pid was not found. */
+let ctlMgr: CtlManager<PendingEntry> | null = null;
+/** This Session has authenticated at least once: it holds the lock and can send acks. Reset when a Session closes. */
+let sessionEverAuthenticated = false;
 /** What rides on every auth frame. Mutated in place: the label tool's change applies to the next one. */
 const authSessionInfo: Record<string, string> = {};
 
@@ -1184,27 +1215,35 @@ let openHostGate!: () => void;
 const hostReady = new Promise<void>((resolve) => (openHostGate = resolve));
 setTimeout(() => openHostGate(), HOST_READY_FALLBACK_MS).unref?.();
 
-const adapter = channelAdapter({
-  notify: (r) => mcp.notification({ method: "notifications/claude/channel", params: r }),
-  ready: () => hostReady,
-  myGrant: () => myContextId,
-  myAgentId: () => agentId,
-  isOwnSend: (id) => ownSentIds.has(id),
-  dismiss: (id) => session?.ack([id], "dismissed"),
-  pushed: (entry: Entry) => {
-    pushedCount++;
-    tracker.pushed(entry.id, Date.now());
-    // RFC-022 D8: the feed gets exactly what the host was handed, once it accepted it.
-    if (entry.kind === "message") {
-      const m = entry.message;
-      feedWithChannelName(m.channelId, (channelName) => feedTap?.inbound(m, { channelName, targeted: isAddressed(m.deliveryReasons) }));
-    }
-  },
-  failed: (entry, err) => {
-    process.stderr.write(`bridge channel: failed to deliver ${entry.kind} ${entry.id} to Claude: ${err}\n`);
-    notifyInboundFailure(entry.kind, err);
-  },
-});
+/**
+ * One adapter PER Session, bound to the Session that holds the entries it pushes: a push that
+ * fails (or an own send coming back) after the Session was replaced must act on the Session
+ * that held the entry, not on whichever is current.
+ */
+function adapterFor(owner: () => Session | null): DeliveryAdapter {
+  return channelAdapter({
+    notify: (r) => mcp.notification({ method: "notifications/claude/channel", params: r }),
+    ready: () => hostReady,
+    myGrant: () => myContextId,
+    myAgentId: () => agentId,
+    isOwnSend: (id) => ownSentIds.has(id),
+    dismiss: (id) => owner()?.ack([id], "dismissed"),
+    unhold: (id) => owner()?.pending.remove([id]),
+    pushed: (entry: Entry) => {
+      pushedCount++;
+      tracker.pushed(entry.id, Date.now());
+      // RFC-022 D8: the feed gets exactly what the host was handed, once it accepted it.
+      if (entry.kind === "message") {
+        const m = entry.message;
+        feedWithChannelName(m.channelId, (channelName) => feedTap?.inbound(m, { channelName, targeted: isAddressed(m.deliveryReasons) }));
+      }
+    },
+    failed: (entry, err) => {
+      process.stderr.write(`bridge channel: failed to deliver ${entry.kind} ${entry.id} to Claude: ${err}\n`);
+      notifyInboundFailure(entry.kind, err);
+    },
+  });
+}
 
 /**
  * EINWEAVE_CHANNELS narrows the BROADCAST tier only — the Session never asks about an
@@ -1233,16 +1272,59 @@ function pendingNotice(e: PendingEntry): NoticeEntry {
   };
 }
 
+/** Waits between attempts to open the control socket while another process serves it (~15 s in all). */
+const CTL_RETRY_BASE_MS = testKnob("EINWEAVE_TEST_CTL_RETRY_MS", (n) => Number.isInteger(n) && n > 0) ?? 500;
+/** TEST-ONLY override (ms) of how often the lock holder re-checks it still owns the control socket (default 30 s). */
+const CTL_WATCH_MS = testKnob("EINWEAVE_TEST_CTL_WATCH_MS", (n) => Number.isInteger(n) && n > 0);
+const CTL_RETRY_DELAYS_MS = [1, 2, 4, 8, 16].map((m) => m * CTL_RETRY_BASE_MS);
+
+/** The current Session unless the SDK has stopped it. */
+function liveSession(): Session | null {
+  return session && !session.stopReason() ? session : null;
+}
+
+/**
+ * Does THIS window hold the Bridge session right now? Asked of the live lock and Session every
+ * time, never remembered: a Session the SDK stopped (superseded, revoked, credentials) or one
+ * standing by holds nothing. The ctl socket, `read_deliveries` and the watch all follow this.
+ */
+async function holdsLiveLock(): Promise<boolean> {
+  const s = liveSession();
+  const l = lock;
+  if (!s || !l || standbyHolder || !sessionEverAuthenticated) return false;
+  try {
+    return await l.isHeld();
+  } catch {
+    return false;
+  }
+}
+
+function ctlOptions(claudePid: number, takeover: boolean): CtlServerOptions<PendingEntry> {
+  return {
+    path: ctlSocketPath(STATE_DIR, claudePid),
+    pending: {
+      // Only a LIVE Session answers the hooks: one the SDK stopped (superseded, revoked, …) has
+      // nothing pending to show and no socket to send an ack on.
+      list: () => liveSession()?.pending.list() ?? [],
+      confirm: (ids) => liveSession()?.pending.confirm(ids) ?? [],
+    },
+    tracker,
+    toNotice: pendingNotice,
+    log: (line) => process.stderr.write(line + "\n"),
+    ...(takeover ? { takeover: true } : {}),
+  };
+}
+
 /**
  * Open a Session — the initial connect, a person's `connect`, a login, the credential
  * watch. Replaces any Session this process has. Every automatic path is refused once
  * superseded; only `takeover` (the person's one-time choice) gets past it.
  */
-async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
-  if (!wantConnected || shuttingDown) return;
-  if (superseded && !opts.takeover) return;
+async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire" | "takeover" | "standby" | "lost" | null> {
+  if (!wantConnected || shuttingDown) return null;
+  if (superseded && !opts.takeover) return null;
   const client = await creds.sessionClient();
-  if (!client || !wantConnected || shuttingDown) return;
+  if (!client || !wantConnected || shuttingDown) return null;
   closeSession();
   const id = myIdentity();
   const myLock = sessionLock({
@@ -1258,6 +1340,11 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
   // Decided here, once, for the log line an operator greps for (and the person's explicit
   // takeover); the Session's own acquire() then finds the lock already ours, or stands by.
   const decision = await myLock.acquire(opts.takeover ? { takeover: true } : {});
+  if ((decision === "acquire" || decision === "takeover") && !shuttingDown) {
+    // The lock holder is the copy whose Session the hooks must reach: if another copy of the
+    // plugin in this Claude holds the socket, take it over (that copy stands by or is exiting).
+    await ctlMgr?.ensure({ assumeHolder: true }); // the lock is ours; the Session object does not exist yet
+  }
   if (decision === "acquire" || decision === "takeover") {
     process.stderr.write(
       decision === "takeover"
@@ -1270,10 +1357,11 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
   if (lock !== myLock || !wantConnected || shuttingDown) {
     if (lock === myLock) lock = null;
     myLock.release();
-    return;
+    return null;
   }
+  let created: Session | null = null; // the adapter acts on THIS Session, not on whichever is current later
   const s = new Session(rt, client, {
-    adapter,
+    adapter: adapterFor(() => created),
     filter: broadcastFilter,
     seqStore,
     lock: myLock,
@@ -1282,6 +1370,7 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
     standbyRetryMs: LOCK_RETRY_MS,
     autoConnect: false,
   });
+  created = s;
   session = s;
   standbyHolder = null;
   updateProcState(STATE_DIR, process.pid, "disconnected");
@@ -1296,6 +1385,7 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<void> {
     }
   })();
   s.start();
+  return decision;
 }
 
 /** Drop the current Session (its `finish` releases its lock). Nothing it owed is lost: the server still owes it. */
@@ -1304,6 +1394,7 @@ function closeSession(): void {
   const l = lock;
   session = null;
   lock = null;
+  sessionEverAuthenticated = false;
   authenticated = false;
   authenticatedAt = null;
   nextReconnectAt = null;
@@ -1318,8 +1409,11 @@ function onStatus(st: SessionStatus): void {
       agentName = st.agentName ?? "";
       agentHandle = st.handle ?? "";
       myContextId = st.contextId ?? "";
+      // Read-tool acks that found no Session go to this one — if it is the same profile and agent.
+      if (session) returnedAcks.flush(session, { profile: PROFILE_LABEL, agentId });
       noteServerAdvice(st.advice);
       authenticated = true;
+      sessionEverAuthenticated = true;
       authenticatedAt = Date.now();
       // "connected" means an authenticated socket, not merely having won the local lock.
       updateProcState(STATE_DIR, process.pid, "connected");
@@ -1329,6 +1423,9 @@ function onStatus(st: SessionStatus): void {
       lastClose = { cls: "transient" };
       standbyHolder = null;
       resetRefusalEpisode();
+      // Authenticated means this copy holds the session lock — also when it got it from the
+      // SDK's standby retry rather than openSession. The socket follows the lock.
+      void ctlMgr?.ensure();
       process.stderr.write(`bridge channel: authenticated as ${agentName} (${agentId})${myContextId ? ` context ${myContextId}` : ""}\n`);
       feedStatus("connected");
       return;
@@ -1362,6 +1459,7 @@ function onStatus(st: SessionStatus): void {
     }
     case "standby": {
       authenticated = false;
+      sessionEverAuthenticated = false;
       updateProcState(STATE_DIR, process.pid, "standby");
       // The node lock hands back its whole record; the port only promises pid/version.
       const holder = (st.holder ?? null) as LockRecord | null;
@@ -1435,6 +1533,7 @@ function noteServerError(message: string): void {
 /** The Session will never reconnect again. What the person is told, and what (if anything) ends it. */
 function onStopped(stop: SessionStop): void {
   authenticated = false;
+  if (stop.kind !== "drain") sessionEverAuthenticated = false; // a stopped Session holds nothing
   authenticatedAt = null;
   nextReconnectAt = null;
   if (stop.kind === "drain") return;
@@ -1522,7 +1621,7 @@ function notifyStandby(rec: LockRecord): void {
   notifyModel(
     `Bridge is connected in another window of this session: pid ${rec.pid}, ${rec.version ?? "0.25.0"}` +
       `${rec.tty ? `, ${rec.tty}` : ""}${rec.termProgram ? ` (${rec.termProgram})` : ""}${rec.cwd ? `, ${rec.cwd}` : ""}` +
-      `, since ${since}. This window stands by. /bridge:connect takeover moves it here.`,
+      `, since ${since}. This window stands by. /bridge:connect takeover moves it here.${forkHint()}`,
     "status"
   );
 }
@@ -1721,11 +1820,159 @@ function requireBridge(): { content: { type: "text"; text: string }[] } | null {
  * this agent's ids; the Session queues it while offline and the server ignores ids it does
  * not owe. Their missed-tracking ends here too.
  */
-function confirmReturned(ids: unknown[]): void {
+function confirmReturned(ids: unknown[], who: Reader): void {
   const list = ids.filter((id): id is string => typeof id === "string" && id.length > 0);
   if (list.length === 0) return;
-  session?.ack(list, "model");
+  // Acks go to the Session that is current NOW, only if it has authenticated (so `agentId` is
+  // ITS agent) — and ReturnedAcks acks through it only when that agent+profile is the one the
+  // entries were READ AS (captured before the await). A different agent swapped in during the
+  // read, or no authenticated Session yet: held, stamped with the captured identity, and handed
+  // only to a Session of that identity (delivery/returned-acks.ts).
+  const target = liveSession() && sessionEverAuthenticated && !standbyHolder ? session : null;
+  returnedAcks.confirm(list, { session: target, profile: PROFILE_LABEL, agentId: agentId || null }, who);
   for (const id of list) tracker.settled(id);
+}
+
+/** Who a read tool reads as — captured BEFORE its first await (a Session can be replaced during one). */
+type Reader = { profile: string; agentId: string | null };
+function readerNow(): Reader {
+  return { profile: PROFILE_LABEL, agentId: agentId || null };
+}
+
+/**
+ * `read_deliveries` must run in the window that holds this Bridge session, live and connected: it
+ * returns the page the SERVER still owes THIS session, and only acking clears it. A window standing
+ * by, stopped, never authenticated or mid-reconnect would return the same page forever (or ack on
+ * behalf of a session it does not have). The other read tools are plain HTTP reads and always work;
+ * their acks are held, stamped, until a live holder of the same identity exists (ReturnedAcks).
+ */
+async function requireHolder(): Promise<{ content: { type: "text"; text: string }[] } | null> {
+  const say = (text: string) => ({ content: [{ type: "text" as const, text }] });
+  if (!session) return say("Bridge is still connecting (no session yet) — nothing was read or acknowledged. Try again in a moment.");
+  const stopped = session.stopReason();
+  if (stopped) {
+    // A superseded window can only get Bridge back by taking it over; a plain connect does nothing there.
+    const how = stopped.kind === "superseded" ? "/bridge:connect takeover moves Bridge back to this window" : "/bridge:connect starts a new one";
+    return say(`This window's Bridge session has stopped (${stopped.kind}) — nothing was read or acknowledged. ${how}.`);
+  }
+  if (standbyHolder) {
+    return say(
+      `This window stands by — another window holds this Bridge session, and reading here would acknowledge entries on its behalf. /bridge:connect takeover moves Bridge to this window.${forkHint()}`
+    );
+  }
+  if (!sessionEverAuthenticated) return say("Bridge is still connecting (no authenticated session yet) — nothing was read or acknowledged. Try again in a moment.");
+  if (!authenticated) return say("Bridge is reconnecting — acks can't be sent yet, so nothing was read or acknowledged; try again shortly.");
+  if (!(await holdsLiveLock())) return say("Another window holds Bridge now (this window's lock was lost; its session is about to stop) — nothing was read or acknowledged. /bridge:connect takeover moves Bridge back to this window.");
+  return null;
+}
+
+/**
+ * `read_deliveries`: everything this session's model still OWES — messages, task events and
+ * action requests, oldest first, full payloads, rendered exactly as a push renders them.
+ * The one way to clear a missed task event or action request (no thread to read), and the
+ * way to catch up after a gap without knowing where to look.
+ *
+ * The C1 rule: nothing is acked until the result is completely built — an entry acked here
+ * but lost on the way is never redelivered. Then `model` is acked for exactly the entries in
+ * the result (the same path read_messages / read_thread use, so the missed tracker settles and
+ * an ack with no live Session is held, not dropped). Echoes of this session's own sends and
+ * entries addressed to its siblings are not shown (as on the push path) and are acked
+ * `dismissed`.
+ *
+ * EINWEAVE_CHANNELS: a broadcast the filter declines is not delivered on the push path and is
+ * never acked there — the server keeps owing it. So it is not shown here, not acked here
+ * (a false ✓✓ in a channel this window excluded), and counted as `filtered`. It stays owed, so
+ * it stays in the server's pages: paging on past it works because the cursor comes from the server.
+ *
+ * Size: the result is capped (~40 KB of entries) — the first entry is always included, the rest
+ * of the page waits. Only what was included is acked, and a cut page offers NO `next` (the
+ * server's cursor would skip the remainder): read again WITHOUT `after` — what was read is cleared,
+ * so the remainder is the new first page.
+ */
+const READ_DELIVERIES_BUDGET_BYTES = 40_000;
+
+async function readDeliveries(args: Record<string, unknown>) {
+  const gate = requireBridge();
+  if (gate) return gate;
+  const notHolder = await requireHolder();
+  if (notHolder) return notHolder;
+  const who = readerNow();
+  const s = session!; // requireHolder: there is an authenticated Session
+  if (args.after != null && typeof args.after !== "string") throw new Error("after must be the `next` cursor string from the previous read_deliveries result.");
+  const limit = Math.min(Math.max(Math.trunc(Number(args.limit) || 50), 1), 200);
+  const after = typeof args.after === "string" && args.after !== "" ? args.after : undefined;
+  const page = await s.readDeliveries({ limit, ...(after ? { after } : {}) });
+
+  // A channel the name map has not heard of (created after it was built, or the map never loaded)
+  // decides "unknown": refresh it once before classifying, so such a broadcast is delivered when
+  // the filter names it — not mistaken for an excluded one. (The push path asks again later;
+  // here there is no later.)
+  const undecided = (e: Entry) => e.kind === "message" && !isAddressed(e.message.deliveryReasons) && channelDecision(e.message.channelId ?? "") === "unknown";
+  if (page.entries.some(undecided)) await ensureChannelMap();
+
+  const echoes: string[] = [];
+  const shown: Entry[] = [];
+  const entries: Record<string, unknown>[] = [];
+  let filtered = 0;
+  let unresolved = 0;
+  let bytes = 0;
+  let cut = false;
+  const deps = { myGrant: () => myContextId, myAgentId: () => agentId, isOwnSend: (id: string) => ownSentIds.has(id) };
+  for (const e of page.entries) {
+    if (e.kind === "message" && !isAddressed(e.message.deliveryReasons)) {
+      const decision = channelDecision(e.message.channelId ?? "");
+      if (decision === "drop") {
+        filtered++; // declined by EINWEAVE_CHANNELS: neither shown nor acked, exactly as on the push path
+        continue;
+      }
+      if (decision === "unknown") {
+        unresolved++; // the name map still cannot say (fetch failed, or refresh rate-limited): not shown, not acked, say so
+        continue;
+      }
+    }
+    if (shouldDismiss(e, deps)) {
+      echoes.push(e.id);
+      continue;
+    }
+    const r = render(e);
+    const { channel_id, thread_id, ...meta } = r.meta; // the two ids ride at the top level, once
+    const item = {
+      kind: e.kind,
+      id: e.id,
+      redelivery: e.redelivery,
+      ...(e.kind === "message" ? { reasons: e.message.deliveryReasons } : {}),
+      ...(channel_id ? { channel_id } : {}),
+      ...(thread_id ? { thread_id } : {}),
+      content: r.content,
+      meta,
+    };
+    const size = Buffer.byteLength(JSON.stringify(item));
+    if (entries.length > 0 && bytes + size > READ_DELIVERIES_BUDGET_BYTES) {
+      cut = true;
+      break; // this one and everything after it wait for the next call; none of them is acked
+    }
+    bytes += size;
+    entries.push(item);
+    shown.push(e);
+  }
+  const filteredNote =
+    (filtered > 0 ? ` ${filtered} broadcast(s) in channels excluded by EINWEAVE_CHANNELS are not shown and stay owed; they do not block paging.` : "") +
+    (unresolved > 0 ? ` ${unresolved} broadcast(s) are in channels not resolved yet (the channel list could not be read) — not shown and not acknowledged; try again shortly.` : "");
+  const next = cut ? null : page.next;
+  const hint = cut
+    ? `Cut short at ~${Math.round(READ_DELIVERIES_BUDGET_BYTES / 1000)} KB: more of this page is still owed. What you just read is cleared — call read_deliveries again WITHOUT \`after\` for the rest.${filteredNote}`
+    : page.next
+      ? `More are owed. Next: read_deliveries(after: ${JSON.stringify(page.next)}).${filteredNote}`
+      : entries.length === 0 && filtered === 0 && unresolved === 0
+        ? "Nothing is owed to this session."
+        : `That is everything owed to this session right now.${filteredNote}`;
+  // Cursor fields first, for the reason read_messages gives.
+  const text = JSON.stringify({ count: entries.length, filtered, ...(unresolved > 0 ? { unresolved } : {}), next, ...(cut ? { truncated: true } : {}), hint, entries }, null, 2);
+
+  // Last, after every fallible step above: only now are these entries really in the model's hands.
+  if (echoes.length > 0 && session && sessionEverAuthenticated && who.agentId === (agentId || null)) session.ack(echoes, "dismissed");
+  confirmReturned(shown.map((e) => e.id), who);
+  return { content: [{ type: "text", text }] };
 }
 
 async function markReadUpTo(
@@ -1766,7 +2013,7 @@ const mcp = new Server(
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
-      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status; list_presence shows who is around — people and agents, connected or when last seen. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: if a reply fails with join_required, call join_channel(channel_id) and send again. who_can_see(channel_id) tells you who will read what you post.",
+      "The list_channels tool shows available channels. The list_agents tool shows connected agents and their status; list_presence shows who is around — people and agents, connected or when last seen. The read_messages tool reads a channel oldest-first; with no since_seq it returns only the NEWEST page, so use the next_since_seq it hands back to continue exactly, or since_seq: 0 to read from the start. It returns root messages only: read_thread(thread_id) reads a thread's replies (including ones sent before this session connected), and list_threads(channel_id) shows which threads have unread messages. Reading marks what you read as read; pass mark_read: false to peek. read_deliveries returns everything Bridge still owes this session — pushed entries that did not reach you, including task events and action requests — and clears them; call it when told entries did not arrive. Before starting a NEW thread (reply without thread_id), call list_threads(channel_id, query: <what it is about>) — if a similar thread exists, reply into it instead; and give a new thread a title. When a reply answers a question thread YOU started, accept it with mark_answer(thread_id, message_id) — that resolves the question for everyone. Posting needs membership: if a reply fails with join_required, call join_channel(channel_id) and send again. who_can_see(channel_id) tells you who will read what you post.",
       "",
       "Agents can run multiple sessions (contexts). Threaded replies are targeted at the asking session by default (pass context_id \"\" to broadcast instead); pass an explicit context_id (from list_contexts or an inbound sender_context_id) to target any session. Targeted messages are invisible to the agent's other sessions. If the target session is gone the message is delivered untargeted (context_unavailable in meta).",
       "",
@@ -2030,6 +2277,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["thread_id"],
+      },
+    },
+    {
+      name: "read_deliveries",
+      description:
+        "Read everything Bridge still owes THIS session's model — messages, task events and action " +
+        "requests that were pushed but not confirmed as received (the \"entries are not reaching you\" " +
+        "notice, a gap, a reconnect) — oldest first, with full content, as they would have arrived. " +
+        "Reading them clears them (the sender sees ✓✓). It is the only way to clear a missed task " +
+        "event or action request. If `next` comes back, call again with after: next.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", minimum: 1, maximum: 200, description: "Max entries to return (default 50, max 200)." },
+          after: { type: "string", description: "The `next` cursor from the previous result. Omit for the first page." },
+        },
       },
     },
     {
@@ -2689,6 +2952,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "read_messages": {
         { const gate = requireBridge(); if (gate) return gate; }
+        const who = readerNow();
         const channelId = args.channel_id as string;
         /**
          * ⚠️ MIRRORS THE SERVER'S CLAMP EXACTLY (`messages.ts:531` —
@@ -2910,7 +3174,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 Math.max(...returnedSeqs)
               )
             : {};
-        confirmReturned(messages.map((m: any) => m.id));
+        confirmReturned(messages.map((m: any) => m.id), who);
 
         return {
           content: [
@@ -2942,6 +3206,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "read_thread": {
         { const gate = requireBridge(); if (gate) return gate; }
+        const who = readerNow();
         const threadId = args.thread_id;
         if (typeof threadId !== "string" || threadId === "") {
           throw new Error("thread_id is required — the thread_id shown on a message, not its message_id.");
@@ -3016,8 +3281,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 Math.max(...returnedSeqs)
               )
             : {};
-        confirmReturned([...(includeParent ? [data.parent.id] : []), ...replies.map((r: any) => r.id)]);
-
         // RFC-015 timeline — the thread's lifecycle history (renames, resolves, answers
         // marked or withdrawn), on the FIRST page only, like the root: it is context.
         // Every page already carries the thread's CURRENT status and answer. A server
@@ -3045,6 +3308,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ? `More replies. Next: read_thread(thread_id: "${threadId}", since_seq: ${nextSinceSeq})`
           : `Caught up. Reply with reply(channel_id: "${channelId}", thread_id: "${threadId}", text: ...). ` +
             `To check for newer replies later: read_thread(thread_id: "${threadId}", since_seq: ${resumeSeq})`;
+
+        // Last, after every fallible step above (the events fetch can throw): an ack for a
+        // result the model never received would stop the server redelivering the replies.
+        confirmReturned([...(includeParent ? [data.parent.id] : []), ...replies.map((r: any) => r.id)], who);
 
         return {
           content: [
@@ -3081,6 +3348,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ],
         };
       }
+
+      case "read_deliveries":
+        return await readDeliveries(args);
 
       case "list_threads": {
         { const gate = requireBridge(); if (gate) return gate; }
@@ -3341,7 +3611,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           reconnectAttempt = 0;
           resetRefusalEpisode();
           last4001At = null;
-          if (!(authenticated && takeover)) await openSession({ takeover });
+          if (!(authenticated && takeover)) {
+            const decided = await openSession({ takeover });
+            // A PLAIN connect never takes a lock another window holds: say so, not "connecting".
+            if (decided === "standby" && !takeover) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Another window of this session holds Bridge, so this window stands by (it keeps retrying; it does not take over). /bridge:connect takeover moves Bridge here.${forkHint()}`,
+                  },
+                ],
+              };
+            }
+          }
         }
         return {
           content: [{ type: "text", text: authenticated ? "connected" : "connecting" }],
@@ -3446,7 +3729,7 @@ function shutdown(): void {
   process.stderr.write("bridge channel: shutting down\n");
   // The Session's drain closes the socket and releases its lock (only ours, never a successor's).
   closeSession();
-  ctl?.stop();
+  ctlMgr?.close();
   removeProc(STATE_DIR, process.pid); // RFC-017 D2
   // RFC-022: tell an attached tail the session is going, and remove the socket file.
   // Detached — the exit below does not wait on a feed client.
@@ -3477,6 +3760,7 @@ sessionKeyReady = resolveSessionKey().then((resolved) => {
   return resolved;
 });
 const resolvedSessionKey = await sessionKeyReady;
+SESSION_KEY_IS_CONVERSATION_ID = resolvedSessionKey.source.startsWith("session map");
 
 // Same precedence note as SESSION_LABEL_OVERRIDE above: launch env wins,
 // then whatever set_session_label persisted on a previous launch of THIS
@@ -3539,20 +3823,22 @@ try {
   mkdirSync(join(STATE_DIR, "seq"), { recursive: true, mode: 0o700 });
 } catch {}
 {
+  // Leftover temp files of a move that died hold credential bytes: remove those of dead processes.
+  sweepMigrationTemps(STATE_DIR, pidAlive);
   const claudePid = myIdentity().claudePid;
   if (claudePid !== null) {
-    sweepStaleCtlSockets(join(STATE_DIR, "ctl"), pidAlive);
-    ctl = await startCtlServer<PendingEntry>({
-      path: ctlSocketPath(STATE_DIR, claudePid),
-      pending: {
-        list: () => session?.pending.list() ?? [],
-        confirm: (ids) => session?.pending.confirm(ids) ?? [],
-      },
-      tracker,
-      toNotice: pendingNotice,
-      log: (line) => process.stderr.write(line + "\n"),
-    });
-    if (shuttingDown) ctl?.stop();
+    // Dead processes' sockets and half-bound temps, in <state>/ctl AND the per-user tmp fallback;
+    // and the 0.30.0 fallback directory, once nothing live is in it.
+    sweepCtlDirs([join(STATE_DIR, "ctl"), dirname(ctlSocketPath(STATE_DIR, claudePid))], pidAlive);
+    removeLegacyCtlDir(tmpdir(), pidAlive);
+    const mgr = new CtlManager<PendingEntry>({ options: (takeover) => ctlOptions(claudePid, takeover), retryDelaysMs: CTL_RETRY_DELAYS_MS, holdsLock: holdsLiveLock, ...(CTL_WATCH_MS ? { watchMs: CTL_WATCH_MS } : {}) });
+    ctlMgr = mgr;
+    await mgr.ensure();
+    if (shuttingDown) mgr.close();
+    // Another copy serves the path — most often the OLD process of a /reload-plugins that
+    // has not exited yet. A bounded wait lets the handover complete; the session-lock
+    // holder takes the socket over regardless (openSession, and every authenticated).
+    else mgr.retry();
   }
 }
 // Only a CURRENT copy writes the launcher. An old window restarting from an orphaned
@@ -3571,7 +3857,7 @@ try {
     software: "bridge-claude-plugin",
     version: PLUGIN_VERSION,
     sessionKey: SESSION_KEY,
-    profile: "error" in PROFILE ? "(invalid)" : profileLabel(PROFILE),
+    profile: PROFILE_LABEL,
     claudePid: id.claudePid,
     tty: id.tty,
     termProgram: id.termProgram,

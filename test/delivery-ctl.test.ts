@@ -5,10 +5,12 @@
  * prompt becomes a confirmation and a missed entry becomes a notice.
  */
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync, existsSync, chmodSync, symlinkSync, realpathSync, readdirSync, unlinkSync } from "node:fs";
+import { userInfo } from "node:os";
 import { join } from "node:path";
 import { ctlSocketPath } from "../delivery/ctl-path";
-import { startCtlServer, sweepStaleCtlSockets, type CtlServer } from "../delivery/ctl-server";
+import { startCtlServer, openCtlServer, sweepStaleCtlSockets, sweepCtlDirs, removeLegacyCtlDir, type CtlServer } from "../delivery/ctl-server";
+import { checkPrivateDir } from "../delivery/private-dir";
 import { MissedTracker } from "../delivery/missed";
 import type { NoticeEntry } from "../delivery/notice";
 
@@ -106,11 +108,11 @@ describe("control socket ⇄ hook", () => {
     t.push(A);
     t.at(5000);
     const first = await t.hook("prompt", "what is new?");
-    expect(first).toContain(`(id ${A}, thread ${THREAD}) — read_thread("${THREAD}") returns it`);
+    expect(first).toContain(`(id ${A}, thread ${THREAD}) — read_deliveries returns it`);
     expect(first).not.toContain("SECRET");
     t.at(9000);
     expect(await t.hook("prompt", "and now?")).toBe(
-      "1 Bridge entry pushed earlier still unconfirmed (#general ×1); list_threads and read_thread return them.",
+      "1 Bridge entry pushed earlier still unconfirmed (#general ×1); read_deliveries returns them.",
     );
     t.held.delete(A); // a read tool returned it (T5 wiring settles the tracker too)
     t.at(12000);
@@ -170,17 +172,240 @@ describe("control socket ⇄ hook", () => {
 });
 
 describe("sweepStaleCtlSockets", () => {
-  test("removes sockets of dead pids only, and only our name shapes", () => {
+  test("removes sockets of dead Claude pids and temp sockets of dead plugin pids only, and only our name shapes", () => {
     const dir = mkdtempSync(join("/tmp", "ews-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    for (const n of ["c1.sock", "c2.sock", "c3-0123456789ab.sock", "other.sock", "c4.sock.bak"]) writeFileSync(join(dir, n), "");
-    expect(sweepStaleCtlSockets(dir, (pid) => pid === 2)).toBe(2);
-    expect(["c1.sock", "c2.sock", "c3-0123456789ab.sock", "other.sock", "c4.sock.bak"].map((n) => existsSync(join(dir, n)))).toEqual([
-      false,
-      true,
-      false,
-      true,
-      true,
-    ]);
+    // [name, removed?] with pid 2 the only live one.
+    const cases: Array<[string, boolean]> = [
+      ["c1.sock", true],
+      ["c2.sock", false],
+      ["c3-0123abcd.sock", true],
+      ["c9.sock.tmp-7-ab12", true], // bound by plugin pid 7, dead
+      ["c9.sock.tmp-2-ab12", false], // bound by plugin pid 2, alive: mid-bind
+      ["other.sock", false],
+      ["c4.sock.bak", false],
+      ["c4.sock.tmp-x-ab12", false],
+    ];
+    for (const [n] of cases) writeFileSync(join(dir, n), "");
+    expect(sweepStaleCtlSockets(dir, (pid) => pid === 2)).toBe(cases.filter(([, r]) => r).length);
+    expect(cases.map(([n]) => !existsSync(join(dir, n)))).toEqual(cases.map(([, r]) => r));
+  });
+});
+
+/** A raw prompt request: does a live server answer on this path, and what does it say? */
+function ask(path: string): Promise<any> {
+  return new Promise((resolve) => {
+    let buf = "";
+    Bun.connect({
+      unix: path,
+      socket: {
+        open: (s) => void s.write('{"op":"stop"}\n'),
+        data: (_s, c) => void (buf += c.toString()),
+        close: () => resolve(buf ? JSON.parse(buf) : null),
+        error: () => resolve(null),
+      },
+    }).catch(() => resolve(null));
+  });
+}
+
+function bare(path: string, log: string[] = []) {
+  return {
+    path,
+    pending: { list: () => [] as Entry[], confirm: () => [] as string[] },
+    tracker: new MissedTracker<Entry>(),
+    toNotice: (e: Entry) => e,
+    log: (l: string) => log.push(l),
+  };
+}
+
+describe("the socket directory must be ours alone (S1)", () => {
+  const LONG = "/" + "s".repeat(120);
+  function withTmp() {
+    const tmp = realpathSync(mkdtempSync(join("/tmp", "ewt-")));
+    const prev = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    cleanups.push(() => {
+      if (prev === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = prev;
+      rmSync(tmp, { recursive: true, force: true });
+    });
+    return { tmp, fallback: join(tmp, `ew-ctl-${userInfo().uid}`) };
+  }
+
+  test("an absent fallback directory is created 0700 and used", async () => {
+    const { fallback } = withTmp();
+    const open = await openCtlServer(bare(ctlSocketPath(LONG, PID)));
+    expect(open.server).not.toBeNull();
+    cleanups.push(() => open.server?.stop());
+    expect(statSync(fallback).mode & 0o777).toBe(0o700);
+    expect((await ask(open.server!.path))?.ok).toBe(true);
+  });
+
+  for (const mode of [0o777, 0o755, 0o750]) {
+    test(`a pre-created ${mode.toString(8)} fallback directory: refused, logged, no socket`, async () => {
+      const { fallback } = withTmp();
+      mkdirSync(fallback, { mode: 0o700 });
+      chmodSync(fallback, mode);
+      const log: string[] = [];
+      const open = await openCtlServer(bare(ctlSocketPath(LONG, PID), log));
+      expect(open.server).toBeNull();
+      expect(open.failure?.kind).toBe("unsafe-dir");
+      expect(log.join("\n")).toContain("not 700");
+      expect(existsSync(ctlSocketPath(LONG, PID))).toBe(false);
+    });
+  }
+
+  test("a symlinked fallback directory: refused, nothing is created in its target", async () => {
+    const { tmp, fallback } = withTmp();
+    const target = join(tmp, "elsewhere");
+    mkdirSync(target, { mode: 0o700 });
+    symlinkSync(target, fallback);
+    const open = await openCtlServer(bare(ctlSocketPath(LONG, PID)));
+    expect(open.failure?.kind).toBe("unsafe-dir");
+    expect(readdirSync(target)).toEqual([]);
+  });
+
+  test("the primary <state>/ctl directory gets the same check (a 0777 one is refused)", async () => {
+    const t = setup();
+    mkdirSync(join(t.dir, "ctl"), { mode: 0o700 });
+    chmodSync(join(t.dir, "ctl"), 0o777);
+    expect(await t.start()).toBeNull();
+    expect(t.logs.join("\n")).toContain("not 700");
+  });
+
+  test("checkPrivateDir: a directory owned by another uid fails", () => {
+    const dir = mkdtempSync(join("/tmp", "ewu-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    chmodSync(dir, 0o700);
+    expect(checkPrivateDir(dir)).toEqual({ ok: true });
+    const bad = checkPrivateDir(dir, userInfo().uid + 1);
+    expect(bad.ok).toBe(false);
+  });
+});
+
+describe("who serves the socket (S5)", () => {
+  test("an old process stopping after a new one bound the path does not delete the new socket", async () => {
+    const t = setup();
+    const path = ctlSocketPath(t.dir, PID);
+    const oldOne = (await openCtlServer(bare(path))).server!;
+    const newOne = (await openCtlServer({ ...bare(path), takeover: true })).server!;
+    expect(newOne).not.toBeNull();
+    // The renamed-in socket was bound by a different listener: the old one now serves nothing.
+    expect(oldOne.ownership()).toBe("replaced");
+    expect(newOne.ownership()).toBe("ours");
+    oldOne.stop();
+    expect(existsSync(path)).toBe(true);
+    // A renamed unix socket accepts connects, and survives the old listener's stop (Bun 1.4.0).
+    expect((await ask(path))?.ok).toBe(true);
+    newOne.stop();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  test("the public path only ever holds a finished 0600 socket: nothing is left under a temp name", async () => {
+    const t = setup();
+    const srv = (await t.start())!;
+    expect(statSync(srv.path).mode & 0o777).toBe(0o600);
+    expect(readdirSync(join(t.dir, "ctl")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    srv.stop();
+    expect(readdirSync(join(t.dir, "ctl"))).toEqual([]);
+  });
+
+  test("ownership: gone once the file is removed", async () => {
+    const t = setup();
+    const srv = (await t.start())!;
+    unlinkSync(srv.path);
+    expect(srv.ownership()).toBe("gone");
+    srv.stop();
+  });
+
+  test("stop() still removes the socket it created", async () => {
+    const t = setup();
+    const srv = (await t.start())!;
+    srv.stop();
+    expect(existsSync(srv.path)).toBe(false);
+  });
+
+  test("another live process → failure names it; the session-lock holder takes over", async () => {
+    const t = setup();
+    const path = ctlSocketPath(t.dir, PID);
+    const other = (await openCtlServer(bare(path))).server!;
+    cleanups.push(() => other.stop());
+    const refused = await openCtlServer(bare(path));
+    expect(refused.failure?.kind).toBe("served-elsewhere");
+    const taken = await openCtlServer({ ...bare(path), takeover: true });
+    expect(taken.server).not.toBeNull();
+    cleanups.push(() => taken.server?.stop());
+    expect(taken.server!.stats().lastHookAt).toBeNull();
+    await ask(path);
+    expect(taken.server!.stats().lastHookAt).not.toBeNull();
+    expect(other.stats().lastHookAt).toBeNull();
+  });
+});
+
+describe("housekeeping of the socket directories (item 8) and the path's uid (item 9)", () => {
+  const dead = () => false;
+  function tmpRoot() {
+    const r = realpathSync(mkdtempSync(join("/tmp", "ewh-")));
+    cleanups.push(() => rmSync(r, { recursive: true, force: true }));
+    return r;
+  }
+  const uid = process.getuid?.() ?? "user";
+
+  test("sweepCtlDirs cleans BOTH directories — the state ctl dir and the private tmp fallback", () => {
+    const r = tmpRoot();
+    const a = join(r, "ctl");
+    const b = join(r, `ew-ctl-${uid}`);
+    for (const d of [a, b]) {
+      mkdirSync(d, { mode: 0o700 });
+      writeFileSync(join(d, "c11.sock"), "");
+      writeFileSync(join(d, "c12-0123abcd.sock.tmp-13-ab12"), "");
+    }
+    expect(sweepCtlDirs([a, b, a], dead)).toBe(4);
+    expect(readdirSync(a)).toEqual([]);
+    expect(readdirSync(b)).toEqual([]);
+  });
+
+  test("sweepCtlDirs never unlinks inside a directory that is not ours alone (a 0777 shared one)", () => {
+    const r = tmpRoot();
+    const b = join(r, `ew-ctl-${uid}`);
+    mkdirSync(b, { mode: 0o700 });
+    chmodSync(b, 0o777);
+    writeFileSync(join(b, "c11.sock"), "");
+    expect(sweepCtlDirs([b], dead)).toBe(0);
+    expect(readdirSync(b)).toEqual(["c11.sock"]);
+  });
+
+  test("the orphaned 0.30.0 einweave-ctl-<uid> dir is removed when ours, private and holding only dead sockets", () => {
+    const r = tmpRoot();
+    const old = join(r, `einweave-ctl-${uid}`);
+    mkdirSync(old, { mode: 0o700 });
+    writeFileSync(join(old, "c21-0123456789ab.sock"), "");
+    expect(removeLegacyCtlDir(r, dead)).toBe(true);
+    expect(existsSync(old)).toBe(false);
+  });
+
+  test("…and left alone when it holds anything else, a live socket, or is not private", () => {
+    for (const setup of ["stranger", "live", "wide"] as const) {
+      const r = tmpRoot();
+      const old = join(r, `einweave-ctl-${uid}`);
+      mkdirSync(old, { mode: 0o700 });
+      writeFileSync(join(old, setup === "stranger" ? "notes.txt" : "c21-0123456789ab.sock"), "");
+      if (setup === "wide") chmodSync(old, 0o777);
+      expect(removeLegacyCtlDir(r, setup === "live" ? () => true : dead)).toBe(false);
+      expect(existsSync(old)).toBe(true);
+    }
+  });
+
+  test("ctlSocketPath uses process.getuid (no passwd lookup) and never throws without it", () => {
+    const real = process.getuid;
+    try {
+      (process as any).getuid = undefined;
+      const p = ctlSocketPath("/" + "x".repeat(120), 5);
+      expect(p).toContain("/ew-ctl-user/");
+      (process as any).getuid = () => 4242;
+      expect(ctlSocketPath("/" + "x".repeat(120), 5)).toContain("/ew-ctl-4242/");
+    } finally {
+      (process as any).getuid = real;
+    }
   });
 });

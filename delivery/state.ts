@@ -17,6 +17,8 @@ export const CHANNELS_LAUNCH = "claude --dangerously-load-development-channels p
 export interface DeliveryInputs {
   /** The control socket is open. */
   ctl: boolean;
+  /** Why it is not, when Claude Code's pid IS known; absent = the pid was not found. */
+  ctlProblem?: { kind: "served-elsewhere" | "unsafe-dir" | "failed"; detail: string };
   /** Entries pushed to the host in this process. */
   pushed: number;
   /** Pushed entries a prompt found missed, still pending. */
@@ -28,6 +30,16 @@ export interface DeliveryInputs {
 }
 
 export function deliveryState(i: DeliveryInputs): { state: DeliveryState; hint?: string } {
+  if (!i.ctl && i.ctlProblem) {
+    const p = i.ctlProblem;
+    const why =
+      p.kind === "served-elsewhere"
+        ? `the control socket is served by another process (a second copy of the plugin in this Claude Code, or one still exiting) — its hooks report there, not here`
+        : p.kind === "unsafe-dir"
+          ? `the control socket's directory is not safe (${p.detail})`
+          : `the control socket could not be opened (${p.detail})`;
+    return { state: "hooks not reporting", hint: `${why} — delivery cannot be confirmed here; read tools still return everything` };
+  }
   if (!i.ctl)
     return { state: "hooks not reporting", hint: "no control socket for the hooks (Claude Code's pid was not found) — delivery cannot be confirmed; read tools still return everything" };
   if (i.pushed === 0) return { state: "idle" };
@@ -35,6 +47,6 @@ export function deliveryState(i: DeliveryInputs): { state: DeliveryState; hint?:
     return { state: "unconfirmed", hint: `Bridge entries are not reaching the model — this session runs without channels. Restart it with: ${CHANNELS_LAUNCH}` };
   if (i.confirmed > 0) return { state: "confirmed" };
   if (i.lastHookAt === null)
-    return { state: "hooks not reporting", hint: "the plugin's UserPromptSubmit hook has not reported in this session (hooks disabled?) — delivery cannot be confirmed; read tools still return everything" };
+    return { state: "hooks not reporting", hint: "the plugin's UserPromptSubmit hook has not reported in this session (hooks disabled, or EINWEAVE_STATE_DIR set where only the MCP server sees it?) — delivery cannot be confirmed; read tools still return everything" };
   return { state: "awaiting confirmation" };
 }

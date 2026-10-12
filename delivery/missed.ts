@@ -25,6 +25,14 @@
  */
 export const GRACE_MS = 2000;
 
+/**
+ * The tracker's memory is bounded on its own: `prompt()` prunes against the pending set, but
+ * a session whose hooks never report never calls it, and every push would stay forever.
+ * Past either limit the OLDEST push is forgotten — never judged missed, the safe side.
+ */
+export const MAX_TRACKED = 1000;
+export const MAX_TRACKED_AGE_MS = 24 * 60 * 60 * 1000;
+
 export interface MissedSplit<T> {
   /** Missed and never noticed: show in full. */
   fresh: T[];
@@ -46,6 +54,14 @@ export class MissedTracker<T extends { id: string }> {
   /** The adapter pushed this entry to the host. A redelivery keeps the first push. */
   pushed(id: string, at: number): void {
     if (!this.pushes.has(id)) this.pushes.set(id, { at, idle: !this.inTurn });
+    this.bound(at);
+  }
+
+  private bound(at: number): void {
+    for (const [id, push] of this.pushes) {
+      if (this.pushes.size <= MAX_TRACKED && at - push.at <= MAX_TRACKED_AGE_MS) break;
+      this.settled(id);
+    }
   }
 
   /** The entry left pending (confirmed, dismissed, or acked by a read tool). */

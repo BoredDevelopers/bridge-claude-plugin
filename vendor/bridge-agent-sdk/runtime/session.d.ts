@@ -29,7 +29,7 @@ import type { LockHolderInfo, SeqStore, SessionLock } from "./store";
 import type { Api, SendBody, SendResult } from "./api";
 import { AgentClientError } from "./errors";
 import { Pending } from "./pending";
-import type { DeliveryAdapter, Inbound } from "./delivery";
+import type { DeliveryAdapter, Entry, Inbound } from "./delivery";
 export type { Inbound } from "./delivery";
 /**
  * What a `Session` needs from its credential holder — `AgentClient` is one; a consumer
@@ -136,6 +136,16 @@ export interface SessionOptions {
     /** `false`: build the session without a socket (a test double, or connect later with `start()`). */
     autoConnect?: boolean;
 }
+/** `Session.readDeliveries` options: page size (the server bounds it) and the previous page's `next`. */
+export interface ReadDeliveriesOptions {
+    limit?: number;
+    after?: string;
+}
+/** One page of owed entries; `next` is null on the last. */
+export interface DeliveriesPage {
+    entries: Entry[];
+    next: string | null;
+}
 export declare class Session {
     private readonly rt;
     private readonly client;
@@ -148,6 +158,8 @@ export declare class Session {
     private watchdogTimer;
     private standbyTimer;
     private reconcileTimer;
+    private reconcileRunning;
+    private reconcileQueued;
     private readonly lock;
     private reconnectAttempt;
     private lastClose;
@@ -236,14 +248,49 @@ export declare class Session {
     private noteSeq;
     private clearReconcile;
     private armReconcile;
-    private reconcile;
+    /**
+     * RFC-027 D5 on demand: fetch what this session still owes (`GET /api/deliveries`)
+     * and deliver what is neither pending nor settled here. For a host that took an entry
+     * out of `pending` after a failure it expects to pass — the timer above runs only on a
+     * QUIET session. One fetch SEQUENCE at a time (it pages to the end inside one run):
+     * calls made while one runs share one trailing sequence, so an id removed mid-fetch is
+     * not missed. Rejects when ANY page fails (the caller picks the retry; pages already
+     * delivered stay). A stopped session starts no fetch, and one that stops mid-sequence
+     * delivers nothing more. `delivered` = entries newly made pending here, over all pages.
+     */
+    reconcile(): Promise<{
+        delivered: number;
+    }>;
+    private runReconcile;
+    private fetchOwed;
+    /**
+     * ONE page of what this session's model still owes (`GET /api/deliveries`), parsed
+     * as the entries a host is handed — messages, task events and action requests, in
+     * the order the server owes them. For a host with no push channel (a checkpoint host
+     * answering "what did I miss?") and the way to clear an entry no push will bring back.
+     *
+     * Pure read: it does NOT ack, does NOT touch `pending`, and does NOT deliver. The
+     * caller acks `ack(ids, "model")` for exactly the entries it handed to its model, and
+     * only after the result carrying them is built — an entry acked here but lost on the
+     * way is never redelivered. A walk over pages is best-effort, not a snapshot: a row
+     * whose send transaction commits after the walk passed its position is missed by
+     * that walk. Nothing owed is lost — a later walk, a reconcile or a push returns it;
+     * ack only what you returned. Page with `next` (null = last page; `after` takes it
+     * back); the server bounds `limit` (default 50, max 200). A malformed row is skipped.
+     *
+     * Rejects when the fetch fails, and on a STOPPED session (or one that stops
+     * mid-fetch): unlike `reconcile`, whose empty result is the true "delivered nothing",
+     * an empty page here would tell the caller its model owes nothing — a claim a stopped
+     * session cannot back.
+     */
+    readDeliveries(opts?: ReadDeliveriesOptions): Promise<DeliveriesPage>;
     private onFrame;
     private handleAuthenticated;
     /**
      * One entry in. Already acked here → the ack was lost, send it again (never re-push).
      * Already pending → pushed once per process, whatever the server redelivers. A
      * broadcast the filter declines is not delivered (and not owed). Otherwise: pending,
-     * then the adapter.
+     * then the adapter. `true` when the entry became pending here.
      */
     private deliver;
     private drainPushQueue;

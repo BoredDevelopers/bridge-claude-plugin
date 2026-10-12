@@ -246,7 +246,11 @@ export declare function createApi(rt: Runtime, client: AgentClient): {
     };
     /** RFC-027 D5: what THIS session's model still owes — its own entries and its agent's unowned, not yet seen. */
     deliveries: {
-        list: () => Promise<DeliveriesResponse>;
+        /** One page, oldest first. `limit` is the server's to bound (default 50, max 200); `after` is a previous page's `next`. */
+        list: (opts?: {
+            limit?: number;
+            after?: string;
+        }) => Promise<DeliveriesResponse>;
     };
     tasks: {
         claim: (messageId: string) => Promise<TaskResult>;
