@@ -202,7 +202,7 @@ const LOGIN_CANCELLED = "The sign-in was cancelled (a logout or a newer login re
 
 export class SignIn {
   /** One AgentClient per API URL (the URL can only change while signed out). */
-  private live: { apiUrl: string; client: Promise<AgentClient> } | null = null;
+  private live: { apiUrl: string; sessionKey: string; client: Promise<AgentClient> } | null = null;
   /**
    * The ONE login in progress. Each flow owns its object and only ever clears the slot
    * while it still holds it (endLogin): a stale flow finishing late must never
@@ -304,14 +304,17 @@ export class SignIn {
     } catch {
       return null;
     }
-    if (this.live?.apiUrl !== apiUrl) {
+    // The session key is part of the client (it names the session grant every mint asks
+    // for), so a re-key (RFC-028 B4: /clear, /resume) opens a new one, like a new API URL.
+    const sessionKey = await this.d.sessionKey();
+    if (this.live?.apiUrl !== apiUrl || this.live.sessionKey !== sessionKey) {
       const prev = this.live;
-      const sessionKey = await this.d.sessionKey();
       // Re-checked after the await: a concurrent caller may have opened it meanwhile.
       if (this.live === prev) {
         void prev?.client.then((c) => c.stop(), () => {});
         this.live = {
           apiUrl,
+          sessionKey,
           client: AgentClient.open(this.d.rt, { apiUrl, store: fileStore(p.dir), softwareId: PLUGIN_CLIENT_ID, softwareVersion: this.d.clientVersion, sessionKey }),
         };
       }

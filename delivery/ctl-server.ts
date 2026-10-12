@@ -49,6 +49,11 @@ export interface CtlServerOptions<E extends { id: string }> {
   log: (line: string) => void;
   /** Bind even if another process answers on the path (the session-lock holder). */
   takeover?: boolean;
+  /**
+   * SessionStart reported the conversation id Claude Code now runs. Returns whether the
+   * server re-keys to it (it does the re-key itself, asynchronously). Absent: never.
+   */
+  onSession?: (conversationId: string) => boolean;
 }
 
 /** Why no socket is open — `status` names it; "the pid was not found" is a different cause. */
@@ -135,6 +140,8 @@ export async function openCtlServer<E extends { id: string }>(o: CtlServerOption
         return { ok: true, op: "stop" };
       case "pending":
         return { ok: true, op: "pending", entries: o.pending.list().map(o.toNotice) };
+      case "session":
+        return { ok: true, op: "session", rekeyed: o.onSession?.(req.id) ?? false };
       case "prompt": {
         let confirmed = false;
         if (req.id) {

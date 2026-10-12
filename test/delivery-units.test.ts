@@ -173,12 +173,13 @@ describe("missedNotice", () => {
 });
 
 describe("parseCtlRequest", () => {
-  test("the three operations", () => {
+  test("the four operations", () => {
     expect(parseCtlRequest(`{"op":"prompt","id":"${ID}"}`)).toEqual({ op: "prompt", id: ID });
     expect(parseCtlRequest(`{"op":"prompt","id":null}`)).toEqual({ op: "prompt", id: null });
     expect(parseCtlRequest(`{"op":"prompt"}`)).toEqual({ op: "prompt", id: null });
     expect(parseCtlRequest(`{"op":"stop"}`)).toEqual({ op: "stop" });
     expect(parseCtlRequest(`{"op":"pending"}`)).toEqual({ op: "pending" });
+    expect(parseCtlRequest(`{"op":"session","id":"${ID}"}`)).toEqual({ op: "session", id: ID });
   });
 
   test("anything else is refused", () => {
@@ -192,6 +193,9 @@ describe("parseCtlRequest", () => {
       `{"op":"prompt","id":42}`,
       `{"op":"prompt","id":"${"a".repeat(65)}"}`,
       `{"op":"prompt","id":"${ID}","pad":"${"x".repeat(MAX_REQUEST_BYTES)}"}`,
+      `{"op":"session"}`,
+      `{"op":"session","id":null}`,
+      `{"op":"session","id":"../x"}`,
     ]) {
       expect(parseCtlRequest(bad)).toBeNull();
     }

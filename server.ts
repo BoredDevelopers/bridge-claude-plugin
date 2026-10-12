@@ -350,14 +350,13 @@ function readSessionMapping(key: string): string | null {
   return null;
 }
 
-// `/clear` is a known and accepted divergence: it fires SessionEnd (the hook
-// unlinks the mapping) then SessionStart (the hook writes the new conversation
-// id under the same port) WITHOUT restarting this process, so from then on the
-// file names a conversation this process is not using. Left as-is on purpose —
-// re-keying a live WS connection would mint a second context and strand
-// messages already targeted at the first — and it is self-healing: the mapping
-// on disk is the current conversation's, so the next MCP server start (restart,
-// /mcp reconnect, next launch) picks up the right one.
+// `/clear` and an interactive `/resume` switch the conversation WITHOUT restarting this
+// process. This used to be a "known and accepted divergence" (re-keying a live connection
+// was thought to strand messages targeted at the first context); measured 2026-10-11 it
+// left a window on the previous conversation's session for 13 h. Since RFC-027 nothing is
+// stranded — the old session's deliveries wait with its grant — so the SessionStart hook
+// now tells this process the new id over the control socket and `rekeyTo` re-keys
+// (RFC-028 B4). This function only resolves the key at startup.
 async function resolveSessionKey(): Promise<{ key: string; source: string }> {
   // An explicit operator override wins over anything discovered. Read from the
   // real environment only (see SESSION_KEY_OVERRIDE).
@@ -416,6 +415,8 @@ async function resolveSessionKey(): Promise<{ key: string; source: string }> {
 let SESSION_KEY: string = FALLBACK_SESSION_KEY;
 /** SESSION_KEY is the conversation's own stable id (from the session map), the one `claude --resume` takes. */
 let SESSION_KEY_IS_CONVERSATION_ID = false;
+/** The startup reads keyed by SESSION_KEY are done; from here on `rekeyTo` may change it. */
+let sessionKeySettled = false;
 
 /**
  * The line that tells a person how to make a second window its OWN Bridge session instead of
@@ -1187,7 +1188,11 @@ const returnedAcks = new ReturnedAcks();
 /** Entries handed to the host in this process — `status`'s "idle" until the first. */
 let pushedCount = 0;
 let session: Session | null = null;
+/** This process's registry record (RFC-017 D2), written at startup; re-written on a re-key. */
+let myProc: ProcInfo | null = null;
 let lock: SessionLockHandle | null = null;
+/** The session key `lock` was built for. */
+let lockKey = "";
 /** Who serves the control socket (delivery/ctl-manager.ts); null when Claude Code's pid was not found. */
 let ctlMgr: CtlManager<PendingEntry> | null = null;
 /** This Session has authenticated at least once: it holds the lock and can send acks. Reset when a Session closes. */
@@ -1311,7 +1316,87 @@ function ctlOptions(claudePid: number, takeover: boolean): CtlServerOptions<Pend
     tracker,
     toNotice: pendingNotice,
     log: (line) => process.stderr.write(line + "\n"),
+    onSession: rekeyTo,
     ...(takeover ? { takeover: true } : {}),
+  };
+}
+
+/**
+ * Bumped by every openSession and every re-key. An openSession that finds it changed after
+ * one of its awaits was overtaken by a newer one (or by a re-key): it stops, and never
+ * releases a lock it no longer owns — the node lock's release unlinks any same-pid file,
+ * so a stale handle releasing would take the CURRENT holder's file with it.
+ */
+let openGen = 0;
+
+/**
+ * RFC-028 B4: the conversation the session map says this Claude Code now runs, when it
+ * differs from SESSION_KEY — else null. The map is the source of truth; the SessionStart
+ * hook's ctl message is only the prompt to look. Checked before every lock acquisition,
+ * so a copy that never got the message (a standby second copy, a hook that failed open)
+ * re-keys instead of taking the old conversation's session the moment it is free.
+ * Cheap: one file read under the already-known Claude pid (mappedConversationOf), no `ps`.
+ */
+function conversationMovedTo(): string | null {
+  if (SESSION_KEY_REGEX.test(SESSION_KEY_OVERRIDE) || !sessionKeySettled) return null;
+  const pid = myIdentity().claudePid;
+  if (pid === null) return null;
+  const id = mappedConversationOf(pid);
+  return id && id !== SESSION_KEY ? id : null;
+}
+
+/**
+ * The conversation id the hook last published for OUR Claude Code process. No liveness or
+ * start-time check (readSessionMapping's, which spawns `ps`): `pid` is this process's own
+ * ancestor, found and validated once at startup, so it is alive and it is ours — a record
+ * naming it with another pid inside is not, and is ignored.
+ */
+function mappedConversationOf(pid: number): string | null {
+  for (const dir of SESSION_MAP_DIRS) {
+    try {
+      const m = JSON.parse(readFileSync(join(dir, `pid-${pid}.json`), "utf8")) as Record<string, unknown>;
+      if (m.claudePid === pid && typeof m.sessionId === "string" && SESSION_KEY_REGEX.test(m.sessionId)) return m.sessionId;
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * An overtaken openSession (see openGen) disposes the handle it built — it may hold the lock
+ * by now (`release` is a no-op on a handle that was not held yet when closeSession ran).
+ * Still current: release it, nothing else in this process has one. Replaced by a handle on
+ * the SAME key: only stop renewing (`markLost`) — the node lock's release unlinks any
+ * same-pid file, which is the current handle's too. Another key, or none: release — a
+ * different file, and keeping it would hold the old conversation's lock until exit.
+ */
+function disposeStaleLock(stale: SessionLockHandle, staleKey: string): void {
+  if (lock === stale) {
+    lock = null;
+    lockKey = "";
+    stale.release();
+  } else if (lock && lockKey === staleKey) {
+    stale.markLost();
+  } else {
+    stale.release();
+  }
+}
+
+/** A session lock that first asks whether the conversation moved (see conversationMovedTo). */
+function keyCheckedLock(inner: SessionLockHandle): SessionLockHandle {
+  return {
+    isHeld: () => inner.isHeld(),
+    onLost: (cb) => inner.onLost(cb),
+    holder: () => inner.holder(),
+    release: () => inner.release(),
+    markLost: () => inner.markLost(),
+    async acquire(opts) {
+      const moved = conversationMovedTo();
+      if (moved) {
+        queueMicrotask(() => rekeyTo(moved));
+        return "standby";
+      }
+      return inner.acquire(opts);
+    },
   };
 }
 
@@ -1323,8 +1408,15 @@ function ctlOptions(claudePid: number, takeover: boolean): CtlServerOptions<Pend
 async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire" | "takeover" | "standby" | "lost" | null> {
   if (!wantConnected || shuttingDown) return null;
   if (superseded && !opts.takeover) return null;
+  const moved = conversationMovedTo();
+  if (moved) {
+    rekeyTo(moved); // opens the new conversation's session itself
+    return null;
+  }
+  const gen = ++openGen;
   const client = await creds.sessionClient();
-  if (!client || !wantConnected || shuttingDown) return null;
+  if (gen !== openGen || !client || !wantConnected || shuttingDown) return null;
+  if (client.sessionKey() !== SESSION_KEY) return null; // opened for a key a re-key has since replaced
   closeSession();
   const id = myIdentity();
   const myLock = sessionLock({
@@ -1337,9 +1429,15 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire"
     log: (line) => process.stderr.write(`bridge channel: ${line}\n`),
   });
   lock = myLock;
+  lockKey = SESSION_KEY;
+  const myKey = SESSION_KEY;
   // Decided here, once, for the log line an operator greps for (and the person's explicit
   // takeover); the Session's own acquire() then finds the lock already ours, or stands by.
   const decision = await myLock.acquire(opts.takeover ? { takeover: true } : {});
+  if (gen !== openGen) {
+    disposeStaleLock(myLock, myKey); // overtaken while acquiring
+    return null;
+  }
   if ((decision === "acquire" || decision === "takeover") && !shuttingDown) {
     // The lock holder is the copy whose Session the hooks must reach: if another copy of the
     // plugin in this Claude holds the socket, take it over (that copy stands by or is exiting).
@@ -1352,19 +1450,22 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire"
         : `bridge channel: session lock acquired for ${SESSION_KEY} (pid ${process.pid})\n`
     );
   }
-  Object.assign(authSessionInfo, await getSessionInfoForAuth());
+  const info = await getSessionInfoForAuth();
   if (CHANNELS_FILTER.length > 0) await ensureChannelMap();
-  if (lock !== myLock || !wantConnected || shuttingDown) {
-    if (lock === myLock) lock = null;
-    myLock.release();
+  if (gen !== openGen || lock !== myLock || !wantConnected || shuttingDown) {
+    disposeStaleLock(myLock, myKey); // overtaken (see openGen), or no longer wanted
     return null;
   }
+  // REPLACE, never merge: a key the new info lacks (a label the previous conversation had,
+  // after a re-key) must not ride along into this session's auth frame.
+  for (const k of Object.keys(authSessionInfo)) delete authSessionInfo[k];
+  Object.assign(authSessionInfo, info);
   let created: Session | null = null; // the adapter acts on THIS Session, not on whichever is current later
   const s = new Session(rt, client, {
     adapter: adapterFor(() => created),
     filter: broadcastFilter,
     seqStore,
-    lock: myLock,
+    lock: keyCheckedLock(myLock),
     sessionInfo: authSessionInfo,
     livenessTimeoutMs: LIVENESS_TIMEOUT_MS,
     standbyRetryMs: LOCK_RETRY_MS,
@@ -1394,6 +1495,7 @@ function closeSession(): void {
   const l = lock;
   session = null;
   lock = null;
+  lockKey = "";
   sessionEverAuthenticated = false;
   authenticated = false;
   authenticatedAt = null;
@@ -1597,6 +1699,50 @@ function restartConnection(): void {
   resetRefusalEpisode();
   last4001At = null;
   void openSession();
+}
+
+/**
+ * RFC-028 B4: one conversation = one Bridge session. `/clear` and an interactive `/resume`
+ * switch Claude Code to another conversation WITHOUT restarting this server, which would
+ * otherwise keep the key it was spawned with (measured 2026-10-11: 13 h on the previous
+ * conversation's session after a `/clear`). The SessionStart hook reports the new id over
+ * the control socket; this re-keys. Nothing is stranded: the old session's deliveries stay
+ * with its grant on the server and come back when that conversation is resumed.
+ *
+ * Returns whether it re-keys. Never with an operator override, before the key is settled,
+ * for an id the server would reject, or for the id already in use.
+ */
+function rekeyTo(conversationId: string): boolean {
+  if (SESSION_KEY_REGEX.test(SESSION_KEY_OVERRIDE)) return false;
+  if (!sessionKeySettled || shuttingDown) return false;
+  if (!SESSION_KEY_REGEX.test(conversationId) || conversationId === SESSION_KEY) return false;
+  const from = SESSION_KEY;
+  SESSION_KEY = conversationId;
+  SESSION_KEY_IS_CONVERSATION_ID = true;
+  // Everything keyed by the session key now reads the new conversation's files.
+  sessionLabel = SESSION_LABEL_OVERRIDE || readLabelFile(STATE_DIR, SESSION_KEY) || "";
+  sessionInfoPromise = null;
+  // The new conversation's own connect choice wins; else it carries on as this window was.
+  wantConnected = readConnectState(STATE_DIR, SESSION_KEY) ?? wantConnected;
+  writeConnectState(STATE_DIR, SESSION_KEY, wantConnected);
+  myContextId = "";
+  // A superseded/standby episode belonged to the old conversation's session.
+  superseded = false;
+  notifiedStandbyFor = null;
+  standbyHolder = null;
+  if (myProc) {
+    myProc = { ...myProc, sessionKey: SESSION_KEY, state: "disconnected" };
+    writeProc(STATE_DIR, myProc);
+  }
+  process.stderr.write(`bridge channel: session key ${from} → ${SESSION_KEY} (conversation changed: /clear or /resume)\n`);
+  lastClose = { cls: "transient" };
+  openGen++; // any openSession in flight was for the old key
+  // Close the old conversation's Session first (it releases that key's lock), so it drains
+  // before its client is replaced by the new key's.
+  closeSession();
+  if (wantConnected) restartConnection();
+  else stopConnection(); // the new conversation was left disconnected: say so everywhere
+  return true;
 }
 
 /** Close the link and stop every retry (disconnect, logout). */
@@ -3759,6 +3905,7 @@ sessionKeyReady = resolveSessionKey().then((resolved) => {
   SESSION_KEY = resolved.key;
   return resolved;
 });
+// rekeyTo (RFC-028 B4) acts only after this point: the per-key state below is read once here.
 const resolvedSessionKey = await sessionKeyReady;
 SESSION_KEY_IS_CONVERSATION_ID = resolvedSessionKey.source.startsWith("session map");
 
@@ -3786,6 +3933,7 @@ sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), S
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
 );
+sessionKeySettled = true;
 
 // RFC-017 D2: register this process so a person (or a future `status` / /bridge:update)
 // can answer "where is the other window" — the question the RFC-016 rollout could not
@@ -3851,7 +3999,7 @@ try {
 }
 {
   const id = myIdentity();
-  const proc: ProcInfo = {
+  myProc = {
     pid: process.pid,
     procStart: procStartOf(process.pid),
     software: "bridge-claude-plugin",
@@ -3865,7 +4013,7 @@ try {
     state: "disconnected",
     ...(feedTap.path() ? { feed: feedTap.path() } : {}),
   };
-  writeProc(STATE_DIR, proc);
+  writeProc(STATE_DIR, myProc);
 }
 
 // Connect to Bridge WebSocket — unless a sibling instance already owns this key.

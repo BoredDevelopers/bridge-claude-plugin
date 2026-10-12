@@ -13,9 +13,12 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
+import { readConnectState } from "../connect-store";
+import { writeLabelFile } from "../label-store";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
 const HOOK = join(import.meta.dir, "..", "hooks", "delivery.ts");
+const SESSION_MAP_HOOK = join(import.meta.dir, "..", "hooks", "session-map.ts");
 const ENROLMENT_KEY = mintAgentToken("ek");
 const CHANNEL_ID = "0190a000-0000-7000-9000-0000000000c1";
 const THREAD = "0190a000-0000-7000-9000-000000000001";
@@ -29,6 +32,8 @@ function startStub() {
   const agentAuth = createAgentAuthRoutes();
   agentAuth.addEnrolmentKey(ENROLMENT_KEY);
   let authCount = 0;
+  const authKeys: string[] = [];
+  const authLabels: Array<string | undefined> = [];
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -51,6 +56,8 @@ function startStub() {
         if (frame.type === "auth") {
           sockets.add(ws);
           authCount++;
+          authKeys.push(String(frame.sessionInfo?.sessionKey ?? ""));
+          authLabels.push(frame.sessionInfo?.sessionLabel);
           ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "bellman", agentName: "Bellman", contextId: "ctx-under-test" } }));
         }
       },
@@ -63,6 +70,11 @@ function startStub() {
     acks,
     connected: () => sockets.size > 0,
     authCount: () => authCount,
+    /** The session key each auth frame named, in order. */
+    authKeys: () => [...authKeys],
+    /** The sessionLabel each auth frame carried (undefined = none), in order. */
+    authLabels: () => [...authLabels],
+    liveSockets: () => sockets.size,
     /** Push a message entry to every connected socket, as the server's `message` frame. */
     pushMessage(id: string, content = "hello") {
       const message = { id, channelId: CHANNEL_ID, threadId: THREAD, agentId: "kevin", senderName: "Kevin", content, type: "text", seq: 1, createdAt: "2026-10-11T10:00:00.000Z" };
@@ -165,6 +177,88 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     await proc.exited;
     return out;
   }
+
+  /** The real SessionStart hook, as Claude Code runs it after `/clear` (source "clear"). */
+  async function runSessionStart(sessionId: string, source = "clear") {
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      EINWEAVE_STATE_DIR: dir,
+      CLAUDE_PLUGIN_DATA: dir,
+      CLAUDE_PID: String(process.pid),
+      CLAUDE_CODE_SESSION_ID: sessionId,
+      CLAUDE_CODE_SSE_PORT: "",
+    };
+    const proc = Bun.spawn(["bun", SESSION_MAP_HOOK, "start"], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env });
+    proc.stdin.write(JSON.stringify({ hook_event_name: "SessionStart", session_id: sessionId, source }));
+    proc.stdin.end();
+    const err = await new Response(proc.stderr).text();
+    await proc.exited;
+    return err;
+  }
+
+  test("RFC-028 B4: /clear re-keys the RUNNING server — the new conversation authenticates as its own session", async () => {
+    await boot(true);
+    await waitFor(() => stub.authKeys().includes("sess-0301"), 15_000, "first auth");
+    await waitFor(() => stub.connected(), 5000, "connected");
+    // The ctl socket is up once the hooks can reach it; retry the hook until the server answers.
+    let err = "";
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !/re-keyed/.test(err)) {
+      err = await runSessionStart("sess-0302");
+      if (!/re-keyed/.test(err)) await Bun.sleep(100);
+    }
+    expect(err).toMatch(/server re-keyed to sess-0302/);
+    await waitFor(() => stub.authKeys().includes("sess-0302"), 10_000, "auth under the new key");
+    // One live socket: the old conversation's session was closed, not left beside the new one.
+    await waitFor(() => stub.liveSockets() === 1, 5000, "old socket closed");
+    expect(stub.authKeys().filter((k) => k === "sess-0301")).toHaveLength(1);
+    // The connect choice carried over to the new conversation.
+    expect(readConnectState(dir, "sess-0302")).toBe(true);
+  }, 40_000);
+
+  test("RFC-028 B4: a SessionStart naming the conversation already in use re-keys nothing", async () => {
+    await boot(true);
+    await waitFor(() => stub.authKeys().includes("sess-0301") && stub.connected(), 15_000, "first auth");
+    await Bun.sleep(500);
+    const before = stub.authCount();
+    // Retried until the server ANSWERS: a hook that never reached it would pass vacuously.
+    let err = "";
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !/server already on/.test(err)) err = await runSessionStart("sess-0301", "compact");
+    expect(err).toMatch(/server already on sess-0301/);
+    await Bun.sleep(500);
+    expect(stub.authCount()).toBe(before);
+  }, 30_000);
+
+  test("RFC-028 B4: the previous conversation's label does not ride into the new session", async () => {
+    writeLabelFile(dir, "sess-0301", "deploy-fix");
+    await boot(true);
+    await waitFor(() => stub.authKeys().includes("sess-0301") && stub.connected(), 15_000, "first auth");
+    expect(stub.authLabels()[stub.authKeys().indexOf("sess-0301")]).toBe("deploy-fix");
+    let err = "";
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !/re-keyed/.test(err)) err = await runSessionStart("sess-0302");
+    await waitFor(() => stub.authKeys().includes("sess-0302"), 10_000, "auth under the new key");
+    expect(stub.authLabels()[stub.authKeys().indexOf("sess-0302")]).toBeUndefined();
+  }, 40_000);
+
+  test("RFC-028 B4: a standby second copy never takes the old conversation once it is free — it follows the session map", async () => {
+    const a = await boot(true); // wins the lock, serves the socket
+    await waitFor(() => stub.authKeys().includes("sess-0301") && stub.connected(), 15_000, "A to authenticate");
+    const b = await boot(true); // same conversation, same Claude: stands by on sess-0301
+    await waitFor(() => lines(b).length > 0, 8000, "B up");
+    await Bun.sleep(700); // B has retried the lock at least once (EINWEAVE_TEST_LOCK_RETRY_MS 300)
+    let err = "";
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !/re-keyed/.test(err)) err = await runSessionStart("sess-0302");
+    expect(err).toMatch(/server re-keyed to sess-0302/);
+    await waitFor(() => stub.authKeys().includes("sess-0302"), 10_000, "auth under the new key");
+    // Several of B's lock retries later: the old conversation was never authenticated again.
+    await Bun.sleep(2000);
+    expect(stub.authKeys().filter((k) => k === "sess-0301")).toHaveLength(1);
+    expect(stub.liveSockets()).toBe(1);
+    void a;
+  }, 60_000);
 
   test("a push alone sends no ack; the hook reporting the tag makes the plugin ack it `model`, once", async () => {
     const plugin = await boot(true);

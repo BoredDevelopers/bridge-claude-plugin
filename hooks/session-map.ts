@@ -36,7 +36,11 @@ import {
   statSync,
 } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
+import { askCtl } from "../delivery/ctl-client";
+import { ctlSocketPath } from "../delivery/ctl-path";
+import { checkPrivateDir } from "../delivery/private-dir";
+import { resolveStateDir } from "../state-dir";
 
 // Must match the server's SESSION_KEY_REGEX (server.ts): publishing an id the
 // server would reject is the same as publishing nothing.
@@ -407,7 +411,25 @@ async function runStart(
       log(`failed to write ${f}: ${err}`);
     }
   }
+  await tellRunningServer(claudePid, sessionId);
   sweep();
+}
+
+/**
+ * RFC-028 B4: `/clear` and an interactive `/resume` change the conversation WITHOUT
+ * restarting the MCP server, which keeps the id it was spawned with. Tell the one already
+ * running in this Claude Code (its control socket is keyed by CLAUDE_PID) which
+ * conversation it now serves; it re-keys if the id differs. At a fresh start the server
+ * is not listening yet or already has this id — either way nothing happens. Fail open.
+ */
+async function tellRunningServer(claudePid: number | null, sessionId: string): Promise<void> {
+  if (!claudePid) return;
+  const path = ctlSocketPath(resolveStateDir(), claudePid);
+  if (!checkPrivateDir(dirname(path)).ok) return;
+  const res = await askCtl(path, { op: "session", id: sessionId });
+  if (res?.ok === true && res.op === "session") {
+    log(res.rekeyed === true ? `server re-keyed to ${sessionId}` : `server already on ${sessionId}`);
+  }
 }
 
 main()
