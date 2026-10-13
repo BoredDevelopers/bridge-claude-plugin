@@ -164,6 +164,14 @@ describe("EINWEAVE_CHANNELS is the starting scope (RFC-028 D6)", () => {
     }, { channels: CHANNELS });
   }, 60_000);
 
+  test("if NO EINWEAVE_CHANNELS name resolves, the starting scope is none -- loudly -- never all", async () => {
+    await setup({ EINWEAVE_CHANNELS: "nope,nada" }, async (_c, notices, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 15_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session", scope: { mode: "none" } });
+      expect(await until(() => notices().some((n) => n.includes("scope NONE")), 10_000)).toBe(true);
+    }, { channels: CHANNELS });
+  }, 60_000);
+
   test("no EINWEAVE_CHANNELS: no scope is sent (the server keeps the grant's); a gateway sends none either", async () => {
     await setup({}, async (_c, _n, stub) => {
       expect(await until(() => stub.stats.authDeclared.length >= 1, 15_000)).toBe(true);

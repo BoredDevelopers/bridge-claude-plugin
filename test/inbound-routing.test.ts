@@ -16,7 +16,7 @@
  *   A  subscribed channel,   untargeted   -> surfaces
  *   B  other channel,       untargeted    -> not pushed (EINWEAVE_CHANNELS is the starting SCOPE, server-side)
  *   D  our own `me-tasks`,  untargeted    -> not pushed, like any other channel
- *   E  other channel,       @MENTION      -> ⚠️ UNVERIFIED against the RFC-028 server (see the case)
+ *   E  other channel,       @MENTION      -> not pushed either: scope narrows all UNHELD work (D6)
  *
  * 0.31.0 (RFC-028): the plugin filters nothing itself. Case C (explicit `contextId` targeting) is gone with
  * the field -- the server answers 400; the hold is the target.
@@ -65,7 +65,7 @@ const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).
 // Same default as the server repo's scripts/run-tests.ts, so a developer who
 // has that suite working already has this one working.
 const ADMIN_URL =
-  process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://einweave:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+  process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
 
 /** Is there actually a Postgres behind ADMIN_URL? Probe, don't assume. */
 async function pgReachable(): Promise<boolean> {
@@ -79,6 +79,14 @@ async function pgReachable(): Promise<boolean> {
   }
 }
 const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
+// EINWEAVE_API_DIR says the person WANTS this gate. A Postgres that cannot be reached must then fail the file,
+// loudly -- a skip here reads as green and has already hidden a wrong default role (the container's is `bridge`).
+if (process.env.EINWEAVE_API_DIR && HAVE_SERVER && !HAVE_PG) {
+  throw new Error(`EINWEAVE_API_DIR is set but Postgres is not reachable at ${ADMIN_URL.replace(/:[^:@/]*@/, ":***@")} -- set EINWEAVE_TEST_PG_ADMIN_URL (the test container's role is "bridge"). Refusing to skip.`);
+}
+if (process.env.EINWEAVE_API_DIR && !HAVE_SERVER) {
+  throw new Error(`EINWEAVE_API_DIR=${process.env.EINWEAVE_API_DIR} has no src/index.ts. Refusing to skip.`);
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -90,7 +98,7 @@ afterAll(async () => {
 
 describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
   test(
-    "targeted messages bypass the channel filter; untargeted ones respect it",
+    "the session scope (EINWEAVE_CHANNELS) narrows all unheld work: in-scope surfaces, out-of-scope -- mentions included -- does not",
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "bridge-plugin-test-"));
 
@@ -321,8 +329,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
        * same filter, opposite outcome — so E is not vacuous. Mentions are on by
        * default server-side; `@me` is matched as a whole token against the id.
        */
-      await post(CH["other-tasks"]!, "@me case-E-mention-pierces-filter");
-      const gotE = await awaitArrival("case-E-mention-pierces-filter");
+      await post(CH["other-tasks"]!, "@me case-E-mention-out-of-scope");
+      const gotE = await awaitArrival("case-E-mention-out-of-scope");
 
       // The inbound path must never throw. This is the assertion that would
       // have caught 0.11.0 on the very first message.
@@ -333,10 +341,10 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       expect(gotA, "subscribed + untargeted should surface").toBe(true);
       expect(gotB, "unsubscribed + untargeted is outside the session's scope: the server does not push it").toBe(false);
       expect(gotD, "our own `-tasks` channel has no exemption from the scope").toBe(false);
-      // ⚠️ UNVERIFIED (written 2026-10-13 without a server to run against). RFC-028 D6: scope narrows UNHELD work, and a
-      // mention in an unheld thread is unheld work -- so this may now be false. Decide against the A3 server:
-      // either the mention pierces the scope (keep) or it does not (flip to false and say so in the RFC).
-      expect(gotE, "an @mention must pierce the channel scope").toBe(true);
+      // E, decided 2026-10-13 (RFC-028 D6): scope narrows ALL unheld work, mentions included. A mention in a
+      // channel outside this session's scope is not pushed to it -- it goes to the gateway, or waits in the
+      // takeable list. (0.30 let a mention pierce the plugin's filter; that filter is gone.)
+      expect(gotE, "an @mention in an out-of-scope channel is unheld work: not pushed to this session").toBe(false);
       expect(errLines.some((l) => l.includes("FILTERED ch="))).toBe(false); // the client has no filter left to log one
     },
     120_000

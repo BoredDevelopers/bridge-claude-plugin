@@ -80,7 +80,7 @@ const PLUGIN_VERSION: string = pkg.version;
 const API_DIR = process.env.EINWEAVE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
 // Same default as the server repo's scripts/run-tests.ts.
-const ADMIN_URL = process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://einweave:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+const ADMIN_URL = process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
 async function pgReachable(): Promise<boolean> {
   try {
     const probe = new Bun.SQL(ADMIN_URL);
@@ -92,6 +92,14 @@ async function pgReachable(): Promise<boolean> {
   }
 }
 const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
+// EINWEAVE_API_DIR says the person WANTS this gate. A Postgres that cannot be reached must then fail the file,
+// loudly -- a skip here reads as green and has already hidden a wrong default role (the container's is `bridge`).
+if (process.env.EINWEAVE_API_DIR && HAVE_SERVER && !HAVE_PG) {
+  throw new Error(`EINWEAVE_API_DIR is set but Postgres is not reachable at ${ADMIN_URL.replace(/:[^:@/]*@/, ":***@")} -- set EINWEAVE_TEST_PG_ADMIN_URL (the test container's role is "bridge"). Refusing to skip.`);
+}
+if (process.env.EINWEAVE_API_DIR && !HAVE_SERVER) {
+  throw new Error(`EINWEAVE_API_DIR=${process.env.EINWEAVE_API_DIR} has no src/index.ts. Refusing to skip.`);
+}
 const SERVER_TS = join(import.meta.dir, "..", "server.ts");
 const SEED_TS = join(import.meta.dir, "fixtures", "real-api-seed.ts");
 /** A build one patch above this one — admitted by the server's minimum, unlike anything older. */
@@ -448,7 +456,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   const wsProof = (token: string, htu = wsHtu(base)) => dpopProof(k1.signer, clock, { htm: "GET", htu, accessToken: token });
   const errors = (s: Sock) => s.frames.filter((f) => f.type === "error").map((f) => f.data?.message ?? f.message ?? null);
   const s1 = await openSocket(base);
-  s1.send({ type: "auth", v: 2, token: at, dpop: await wsProof(at) });
+  s1.send({ type: "auth", v: 2, kind: "session", token: at, dpop: await wsProof(at) });
   await s1.wait(() => s1.frames.some((f) => f.type === "authenticated") || s1.closed() !== null);
   out.ws_auth = { authenticated: s1.frames.some((f) => f.type === "authenticated"), closed: s1.closed() };
   const m3 = await mint({ state: S2 });
@@ -457,9 +465,9 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   await s1.wait(() => s1.frames.some((f) => f.type === "reauthenticated") || s1.closed() !== null);
   out.ws_reauth = { reauthenticated: s1.frames.some((f) => f.type === "reauthenticated"), closed: s1.closed() };
   for (const [name, frame] of [
-    ["ws_auth_no_proof", { type: "auth", v: 2, token: m3.json.access_token }],
-    ["ws_auth_wrong_htu", { type: "auth", v: 2, token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) }],
-    ["ws_auth_http_proof", { type: "auth", v: 2, token: m3.json.access_token, dpop: await resProof("GET", "/api/channels", m3.json.access_token) }],
+    ["ws_auth_no_proof", { type: "auth", v: 2, kind: "session", token: m3.json.access_token }],
+    ["ws_auth_wrong_htu", { type: "auth", v: 2, kind: "session", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) }],
+    ["ws_auth_http_proof", { type: "auth", v: 2, kind: "session", token: m3.json.access_token, dpop: await resProof("GET", "/api/channels", m3.json.access_token) }],
     // RFC-027 §5: a v1 frame (no `v`) is refused as a client too old — the cutover's one gate.
     ["ws_auth_v1", { type: "auth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) }],
   ] as const) {
@@ -472,7 +480,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   s1.close();
   await s1.wait(() => s1.closed() !== null);
   const s2 = await openSocket(base);
-  s2.send({ type: "auth", v: 2, token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) });
+  s2.send({ type: "auth", v: 2, kind: "session", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) });
   await s2.wait(() => s2.frames.some((f) => f.type === "authenticated") || s2.closed() !== null);
   s2.send({ type: "reauth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) });
   await s2.wait(() => s2.closed() !== null);
@@ -504,12 +512,12 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
 
   // ── retired / unknown grants (E13) ──
   out.grant_refresh_token = oauth(await post(tokenUrl, { grant_type: "refresh_token", refresh_token: "ew_rt_x" }));
-  out.grant_rfc014_session = oauth(await post(tokenUrl, { grant_type: "urn:einweave:params:oauth:grant-type:session", installation_token: "ew_it_x" }));
+  out.grant_rfc014_session = oauth(await post(tokenUrl, { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "ew_it_x" }));
   out.grant_unknown = oauth(await post(tokenUrl, { grant_type: "urn:example:nope" }));
 
   // ── a copy: a stale state LOCKS (E6d/E8) ──
   const s3 = await openSocket(base);
-  s3.send({ type: "auth", v: 2, token: after.json.access_token, dpop: await wsProof(after.json.access_token) });
+  s3.send({ type: "auth", v: 2, kind: "session", token: after.json.access_token, dpop: await wsProof(after.json.access_token) });
   await s3.wait(() => s3.frames.some((f) => f.type === "authenticated") || s3.closed() !== null);
   out.mint_stale_state_locks = oauth(await mint({ state: S1 }));
   await s3.wait(() => s3.closed() !== null);
@@ -876,7 +884,10 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       const minting = s3.accessToken();
       expect(await entered("evict"), "the eviction gate was never reached").toBe(true);
       await p.call("connect");
-      expect(await until(p.connected, 8_000), p.stderr()).toBe(true);
+      // RFC-028: a socket's auth now WRITES the grant (its declared kind), and s1's grant row is locked by the
+      // gated eviction transaction -- so the auth cannot finish until the gate opens. Wait for the plugin to have
+      // sent it (it is blocked on the row), do not wait for `connected` (that would wait on ourselves).
+      await Bun.sleep(1_500);
       release("evict");
       await minting;
       expect(await until(() => p.stderr().includes("WebSocket closed (4008 session evicted)"), 10_000), p.stderr()).toBe(true);
@@ -924,7 +935,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
   test("retired RFC-014 grants answer invalid_grant rfc014_retired, which the plugin classifies update_required", async () => {
     for (const body of [
       { grant_type: "refresh_token", refresh_token: "ew_rt_x" },
-      { grant_type: "urn:einweave:params:oauth:grant-type:session", installation_token: "ew_it_x", session_key: "x" },
+      { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "ew_it_x", session_key: "x" },
     ]) {
       const r = await fetch(`${api.url}/api/agent-auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const j = (await r.json()) as any;
@@ -1069,7 +1080,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
         // Past token 1's 4009: had the reauth been refused (4001) or ignored (4009 on token 1), the socket would be closed.
         await Bun.sleep(Math.max(0, T + 23_500 - Date.now()));
         expect(p.stderr()).not.toContain("WebSocket closed");
-        expect(await p.connected()).toBe(true);
+        // (No `status` poll here: since 0.31 it lists the threads that need someone -- an authenticated HTTP use that,
+        // inside the expiry slack, would mint and reauth token 2 and so prevent the very 4009 this waits for.)
         // Token 2 (minted ≈ T+4 s) runs out at ≈ T+26 s — before the plugin's 15 s ticker (≥ T+29.5 s) renews it.
         expect(await until(() => p.stderr().includes("WebSocket closed (4009 token expired)"), 15_000), p.stderr()).toBe(true);
         expect(await until(p.connected, 15_000), p.stderr()).toBe(true);

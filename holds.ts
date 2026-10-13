@@ -11,7 +11,7 @@
  * instead: a stale number is never guessed into a thread.
  */
 
-const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const SEARCH_PAGES = 4;
 const SEARCH_PAGE_SIZE = 50;
 
@@ -37,8 +37,9 @@ export type Ref =
   | { kind: "search"; text: string };
 
 /**
- * `N` | a link or id (the LAST uuid in it: the thread/session id is the last path segment of
- * a link) | `all` | anything else = search words.
+ * `N` | a thread LINK (the web URL is `/w/<workspace>/c/<channel>/t/<thread>`: the id is the segment after
+ * `/t/`, never "some uuid in the string" -- the workspace and channel ids are uuids too) | a bare thread id |
+ * `all` | anything else = search words.
  */
 export function parseRef(raw: unknown): Ref {
   if (raw === undefined || raw === null) return { kind: "none" };
@@ -47,8 +48,9 @@ export function parseRef(raw: unknown): Ref {
   if (/^all$/i.test(s)) return { kind: "all" };
   const n = /^#?(\d{1,3})$/.exec(s);
   if (n) return { kind: "index", n: Number(n[1]) };
-  const ids = s.match(UUID_RE);
-  if (ids && ids.length > 0) return { kind: "id", id: ids[ids.length - 1]!.toLowerCase() };
+  if (new RegExp(`^${UUID}$`, "i").test(s)) return { kind: "id", id: s.toLowerCase() };
+  const link = new RegExp(`/t/(${UUID})(?:[/?#]|$)`, "i").exec(s);
+  if (link) return { kind: "id", id: link[1]!.toLowerCase() };
   return { kind: "search", text: s };
 }
 

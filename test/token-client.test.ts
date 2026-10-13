@@ -227,7 +227,7 @@ describe("mint (§3.3) and the join-state chain (E6)", () => {
 
   test("the RFC-014 grants are retired as the server retires them: invalid_grant rfc014_retired (E13)", async () => {
     const { stub } = await setup();
-    for (const grant_type of ["refresh_token", "urn:einweave:params:oauth:grant-type:session"]) {
+    for (const grant_type of ["refresh_token", "urn:bridge:params:oauth:grant-type:session"]) {
       const r = await fetch(`${stub.url}/api/agent-auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ grant_type }) });
       const j = (await r.json()) as any;
       expect(r.status).toBe(400);

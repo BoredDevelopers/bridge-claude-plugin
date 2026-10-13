@@ -55,8 +55,12 @@ describe("parseRef", () => {
     expect(parseRef("2")).toEqual({ kind: "index", n: 2 });
     expect(parseRef("#12")).toEqual({ kind: "index", n: 12 });
     expect(parseRef(T1)).toEqual({ kind: "id", id: T1 });
-    expect(parseRef(`https://einweave.example/w/general/${T2}`)).toEqual({ kind: "id", id: T2 });
-    expect(parseRef(`https://einweave.example/${CH_A}/threads/${T2}?x=1`)).toEqual({ kind: "id", id: T2 });
+    const W = "03000000-0000-7000-8000-0000000000aa";
+    // The web thread URL: /w/<workspace>/c/<channel>/t/<thread>. Workspace and channel ids are uuids too.
+    expect(parseRef(`https://einweave.example/w/${W}/c/${CH_A}/t/${T2}`)).toEqual({ kind: "id", id: T2 });
+    expect(parseRef(`https://einweave.example/w/${W}/c/${CH_A}/t/${T2}?x=1#top`)).toEqual({ kind: "id", id: T2 });
+    // A link with no /t/ segment is not a thread: it must not be read as the channel or workspace id.
+    expect(parseRef(`https://einweave.example/w/${W}/c/${CH_A}`)).toEqual({ kind: "search", text: `https://einweave.example/w/${W}/c/${CH_A}` });
     expect(parseRef("ALL")).toEqual({ kind: "all" });
     expect(parseRef("fix the build")).toEqual({ kind: "search", text: "fix the build" });
     expect(parseRef("  ")).toEqual({ kind: "none" });
@@ -114,7 +118,7 @@ describe("take: N refers to the list this session showed last, and the server is
 
   test("a link or id acts on that id without needing a list", async () => {
     const f = fake((c) => (c.method === "POST" ? { status: 200, body: { changed: true, moved: 0 } } : undefined));
-    await f.holds.take({ ref: `https://einweave.example/general/${T3}` });
+    await f.holds.take({ ref: `https://einweave.example/w/ws/c/${CH_A}/t/${T3}` });
     expect(f.calls).toEqual([{ method: "POST", path: `/api/threads/${T3}/hold`, body: { action: "take" } }]);
   });
 

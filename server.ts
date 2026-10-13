@@ -1377,11 +1377,10 @@ function keyCheckedLock(inner: SessionLockHandle): SessionLockHandle {
 let scopeSetHere = false;
 
 /**
- * EINWEAVE_CHANNELS (names or ids) as the server's scope object, or null when unset or when no name
- * resolved. The first connect says it once; the server stores it on the grant (RFC-028 D6). A name
+ * EINWEAVE_CHANNELS (names or ids) as the server's scope object, or null when unset. When no name resolves the scope is `none`, never `all`. The first connect says it once; the server stores it on the grant (RFC-028 D6). A name
  * that does not resolve is told to the model -- never silently widened to "all" for the whole list.
  */
-async function startingScopeFromEnv(): Promise<{ mode: "channels"; channelIds: string[] } | null> {
+async function startingScopeFromEnv(): Promise<{ mode: "channels"; channelIds: string[] } | { mode: "none" } | null> {
   if (STARTING_SCOPE_CHANNELS.length === 0) return null;
   await ensureChannelMap();
   const ids: string[] = [];
@@ -1393,12 +1392,14 @@ async function startingScopeFromEnv(): Promise<{ mode: "channels"; channelIds: s
   }
   if (missing.length > 0) {
     notifyModel(
-      `EINWEAVE_CHANNELS names channel(s) this agent cannot see: ${missing.join(", ")}. ` +
-        (ids.length > 0 ? `The starting scope covers only ${STARTING_SCOPE_CHANNELS.filter((r) => !missing.includes(r)).join(", ")}.` : "No starting scope was set (the session keeps the scope it had); /einweave:scope sets one."),
+      `⚠️ EINWEAVE_CHANNELS names channel(s) this agent cannot see: ${missing.join(", ")}. ` +
+        (ids.length > 0
+          ? `The starting scope covers only ${STARTING_SCOPE_CHANNELS.filter((r) => !missing.includes(r)).join(", ")}.`
+          : "None resolved, so this session starts with scope NONE (it takes no unheld work; threads it holds still arrive) -- the narrow reading of what was asked. /einweave:scope sets it."),
       "status"
     );
   }
-  return ids.length > 0 ? { mode: "channels", channelIds: [...new Set(ids)] } : null;
+  return ids.length > 0 ? { mode: "channels", channelIds: [...new Set(ids)] } : { mode: "none" };
 }
 
 /**

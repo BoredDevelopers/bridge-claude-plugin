@@ -121,8 +121,8 @@ const GRANT_ENROLMENT_KEY = "urn:einweave:params:oauth:grant-type:enrolment-key"
 const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 const ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const SKEW_S = 300;
-const UPDATE_PLUGIN_HINT = "update the Bridge plugin and run /einweave:login";
-const RETIRED_RFC014_GRANTS = new Set(["refresh_token", "urn:einweave:params:oauth:grant-type:session"]);
+const UPDATE_PLUGIN_HINT = "update the einweave plugin and run /einweave:login";
+const RETIRED_RFC014_GRANTS = new Set(["refresh_token", "urn:bridge:params:oauth:grant-type:session"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** C4. */
 const ATTEMPT_RE = /^[A-Za-z0-9_-]{22,128}$/;
@@ -369,7 +369,7 @@ export function createAuthCore(opts: StubOptions = {}) {
         token_endpoint: `${issuer}/token`,
         revocation_endpoint: `${issuer}/revoke`,
         grant_types_supported: opts.legacyServer
-          ? ["authorization_code", GRANT_DEVICE_CODE, GRANT_ENROLMENT_KEY, "urn:einweave:params:oauth:grant-type:session", "refresh_token"]
+          ? ["authorization_code", GRANT_DEVICE_CODE, GRANT_ENROLMENT_KEY, "urn:bridge:params:oauth:grant-type:session", "refresh_token"]
           : ["authorization_code", GRANT_DEVICE_CODE, GRANT_ENROLMENT_KEY, "client_credentials"],
         token_endpoint_auth_methods_supported: ["private_key_jwt", "none"],
         token_endpoint_auth_signing_alg_values_supported: ["ES256"],
@@ -770,12 +770,7 @@ export function startAuthStub(opts: StubOptions = {}) {
             core.stats.refusals.push("ws:v1");
             return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
           }
-          // RFC-028 D1, as the server: a connection declares its kind; the server never infers one.
           core.stats.authDeclared.push({ kind: f.kind, scope: f.scope, takeover: f.takeover });
-          if (!["gateway", "session", "observer"].includes(f.kind)) {
-            core.stats.refusals.push("ws:no-kind");
-            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
-          }
           const forced = core.takeForcedAuthClose();
           if (forced) {
             core.stats.refusals.push(`ws:forced ${forced.code}`);
@@ -783,6 +778,11 @@ export function startAuthStub(opts: StubOptions = {}) {
           }
           const a = core.wsCheck(origin, f);
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
+          // RFC-028 D1, as the server: the credential is judged first (4001), THEN a connection must declare its kind.
+          if (!["gateway", "session", "observer"].includes(f.kind)) {
+            core.stats.refusals.push("ws:no-kind");
+            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
+          }
           ws.data.session = a.session;
           const s = core.sessions.get(a.session)!;
           ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "agent-1", agentName: "Agent", contextId: s.key, kind: f.kind, scope: f.scope ? { mode: f.scope.mode, channelIds: f.scope.channelIds ?? [] } : { mode: "all", channelIds: [] }, holds: opts.holds ?? [] } }));
