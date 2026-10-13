@@ -5,7 +5,7 @@
  * silently.
  */
 import { test, expect, describe } from "bun:test";
-import { ciVerdict, peeled, pinListing, releaseVersion, tagAction } from "../scripts/release";
+import { ciVerdict, peeled, pinListing, releaseVersion, tagAction, MARKETPLACE_REPO, PLUGIN_NAME } from "../scripts/release";
 
 const SHA = "f4d0019c0ffee0000000000000000000000000ab";
 const LISTING = JSON.stringify(
@@ -105,5 +105,12 @@ describe("resumable tagging", () => {
     expect(peeled(annotated)).toBe(HEAD);
     expect(peeled(`${HEAD}\trefs/tags/v0.28.1\n`)).toBe(HEAD);
     expect(peeled("")).toBeNull();
+  });
+});
+
+describe("the marketplace the release pins (Jörgen's decision: its NAME is einweave-marketplace, like its repo)", () => {
+  test("the listing repo and plugin name", () => {
+    expect(MARKETPLACE_REPO).toBe("plexodus/einweave-marketplace");
+    expect(PLUGIN_NAME).toBe("einweave");
   });
 });

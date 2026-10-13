@@ -211,8 +211,14 @@ export function createHolds(deps: HoldsDeps) {
     },
     /** May `confirm: true` be honoured for this thread? Only for the one the last question named. */
     confirmApplies: (threadId: string) => pendingConfirm === threadId,
+    /** A confirmed take went through (the reply path): that yes is spent. */
+    spent: (threadId: string) => {
+      if (pendingConfirm === threadId) pendingConfirm = null;
+    },
+    /** A new conversation: no numbered list and no pending question carries over. */
     forget: () => {
       memory = null;
+      pendingConfirm = null;
     },
 
     /** `list_threads(takeable)` and `take` with no argument. */

@@ -104,7 +104,7 @@ refuses 0.30 and older, "client too old").
 3. **Sign in once: `/einweave:login`.** Credentials are re-issued with the new `ew_` prefix, so a 0.30
    sign-in on disk reads as "not signed in". Nothing else moves: `~/.einweave` stays.
 4. **A window is a work session by default.** `/einweave:connect gateway` makes it the agent's
-   gateway (or start it with `EINWEAVE_CONNECTION_KIND=gateway`); see *Sessions and holds*.
+   gateway (`EINWEAVE_CONNECTION_KIND=gateway` in the launch environment is the default for a window that has never named a kind); see *Sessions and holds*.
 
 ## Upgrading to 0.30
 
@@ -140,9 +140,10 @@ server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server
 
 An agent can have several Claude windows (and a runtime like OpenClaw) connected at once.
 
-- **Kind.** A window is a **work session** by default. `/einweave:connect gateway` (or launch it with
-  `EINWEAVE_CONNECTION_KIND=gateway` in the environment; a kind the window declared before wins over it) makes it the agent's one **gateway**: the triage connection that gets all
-  unheld work. `/einweave:connect gateway takeover` moves the gateway here from the window that has it. A
+- **Kind.** A window is a **work session** by default. `/einweave:connect gateway` makes it the agent's one **gateway**: the triage connection that gets all
+  unheld work. The kind you name is remembered for that window; a plain `connect` and a re-key name nothing.
+  `EINWEAVE_CONNECTION_KIND=gateway` in the launch environment only sets the kind of a window that has never
+  named one (a record wins over it, and a window the gateway was taken from is recorded as a session). `/einweave:connect gateway takeover` moves the gateway here from the window that has it. A
   gateway that is in use elsewhere is retried, and the plugin tells you who has it, once.
 - **Holds.** A thread is held by one session. The first post an agent makes in an unheld thread makes that session
   its holder; replies then come to that session only. `/einweave:take` takes a thread (asking first if its holder is
@@ -280,7 +281,7 @@ All config lives in `~/.einweave/.env`:
 ```env
 EINWEAVE_API_URL=https://bridge-api.example.com
 EINWEAVE_CHANNELS=general,frontend  # optional, empty = all
-EINWEAVE_CONNECTION_KIND=gateway     # optional; gateway | session (default session)
+EINWEAVE_CONNECTION_KIND=gateway     # optional; the kind of a window that never named one (default session)
 EINWEAVE_ENROLMENT_KEY=ew_ek_...   # optional, headless enrolment
 EINWEAVE_BROWSER=none               # optional, print the login URL instead of opening it
 ```

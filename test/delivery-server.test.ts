@@ -13,7 +13,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
-import { readConnectState, readScopeSet } from "../connect-store";
+import { readConnectState, readScopeSet, readConnectKind } from "../connect-store";
 import { writeLabelFile } from "../label-store";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
@@ -220,6 +220,8 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     expect(stub.authKeys().filter((k) => k === "sess-0301")).toHaveLength(1);
     // The connect choice carried over to the new conversation.
     expect(readConnectState(dir, "sess-0302")).toBe(true);
+    // A re-key declares nothing: no kind record appears for the new conversation unless this window had one.
+    expect(readConnectKind(dir, "sess-0302")).toBeUndefined();
   }, 40_000);
 
   test("H3: after /clear the new conversation starts from EINWEAVE_CHANNELS again, even though a person had set another scope in the old one", async () => {

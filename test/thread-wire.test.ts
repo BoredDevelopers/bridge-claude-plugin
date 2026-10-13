@@ -292,5 +292,9 @@ describe("reply posts a threaded reply to the thread-native route", () => {
     const ok = await callTool("reply", { channel_id: "general", text: "mine", thread_id: "thr-1", take: true, confirm: true });
     expect(ok.isError).toBe(false);
     expect(stub.sends[0]!.body).toMatchObject({ take: true, confirm: true });
+    // One yes, one take: the same confirmation does not authorise a second one (the holder may have changed).
+    const again = await callTool("reply", { channel_id: "general", text: "mine again", thread_id: "thr-1", take: true, confirm: true });
+    expect(again.text).toContain("Nothing was sent");
+    expect(stub.sends.length).toBe(1);
   });
 });

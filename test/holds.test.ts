@@ -195,6 +195,25 @@ describe("take from an online holder asks first", () => {
     expect(await f.holds.take({ ref: T1, confirm: true })).toContain("none is pending");
   });
 
+  test("a new conversation (forget) drops the pending question: a yes asked before /clear takes nothing after it", async () => {
+    const f = fake((c) => (c.method === "POST" ? online(c) : list3(c)));
+    await f.holds.take({ ref: T1 }); // asks about T1
+    f.holds.forget(); // /clear
+    const before = f.calls.length;
+    expect(await f.holds.take({ ref: T1, confirm: true })).toContain("none is pending");
+    expect(f.calls.length).toBe(before);
+    expect(f.holds.memory()).toBeNull();
+  });
+
+  test("a yes is spent once used on the reply path too", () => {
+    const f = fake(() => undefined);
+    f.holds.askedAbout(T1);
+    f.holds.spent(T2); // another thread's success does not spend it
+    expect(f.holds.confirmApplies(T1)).toBe(true);
+    f.holds.spent(T1);
+    expect(f.holds.confirmApplies(T1)).toBe(false);
+  });
+
   test("the reply path asks the same question and binds the same way", () => {
     const f = fake(() => undefined);
     expect(f.holds.confirmApplies(T1)).toBe(false);

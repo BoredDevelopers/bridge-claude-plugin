@@ -5,7 +5,8 @@
  * told for the three new close classes (gateway-in-use, gateway-taken-over, kind-not-allowed).
  */
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync, utimesSync } from "node:fs";
+import { connectStateFileFor, connectKindFileFor, connectScopeFileFor, writeConnectState, writeConnectKind, writeScopeSet } from "../connect-store";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startAuthStub } from "./agent-auth-stub";
@@ -27,7 +28,7 @@ describe("the auth frame declares a kind", () => {
     });
   }, 40_000);
 
-  test("EINWEAVE_CONNECTION_KIND=gateway declares the gateway at autoconnect, and a restart without it keeps it", async () => {
+  test("EINWEAVE_CONNECTION_KIND=gateway declares the gateway at autoconnect; a kind the person NAMED is remembered across a restart", async () => {
     const stub = startAuthStub();
     const dir = mkdtempSync(join(tmpdir(), "kind-"));
     try {
@@ -35,7 +36,8 @@ describe("the auth frame declares a kind", () => {
       await withPlugin(stub, dir, { EINWEAVE_CONNECTION_KIND: "gateway" }, async (client) => {
         expect(await until(() => stub.stats.authDeclared.length >= 1, 15_000)).toBe(true);
         expect(stub.stats.authDeclared[0]).toEqual({ kind: "gateway" });
-        await connect(client, {}); // an explicit connect persists what the window is
+        expect(kindFile(dir)).toBeNull(); // the environment declared it, not the person: nothing is recorded
+        await connect(client, { kind: "gateway" }); // naming it is a declaration
         expect(kindFile(dir)).toBe("gateway");
       });
       const before = stub.stats.authDeclared.length;
@@ -43,6 +45,28 @@ describe("the auth frame declares a kind", () => {
         expect(await until(() => stub.stats.authDeclared.length > before, 15_000)).toBe(true);
         expect(stub.stats.authDeclared[before]).toEqual({ kind: "gateway" });
         expect((await status(client)).kind).toBe("gateway");
+      });
+    } finally {
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a PLAIN connect declares nothing: a restart with EINWEAVE_CONNECTION_KIND=gateway still starts as the gateway", async () => {
+    const stub = startAuthStub();
+    const dir = mkdtempSync(join(tmpdir(), "kind-plain-"));
+    try {
+      await enrolledProfile(stub, dir);
+      await withPlugin(stub, dir, {}, async (client) => {
+        expect(await until(async () => (await status(client)).websocket === "connected", 15_000)).toBe(true);
+        await connect(client, {});
+        await connect(client, {});
+        expect(kindFile(dir)).toBeNull();
+      });
+      const before = stub.stats.authDeclared.length;
+      await withPlugin(stub, dir, { EINWEAVE_CONNECTION_KIND: "gateway" }, async () => {
+        expect(await until(() => stub.stats.authDeclared.length > before, 15_000)).toBe(true);
+        expect(stub.stats.authDeclared[before]).toEqual({ kind: "gateway" });
       });
     } finally {
       stub.stop();
@@ -227,5 +251,30 @@ describe("kind precedence and persistence", () => {
       expect(kindFile(dir)).toBe(kindBefore);
       expect((await status(client)).kind).toBe("session");
     });
+  }, 60_000);
+});
+
+describe("a window keeps its own records young", () => {
+  test("starting up touches the connect-state, kind and scope files of its key (so another window's 24 h sweep leaves them)", async () => {
+    const key = "11111111-2222-3333-4444-555555555555"; // the harness's CLAUDE_CODE_SESSION_ID
+    const stub = startAuthStub();
+    const dir = mkdtempSync(join(tmpdir(), "kind-touch-"));
+    try {
+      await enrolledProfile(stub, dir);
+      writeConnectState(dir, key, false); // not connected: nothing else would write these files
+      writeConnectKind(dir, key, "session");
+      writeScopeSet(dir, key);
+      const files = [connectStateFileFor(dir, key), connectKindFileFor(dir, key), connectScopeFileFor(dir, key)];
+      const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      for (const f of files) utimesSync(f, old, old);
+      await withPlugin(stub, dir, {}, async (client) => {
+        // Startup settles the session key first (up to a few seconds); the touch follows it.
+        const fresh = () => files.every((f) => Date.now() - statSync(f).mtimeMs < 60_000);
+        expect(await until(fresh, 15_000), "startup never touched the window's records").toBe(true);
+      });
+    } finally {
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 });

@@ -15,6 +15,12 @@ import { deliveryState, CHANNELS_LAUNCH } from "../delivery/state";
 const ID = "01992f6e-7c1a-7b2e-9f00-1a2b3c4d5e6f";
 const CH = "01992f6e-0000-7000-8000-000000000001";
 
+describe("the restart command a missed delivery names", () => {
+  test("CHANNELS_LAUNCH is the einweave plugin in the einweave-marketplace, literally", () => {
+    expect(CHANNELS_LAUNCH).toBe("claude --dangerously-load-development-channels plugin:einweave@einweave-marketplace");
+  });
+});
+
 describe("deliveredEntryId", () => {
   test("plugin and .mcp.json source spellings", () => {
     for (const source of ["plugin:einweave:einweave", "einweave"]) {

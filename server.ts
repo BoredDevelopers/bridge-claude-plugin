@@ -152,6 +152,9 @@ let serverHolds: string[] = [];
 let intentExplicitlySet = false;
 // The same for the kind: a `connect` that names one before SESSION_KEY resolves.
 let kindExplicitlySet = false;
+// Did the kind in effect come from a RECORD (a kind this window declared, or a demotion)? Only a declared kind is
+// remembered per key; the environment and the default are not.
+let kindFromRecord = false;
 
 // Shared awaitable for SESSION_KEY resolution, assigned once (near the bottom
 // of this file) right after mcp.connect(). Both the startup sequence AND the
@@ -765,8 +768,10 @@ async function loadChannelMap(): Promise<boolean> {
     const res = await apiFetch("/api/channels");
     if (!res.ok) return false;
     const data = (await res.json()) as any;
+    // A 200 that is not a channel list (a proxy page, `{}`) is not an ANSWER: it must never read as "no channels".
+    if (!Array.isArray(data?.channels)) return false;
     const next = new Map<string, string>();
-    for (const ch of data.channels ?? []) {
+    for (const ch of data.channels) {
       if (ch?.name && ch?.id) next.set(String(ch.name), String(ch.id));
     }
     // An empty answer is still an answer (RFC-028: "no name resolves" must be told apart from "the map never
@@ -1401,6 +1406,14 @@ function resolveEnvScope(): { scope: StartScope; missing: string[] } {
   return { scope: ids.length > 0 ? { mode: "channels", channelIds: [...new Set(ids)] } : { mode: "none" }, missing };
 }
 
+/** Resolve, and if a name is missing refresh the list ONCE first: a channel created after the list was read. */
+async function resolveEnvScopeFresh(): Promise<{ scope: StartScope; missing: string[] }> {
+  const first = resolveEnvScope();
+  if (first.missing.length === 0) return first;
+  await loadChannelMap();
+  return resolveEnvScope();
+}
+
 function announceMissingScopeEntries(r: { scope: StartScope; missing: string[] }): void {
   if (r.missing.length === 0) return;
   notifyModel(
@@ -1426,12 +1439,16 @@ function applyStartingScopeWhenMapLoads(): void {
         await Bun.sleep(Math.min(30_000, 2_000 * 2 ** i));
         if (scopeSetHere || shuttingDown || !authenticated || connectionKind !== "session") continue;
         if (!(await loadChannelMap())) continue;
-        const r = resolveEnvScope();
+        const r = await resolveEnvScopeFresh();
+        if (scopeSetHere) return; // a person set one while the list was loading: theirs stands
         const res = await apiFetch("/api/sessions/me/scope", { method: "PUT", body: JSON.stringify(r.scope) });
         if (!res.ok) continue;
         serverScope = ((await res.json().catch(() => null)) as any)?.scope ?? serverScope;
         announceMissingScopeEntries(r);
         return;
+      }
+      if (!scopeSetHere && !shuttingDown) {
+        notifyModel("⚠️ EINWEAVE_CHANNELS could not be applied: the channel list never loaded. This session is still receiving unheld work from ALL channels. /einweave:scope sets the scope by hand.", "status");
       }
     } catch (err) {
       process.stderr.write(`bridge channel: starting scope could not be set: ${err}\n`);
@@ -1454,10 +1471,12 @@ async function startingScopeFromEnv(): Promise<StartScope | null> {
   }
   if (!channelNameToId && !(await loadMapForScope())) {
     process.stderr.write("bridge channel: channel list unavailable -- connecting without a starting scope; it is set when the list loads\n");
+    // Missing work is worse than extra unheld work, so it connects -- but the model is told it is NOT narrowed yet.
+    notifyModel("⚠️ EINWEAVE_CHANNELS is set but the channel list could not be read. Until it loads this session receives unheld work from ALL channels; the scope is applied automatically once the list loads.", "status");
     applyStartingScopeWhenMapLoads();
     return null;
   }
-  const r = resolveEnvScope();
+  const r = await resolveEnvScopeFresh();
   announceMissingScopeEntries(r);
   return r.scope;
 }
@@ -1769,6 +1788,7 @@ function onStopped(stop: SessionStop): void {
   // must not ask for the lease again and sit in "gateway in use" behind the one that took it.
   if (cls === "gateway-taken-over" && connectionKind === "gateway") {
     connectionKind = "session";
+    kindFromRecord = true;
     writeConnectKind(STATE_DIR, SESSION_KEY, "session");
   }
   const why = describeClose(cls, c?.code, c?.reason, { keyDeleted: c?.keyDeleted, myVersion: PLUGIN_VERSION });
@@ -1813,8 +1833,10 @@ function rekeyTo(conversationId: string): boolean {
   wantConnected = readConnectState(STATE_DIR, SESSION_KEY) ?? wantConnected;
   writeConnectState(STATE_DIR, SESSION_KEY, wantConnected);
   // Same for the kind (RFC-028 D1): the new conversation's own declaration wins; else this window's carries on.
-  connectionKind = readConnectKind(STATE_DIR, SESSION_KEY) ?? connectionKind;
-  writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
+  // A plain re-key declares nothing: the kind goes into the new key's record only if THIS window's kind came from one.
+  const recorded = readConnectKind(STATE_DIR, SESSION_KEY);
+  connectionKind = recorded ?? connectionKind;
+  if (!recorded && kindFromRecord) writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
   // A new conversation starts from EINWEAVE_CHANNELS again (a resumed one keeps the scope a person set in it, which
   // is the marker file under ITS key). The old conversation's numbered lists and pending question are not this one's.
   scopeSetHere = readScopeSet(STATE_DIR, SESSION_KEY);
@@ -2826,7 +2848,7 @@ const holds = createHolds({
   onScope: (scope) => {
     serverScope = scope;
     scopeSetHere = true;
-    writeScopeSet(STATE_DIR, SESSION_KEY, true); // survives a restart: the env's starting scope must not undo it
+    writeScopeSet(STATE_DIR, SESSION_KEY); // survives a restart: the env's starting scope must not undo it
   },
   currentScope: () => (authenticated ? serverScope : null),
 });
@@ -2930,6 +2952,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const result = (await res.json()) as any;
+        if (take && args.confirm === true && threadId) holds.spent(threadId); // that yes is used up
         if (result.id) {
           rememberOwnSend(result.id);
           rememberSentMessage(result.id, type);
@@ -3931,7 +3954,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         writeConnectState(STATE_DIR, SESSION_KEY, true);
 
         const problem = creds.configError();
-        if (problem) writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
+        // A kind is recorded only when the person NAMED one (kind, or a gateway takeover); a plain connect declares
+        // nothing, so it must not turn the environment's default into a record that outranks it next start.
+        const kindDeclared = args.kind !== undefined || gatewayTakeover;
+        const persistKind = () => {
+          if (kindDeclared) {
+            writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
+            kindFromRecord = true;
+          } else touchSessionFiles(STATE_DIR, SESSION_KEY);
+        };
+        if (problem) persistKind();
         if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
         // RFC-016 E9: after a session revoke, THIS is the explicit user reconnect —
         // the next mint says so (reconnect=true) and the server opens a new session.
@@ -3958,7 +3990,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           reconnectAttempt = 0;
           resetRefusalEpisode();
           last4001At = null;
-          writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
+          persistKind();
           if (reopen) {
             const decided = await openSession({ takeover, gatewayTakeover });
             // A PLAIN connect never takes a lock another window holds: say so, not "connecting".
@@ -3974,7 +4006,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             }
           }
         }
-        writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind); // (also a refresh of its age for the sweep)
+        persistKind();
         // RFC-028 D8: a connected window is told which threads need someone.
         const needSomeone = authenticated ? await needSomeoneText() : "";
         return {
@@ -4144,7 +4176,9 @@ if (!intentExplicitlySet) {
 // not undo that on the next start); the environment applies only when there is no record; the default is session.
 if (!kindExplicitlySet) {
   const fromEnv = process.env.EINWEAVE_CONNECTION_KIND;
-  connectionKind = readConnectKind(STATE_DIR, SESSION_KEY) ?? (fromEnv === "gateway" ? "gateway" : "session");
+  const record = readConnectKind(STATE_DIR, SESSION_KEY);
+  kindFromRecord = record !== undefined;
+  connectionKind = record ?? (fromEnv === "gateway" ? "gateway" : "session");
 }
 scopeSetHere = readScopeSet(STATE_DIR, SESSION_KEY);
 touchSessionFiles(STATE_DIR, SESSION_KEY);

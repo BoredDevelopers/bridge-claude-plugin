@@ -32,9 +32,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const PLUGIN_REPO = "BoredDevelopers/bridge-claude-plugin";
-const MARKETPLACE_REPO = "plexodus/einweave-marketplace";
+export const MARKETPLACE_REPO = "plexodus/einweave-marketplace";
 const MARKETPLACE_FILE = ".claude-plugin/marketplace.json";
-const PLUGIN_NAME = "einweave";
+export const PLUGIN_NAME = "einweave";
 
 /** The version both files declare, or why there isn't one. */
 export function releaseVersion(pkg: { version?: unknown }, manifest: { version?: unknown }): string {

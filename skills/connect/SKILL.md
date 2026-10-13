@@ -27,7 +27,8 @@ Arguments passed: `$ARGUMENTS`
        triage connection and gets all unheld work. The kind is remembered for
        this session across restarts; with no kind word the window keeps the
        kind it has. `EINWEAVE_CONNECTION_KIND=gateway` in the launch
-       environment starts a window as the gateway when it has declared no kind before.
+       environment starts a window as the gateway when it has never named a kind (only a kind the person
+       names is remembered; a plain connect names nothing).
      - `gateway takeover` → `kind: "gateway"`, `takeover: "gateway"`: move the
        agent's gateway from the window that has it to this one (that window is
        told and stops being the gateway). If another window holds the gateway

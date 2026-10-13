@@ -246,8 +246,38 @@ describe("H1: a channel list that cannot be read is never 'no name resolves'", (
       expect(c.state.puts[0]).toEqual({ mode: "channels", channelIds: [CH_GENERAL] });
       expect(await until(async () => (await status(client)).scope?.mode === "channels", 5_000)).toBe(true);
       expect(notices().filter((n) => n.includes("cannot see"))).toEqual([]);
+      // Never silent: until the list loaded this window was receiving ALL channels, and the model was told so.
+      expect(notices().some((n) => n.includes("ALL channels") && n.includes("could not be read"))).toBe(true);
     }, { api: c.api });
   }, 90_000);
+
+  test("a 200 that is not a channel list (`{}`) is no answer: the first frame has no scope, never mode none", async () => {
+    let calls = 0;
+    const api = async (_req: Request, url: URL): Promise<Response | undefined> => {
+      if (url.pathname !== "/api/channels") return undefined;
+      calls++;
+      return calls <= 3 ? Response.json({}) : Response.json({ channels: CHANNELS });
+    };
+    await setup({ EINWEAVE_CHANNELS: "general" }, async (_c, _n, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 30_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session" });
+    }, { api });
+  }, 60_000);
+
+  test("a name that does not resolve refreshes the list once before it is called missing (a channel created after the list was read)", async () => {
+    let calls = 0;
+    const LATE = "02000000-0000-7000-8000-0000000000cc";
+    const api = async (_req: Request, url: URL): Promise<Response | undefined> => {
+      if (url.pathname !== "/api/channels") return undefined;
+      calls++;
+      return Response.json({ channels: calls === 1 ? CHANNELS : [...CHANNELS, { id: LATE, name: "late" }] });
+    };
+    await setup({ EINWEAVE_CHANNELS: "general,late" }, async (_c, notices, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 30_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session", scope: { mode: "channels", channelIds: [CH_GENERAL, LATE] } });
+      expect(notices().filter((n) => n.includes("cannot see"))).toEqual([]);
+    }, { api });
+  }, 60_000);
 
   test("after a SUCCESSFUL load a UUID that is not one of this agent's channels is named, not sent", async () => {
     const stranger = "09999999-0000-7000-8000-000000000001";

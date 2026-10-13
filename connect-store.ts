@@ -21,7 +21,7 @@
  * corrupt, not a newer plugin's file, and must not wedge this store shut forever: it is
  * overwritten (logged once).
  */
-import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync, utimesSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync, utimesSync, existsSync } from "fs";
 import { join } from "path";
 
 const PREFIX = ".connect-state-";
@@ -75,15 +75,9 @@ export function readScopeSet(dir: string, key: string): boolean {
   }
 }
 
-export function writeScopeSet(dir: string, key: string, on: boolean): void {
+export function writeScopeSet(dir: string, key: string): void {
   try {
     const target = connectScopeFileFor(dir, key);
-    if (!on) {
-      try {
-        unlinkSync(target);
-      } catch {}
-      return;
-    }
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const tmp = `${target}.${process.pid}.tmp`;
     writeFileSync(tmp, "set\n", { mode: 0o600 });
@@ -164,11 +158,24 @@ export function sweepConnectStateFiles(dir: string, currentPath: string, maxAgeM
   try {
     const cutoff = Date.now() - maxAgeMs;
     for (const name of readdirSync(dir)) {
-      if (!name.startsWith(PREFIX) && !name.startsWith(KIND_PREFIX) && !name.startsWith(SCOPE_PREFIX)) continue;
+      if (!name.startsWith(PREFIX)) continue;
       const path = join(dir, name);
       if (path === currentPath || alsoCurrent.includes(path)) continue;
       try {
         if (statSync(path).mtimeMs < cutoff) unlinkSync(path);
+      } catch {}
+    }
+    // The kind record and the scope marker are a person's explicit choices for a window: they are forgotten only
+    // when that window's own connect-state file is gone -- never on their own age (an overnight idle must not
+    // undo a /einweave:scope), and never while another window still lists them as current.
+    for (const name of readdirSync(dir)) {
+      const prefix = name.startsWith(KIND_PREFIX) ? KIND_PREFIX : name.startsWith(SCOPE_PREFIX) ? SCOPE_PREFIX : null;
+      if (!prefix || name.endsWith(".tmp")) continue;
+      const path = join(dir, name);
+      if (path === currentPath || alsoCurrent.includes(path)) continue;
+      if (existsSync(join(dir, `${PREFIX}${name.slice(prefix.length)}`))) continue;
+      try {
+        unlinkSync(path);
       } catch {}
     }
   } catch {}
