@@ -1134,10 +1134,14 @@ describe("finding 4 (2026-09-27 re-review): the standby retry must not carry a s
       expect(afterFailedWrite.pid, "the failed write must not have claimed the lock").toBe(process.pid);
       expect(afterFailedWrite.version, "still the older holder's own record").toBe("0.1.0");
 
-      // Restore permissions, then plant a GENUINELY NEWER live holder — standing in for
-      // whoever legitimately holds the key by the time the retry fires.
-      chmodSync(locksDir, 0o700);
+      // Plant a GENUINELY NEWER live holder — standing in for whoever legitimately holds the key by the time
+      // the retry fires — WHILE THE DIRECTORY IS STILL READ-ONLY (the record is rewritten in place, which a
+      // 0o500 directory allows). Restoring permissions first left a window in which a 300 ms retry saw the OLDER
+      // 0.1.0 record, rightly took it over (a newer plugin may take an older holder), and its write could land
+      // after this test's plant: a flake that was the test's race, not the plugin's. Now there is no moment at
+      // which the plugin can write AND the lock still names the older holder.
       writeLock({ pid: process.pid, procStart: procStart(process.pid), sessionKey: SESSION_ID, at: new Date().toISOString(), version: "99.0.0" });
+      chmodSync(locksDir, 0o700);
 
       // Past several 300ms retry cycles.
       await Bun.sleep(300 * 4);
