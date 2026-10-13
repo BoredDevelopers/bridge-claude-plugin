@@ -14,7 +14,7 @@
  *     CRC is checked before any database read): corrupt_state, attempt_invalid,
  *     session_key_invalid (mint); scope_invalid, corrupt_state, attempt_invalid,
  *     session_key_invalid (revoke);
- *   - every secret (`brg_ek_` / `brg_ac_` / `brg_dc_`) in the server's format with its CRC,
+ *   - every secret (`ew_ek_` / `ew_ac_` / `ew_dc_`) in the server's format with its CRC,
  *     judged (invalid_grant) BEFORE key_storage and the proof, as agent-credentials.ts does;
  *     an authorization code is burnt by ANY mismatch; the device grant checks client_id,
  *     paces polls (`interval`, default the server's 5 s ⇒ `slow_down`), and answers
@@ -111,12 +111,12 @@ type Inst = {
 };
 type Sess = { id: string; instId: string; key: string; revoked: null | "manual" | "evicted" | "client_revoked"; lastUsed: number };
 
-const GRANT_ENROLMENT_KEY = "urn:bridge:params:oauth:grant-type:enrolment-key";
+const GRANT_ENROLMENT_KEY = "urn:einweave:params:oauth:grant-type:enrolment-key";
 const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 const ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const SKEW_S = 300;
 const UPDATE_PLUGIN_HINT = "update the Bridge plugin and run /bridge:login";
-const RETIRED_RFC014_GRANTS = new Set(["refresh_token", "urn:bridge:params:oauth:grant-type:session"]);
+const RETIRED_RFC014_GRANTS = new Set(["refresh_token", "urn:einweave:params:oauth:grant-type:session"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** C4. */
 const ATTEMPT_RE = /^[A-Za-z0-9_-]{22,128}$/;
@@ -127,14 +127,14 @@ export const STUB_CLIENT_ID = "bridge-claude-plugin";
 const PKCE_VALUE_RE = /^[A-Za-z0-9._~-]{43,128}$/;
 const JKT_RE = /^[A-Za-z0-9_-]{43}$/;
 
-/** The server's secret format (agent-tokens.ts): `brg_<kind>_<43 base62><6 base62 CRC32>`. */
+/** The server's secret format (agent-tokens.ts): `ew_<kind>_<43 base62><6 base62 CRC32>`. */
 export function mintAgentToken(kind: "at" | "ek" | "ac" | "dc"): string {
-  const head = `brg_${kind}_${randomBase62(43)}`;
+  const head = `ew_${kind}_${randomBase62(43)}`;
   return head + base62(crc32(head), 6);
 }
 export function isAgentToken(kind: string, s: unknown): boolean {
   if (typeof s !== "string") return false;
-  const m = /^(brg_(at|ek|ac|dc)_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
+  const m = /^(ew_(at|ek|ac|dc)_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
   return !!m && m[2] === kind && base62(crc32(m[1]!), 6) === m[3];
 }
 
@@ -170,6 +170,8 @@ export function createAuthCore(opts: StubOptions = {}) {
     apiHits: 0,
     /** Every refusal, as `<where>:<reason>` — the first thing to read when a test fails. */
     refusals: [] as string[],
+    /** The `kind` (and starting scope / takeover) of each WS auth frame, in order (RFC-028 D1). */
+    authDeclared: [] as Array<{ kind: unknown; scope?: unknown; takeover?: unknown }>,
   };
   const mint = mintAgentToken;
   const sockets = new Set<any>();
@@ -361,13 +363,13 @@ export function createAuthCore(opts: StubOptions = {}) {
         token_endpoint: `${issuer}/token`,
         revocation_endpoint: `${issuer}/revoke`,
         grant_types_supported: opts.legacyServer
-          ? ["authorization_code", GRANT_DEVICE_CODE, GRANT_ENROLMENT_KEY, "urn:bridge:params:oauth:grant-type:session", "refresh_token"]
+          ? ["authorization_code", GRANT_DEVICE_CODE, GRANT_ENROLMENT_KEY, "urn:einweave:params:oauth:grant-type:session", "refresh_token"]
           : ["authorization_code", GRANT_DEVICE_CODE, GRANT_ENROLMENT_KEY, "client_credentials"],
         token_endpoint_auth_methods_supported: ["private_key_jwt", "none"],
         token_endpoint_auth_signing_alg_values_supported: ["ES256"],
         revocation_endpoint_auth_methods_supported: ["private_key_jwt"],
         dpop_signing_alg_values_supported: ["ES256"],
-        bridge_connect_done_uri: `${url.origin}/connect/done`,
+        einweave_connect_done_uri: `${url.origin}/connect/done`,
       });
     }
     if (url.pathname === "/api/agent-auth/authorize") {
@@ -669,7 +671,7 @@ export function createAuthCore(opts: StubOptions = {}) {
       enrolmentKeys.set(key, uses);
       return key;
     },
-    /** Register a specific key; it must be in the server's format (`brg_ek_…` + CRC) or it could never be redeemed. */
+    /** Register a specific key; it must be in the server's format (`ew_ek_…` + CRC) or it could never be redeemed. */
     addEnrolmentKey(key: string, uses = 1) {
       if (!isAgentToken("ek", key)) throw new Error(`stub: ${key} is not a well-formed enrolment key (use mintEnrolmentKey())`);
       enrolmentKeys.set(key, uses);
@@ -751,6 +753,12 @@ export function startAuthStub(opts: StubOptions = {}) {
           if (f.v !== 2 || f.since !== undefined) {
             core.stats.refusals.push("ws:v1");
             return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins");
+          }
+          // RFC-028 D1, as the server: a connection declares its kind; the server never infers one.
+          core.stats.authDeclared.push({ kind: f.kind, scope: f.scope, takeover: f.takeover });
+          if (!["gateway", "session", "observer"].includes(f.kind)) {
+            core.stats.refusals.push("ws:no-kind");
+            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
           }
           const forced = core.takeForcedAuthClose();
           if (forced) {

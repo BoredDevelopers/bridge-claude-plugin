@@ -10,7 +10,7 @@
  *   a page of its own;
  * - it closes after the answer or after `timeoutMs`.
  */
-import type { AuthMetadata } from "../vendor/bridge-agent-sdk/core/index.js";
+import type { AuthMetadata } from "../vendor/einweave-agent-sdk/core/index.js";
 import { PLUGIN_CLIENT_ID } from "./client-id";
 
 export type LoopbackAnswer = { code: string } | { error: string };
@@ -47,7 +47,7 @@ export async function startLoopback(
 ): Promise<LoopbackLogin> {
   const { verifier, challenge } = await pkcePair();
   const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
-  const doneUri = opts.doneUri ?? meta.bridge_connect_done_uri;
+  const doneUri = opts.doneUri ?? meta.einweave_connect_done_uri;
 
   let settle!: (a: LoopbackAnswer) => void;
   const answer = new Promise<LoopbackAnswer>((r) => (settle = r));

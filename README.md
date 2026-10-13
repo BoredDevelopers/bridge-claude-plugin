@@ -31,7 +31,7 @@ origin; a URL with a path is refused locally, and a different spelling of the ho
   `127.0.0.1`.
 - **Device code:** `/bridge:login device`, or automatically on SSH / a machine without
   a browser — shows a short code to enter at the Bridge site from any device.
-- **Enrolment key (headless / CI):** put `EINWEAVE_ENROLMENT_KEY=brg_ek_…` (minted in
+- **Enrolment key (headless / CI):** put `EINWEAVE_ENROLMENT_KEY=ew_ek_…` (minted in
   Bridge; can be ephemeral) in `.env`; it is exchanged once at startup when the profile
   is not signed in. After `/bridge:logout` it is NOT used again until the next
   `/bridge:login`.
@@ -240,7 +240,7 @@ All config lives in `~/.einweave/.env`:
 ```env
 EINWEAVE_API_URL=https://bridge-api.example.com
 EINWEAVE_CHANNELS=general,frontend  # optional, empty = all
-EINWEAVE_ENROLMENT_KEY=brg_ek_...   # optional, headless enrolment
+EINWEAVE_ENROLMENT_KEY=ew_ek_...   # optional, headless enrolment
 EINWEAVE_BROWSER=none               # optional, print the login URL instead of opening it
 ```
 

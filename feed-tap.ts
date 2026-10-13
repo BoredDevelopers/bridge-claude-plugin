@@ -17,7 +17,7 @@
  * else. The only thing written to disk is the launcher script, which holds two paths.
  *
  * The socket, the ring and the wire format are `@bridge/agent-sdk`'s, from the vendored
- * build (`vendor/bridge-agent-sdk`, stamped by `VERSION`). This file only translates the
+ * build (`vendor/einweave-agent-sdk`, stamped by `VERSION`). This file only translates the
  * plugin's own shapes — an inbound WS message, a `reply` tool call — into feed frames.
  */
 import { chmodSync, mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -25,8 +25,8 @@ import { join } from "node:path";
 // TYPES only. The vendored build is loaded with `await import()` inside startFeedTap's
 // try block: a missing or half-written chunk (an update in progress) must cost this
 // session its feed, not its boot.
-import type { FeedServer, FeedHelloInfo } from "./vendor/bridge-agent-sdk/node.js";
-import type { FeedMessage, FeedStatusState } from "./vendor/bridge-agent-sdk/core/index.js";
+import type { FeedServer, FeedHelloInfo } from "./vendor/einweave-agent-sdk/node.js";
+import type { FeedMessage, FeedStatusState } from "./vendor/einweave-agent-sdk/core/index.js";
 
 /** What the tap remembers about a thread, learned from its root as it passes through. */
 interface ThreadNote {
@@ -188,7 +188,7 @@ export function writeLauncher(stateDir: string, pluginRoot: string): string {
   const script =
     "#!/bin/sh\n" +
     "# Written by the Bridge plugin on every start (RFC-022 D10). Do not edit: it is replaced.\n" +
-    `exec ${shq(process.execPath)} ${shq(join(pluginRoot, "vendor", "bridge-agent-sdk", "tail-cli.js"))} --procs ${shq(stateDir)} "$@"\n`;
+    `exec ${shq(process.execPath)} ${shq(join(pluginRoot, "vendor", "einweave-agent-sdk", "tail-cli.js"))} --procs ${shq(stateDir)} "$@"\n`;
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, script, { mode: 0o700 });
   chmodSync(tmp, 0o700);
@@ -256,7 +256,7 @@ export async function startFeedTap(o: FeedTapOptions): Promise<FeedTap> {
     timer = setTimeout(() => reject(new Error(`did not open within ${FEED_OPEN_TIMEOUT_MS} ms`)), FEED_OPEN_TIMEOUT_MS);
   });
   const opening = (async () => {
-    const { feedServer } = await import("./vendor/bridge-agent-sdk/node.js");
+    const { feedServer } = await import("./vendor/einweave-agent-sdk/node.js");
     return feedServer({ stateDir: o.stateDir, contextId: feedContextName(o.sessionKey), hello: o.hello });
   })();
   // If the timeout wins, a late open is closed again rather than left serving unannounced.

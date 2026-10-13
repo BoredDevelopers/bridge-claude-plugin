@@ -20,8 +20,8 @@ import {
   type AuthMetadata,
   type FetchLike,
   type Signer,
-} from "../vendor/bridge-agent-sdk/core/index.js";
-import { STALE_MS } from "../vendor/bridge-agent-sdk/node.js";
+} from "../vendor/einweave-agent-sdk/core/index.js";
+import { STALE_MS } from "../vendor/einweave-agent-sdk/node.js";
 import { parseJws, verifyEs256 } from "./dpop-verify";
 
 /** Compact ES256 JWS — the SDK's internal `signJwt` (not exported), for hand-made bad proofs. */
@@ -67,7 +67,7 @@ describe("enrolment (§3.2)", () => {
     const { stub, meta, tc, ek, signer, inst, state0 } = await setup();
     expect(stub.installation(inst)!.jkt).toBe(signer.jkt);
     expect(stub.installation(inst)!.keyStorage).toBe("software"); // E10: declared by the client
-    expect(state0).toStartWith("brg_js_0_");
+    expect(state0).toStartWith("ew_js_0_");
     const e = await refused(tc.enrolWithKey(meta, signer, { enrolmentKey: ek, installationName: "again" }));
     expect(e).toMatchObject({ error: "invalid_dpop_proof", description: "key_already_enrolled" });
   });
@@ -115,7 +115,7 @@ describe("mint (§3.3) and the join-state chain (E6)", () => {
     const { stub, meta, tc, signer, inst, state0 } = await setup();
     const g = await mintWith(tc, meta, signer, inst, state0, "a".repeat(43));
     expect(g.token_type).toBe("DPoP");
-    expect(g.join_state).toStartWith("brg_js_1_");
+    expect(g.join_state).toStartWith("ew_js_1_");
     expect(stub.stats).toMatchObject({ mints: 1, replays: 0, locks: 0 });
   });
 
@@ -140,7 +140,7 @@ describe("mint (§3.3) and the join-state chain (E6)", () => {
     expect(await refused(mintWith(tc, meta, signer, inst, state0, "short"))).toMatchObject({ error: "invalid_request", description: "attempt_invalid" });
     expect(await refused(mintWith(tc, meta, signer, inst, state0, "a".repeat(40) + "!!!"))).toMatchObject({ description: "attempt_invalid" });
     expect(stub.stats.locks).toBe(0);
-    expect((await mintWith(tc, meta, signer, inst, state0, "a".repeat(43))).join_state).toStartWith("brg_js_1_");
+    expect((await mintWith(tc, meta, signer, inst, state0, "a".repeat(43))).join_state).toStartWith("ew_js_1_");
   });
 
   test("an OLDER state (two back) locks; a bad CRC is corrupt_state and does NOT lock", async () => {
@@ -208,7 +208,7 @@ describe("mint (§3.3) and the join-state chain (E6)", () => {
     // A fresh client whose machine clock is 10 min behind, never taught by an answer yet.
     const { tc } = client({ now: () => Date.now() - 600_000 });
     const g = await mintWith(tc, meta, signer, inst, state0, "a".repeat(43));
-    expect(g.join_state).toStartWith("brg_js_1_");
+    expect(g.join_state).toStartWith("ew_js_1_");
     expect(stub.stats.refusals.some((r) => r.includes("iat"))).toBe(true);
   });
 
@@ -227,7 +227,7 @@ describe("mint (§3.3) and the join-state chain (E6)", () => {
 
   test("the RFC-014 grants are retired as the server retires them: invalid_grant rfc014_retired (E13)", async () => {
     const { stub } = await setup();
-    for (const grant_type of ["refresh_token", "urn:bridge:params:oauth:grant-type:session"]) {
+    for (const grant_type of ["refresh_token", "urn:einweave:params:oauth:grant-type:session"]) {
       const r = await fetch(`${stub.url}/api/agent-auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ grant_type }) });
       const j = (await r.json()) as any;
       expect(r.status).toBe(400);
@@ -245,9 +245,9 @@ describe("the stub refuses what a wrong client would send", () => {
     const { stub } = await setup();
     const post = (body: object) =>
       fetch(`${stub.url}/api/agent-auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json() as any);
-    const EK = "urn:bridge:params:oauth:grant-type:enrolment-key";
+    const EK = "urn:einweave:params:oauth:grant-type:enrolment-key";
     // A malformed / bad-CRC secret is judged first, before key_storage and before the proof.
-    expect(await post({ grant_type: EK, enrolment_key: "brg_ek_t", key_storage: "tpm" })).toEqual({ error: "invalid_grant" });
+    expect(await post({ grant_type: EK, enrolment_key: "ew_ek_t", key_storage: "tpm" })).toEqual({ error: "invalid_grant" });
     const ek = stub.mintEnrolmentKey();
     const badCrc = ek.slice(0, -1) + (ek.endsWith("A") ? "B" : "A");
     expect(await post({ grant_type: EK, enrolment_key: badCrc, key_storage: "tpm" })).toEqual({ error: "invalid_grant" });
@@ -256,7 +256,7 @@ describe("the stub refuses what a wrong client would send", () => {
       error: "invalid_dpop_proof",
       error_description: expect.stringMatching(/^dpop_proof_required: /),
     });
-    expect(() => stub.addEnrolmentKey("brg_ek_t")).toThrow(/well-formed/);
+    expect(() => stub.addEnrolmentKey("ew_ek_t")).toThrow(/well-formed/);
   });
 
   test("an authorization code is burnt by ANY mismatch (client_id, redirect_uri, verifier) — one try, as the server", async () => {
@@ -363,7 +363,7 @@ describe("the stub refuses what a wrong client would send", () => {
     const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", DPoP: proof },
-      body: JSON.stringify({ grant_type: "urn:bridge:params:oauth:grant-type:enrolment-key", enrolment_key: ekNc, installation_name: "x" }),
+      body: JSON.stringify({ grant_type: "urn:einweave:params:oauth:grant-type:enrolment-key", enrolment_key: ekNc, installation_name: "x" }),
     });
     // The server answers a bad proof WITHOUT a description (measured, key-credentials-real-api); the stub records why.
     expect(await r.json()).toEqual({ error: "invalid_dpop_proof" });
@@ -454,7 +454,7 @@ describe("revoke (§3.5)", () => {
     expect(stub.installation(inst)!.seq).toBe(seqBefore);
     expect(stub.installation(inst)!.revoked).toBeNull();
     const g2 = await mintWith(tc, meta, signer, inst, g1.join_state, "b".repeat(43), "s1", true);
-    expect(g2.join_state).toStartWith("brg_js_2_");
+    expect(g2.join_state).toStartWith("ew_js_2_");
   });
 
   test("with a stale state: LOCKED, not revoked — a thief cannot revoke to hide", async () => {
@@ -510,7 +510,7 @@ describe("TokenClient failure shapes (classifyTokenError input)", () => {
     return meta;
   }
   const mintAt = async (meta: AuthMetadata) =>
-    refused(mintWith(client().tc, meta, (await generateSoftwareKey()).signer, crypto.randomUUID(), "brg_js_0_" + "A".repeat(49), "a".repeat(43)));
+    refused(mintWith(client().tc, meta, (await generateSoftwareKey()).signer, crypto.randomUUID(), "ew_js_0_" + "A".repeat(49), "a".repeat(43)));
 
   test("no answer (connection refused) ⇒ TransportError ⇒ transient", async () => {
     const e = await mintAt({ ...fakeAs(() => new Response("")), token_endpoint: "http://127.0.0.1:1/api/agent-auth/token" });
@@ -525,7 +525,7 @@ describe("TokenClient failure shapes (classifyTokenError input)", () => {
       port: 0,
       socket: {
         data(sock) {
-          sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{"access_token":"brg_at_');
+          sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{"access_token":"ew_at_');
           sock.flush();
           setTimeout(() => sock.end(), 50);
         },
@@ -609,8 +609,8 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     const meta = { issuer: `${base}/api/agent-auth`, token_endpoint: `${base}/api/agent-auth/token`, device_authorization_endpoint: `${base}/api/agent-auth/device_authorization` } as AuthMetadata;
     const k = (await generateSoftwareKey()).signer;
     await refused(tc.deviceAuthorization(meta, "mac"));
-    await refused(tc.pollDeviceCode(meta, k, "brg_dc_x"));
-    await refused(tc.exchangeCode(meta, k, { code: "brg_ac_x", verifier: "v".repeat(43), redirectUri: "http://127.0.0.1:1/cb" }));
+    await refused(tc.pollDeviceCode(meta, k, "ew_dc_x"));
+    await refused(tc.exchangeCode(meta, k, { code: "ew_ac_x", verifier: "v".repeat(43), redirectUri: "http://127.0.0.1:1/cb" }));
     expect(sent.map((b) => b.client_id)).toEqual(["bridge-openclaw", "bridge-openclaw", "bridge-openclaw"]);
   });
 
@@ -627,7 +627,7 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     await refused(tc.enrolWithKey(meta, k, { enrolmentKey: "ek", installationName: "t" }));
     await refused(tc.exchangeCode(meta, k, { code: "c", verifier: "v".repeat(43), redirectUri: "http://127.0.0.1:1/cb" }));
     await refused(tc.pollDeviceCode(meta, k, "dc"));
-    await refused(tc.mint(meta, k, { installationId: "i", joinState: "brg_js_0_x", attempt: "a".repeat(43), sessionKey: "s1", reconnect: false }));
+    await refused(tc.mint(meta, k, { installationId: "i", joinState: "ew_js_0_x", attempt: "a".repeat(43), sessionKey: "s1", reconnect: false }));
     expect(sent).toHaveLength(4);
     for (const b of sent) {
       expect(b.software_id).toBe("bridge-claude-plugin");
@@ -690,7 +690,7 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     };
     const { tc } = client();
     const k = (await generateSoftwareKey()).signer;
-    const input = { installationId: crypto.randomUUID(), joinState: "brg_js_0_" + "A".repeat(49), attempt: "a".repeat(43), sessionKey: "s", reconnect: false };
+    const input = { installationId: crypto.randomUUID(), joinState: "ew_js_0_" + "A".repeat(49), attempt: "a".repeat(43), sessionKey: "s", reconnect: false };
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 100);
     const cancelled = await refused(tc.mint(meta, k, input, { signal: ac.signal }));
@@ -707,7 +707,7 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     stops.push(() => srv.stop(true));
     const base = `http://127.0.0.1:${srv.port}`;
     const meta = { issuer: `${base}/api/agent-auth`, token_endpoint: `${base}/api/agent-auth/token` } as AuthMetadata;
-    const e = await refused(mintWith(client().tc, meta, (await generateSoftwareKey()).signer, crypto.randomUUID(), "brg_js_0_" + "A".repeat(49), "a".repeat(43)));
+    const e = await refused(mintWith(client().tc, meta, (await generateSoftwareKey()).signer, crypto.randomUUID(), "ew_js_0_" + "A".repeat(49), "a".repeat(43)));
     const a = classifyTokenError(e);
     expect(a.kind).toBe("rate_limited");
     expect((a as any).retryAfterS).toBeGreaterThanOrEqual(6);
@@ -737,7 +737,7 @@ describe("TokenClientOptions.timeouts (test-only override; production defaults u
     };
     const tc = new TokenClient({ clock: new Clock(), clientId: STUB_CLIENT_ID, timeouts: { mintMs: 150, mintBudgetMs: 150 } });
     const k = (await generateSoftwareKey()).signer;
-    const input = { installationId: crypto.randomUUID(), joinState: "brg_js_0_" + "A".repeat(49), attempt: "a".repeat(43), sessionKey: "s", reconnect: false };
+    const input = { installationId: crypto.randomUUID(), joinState: "ew_js_0_" + "A".repeat(49), attempt: "a".repeat(43), sessionKey: "s", reconnect: false };
     const started = Date.now();
     const e = await refused(tc.mint(meta, k, input));
     const elapsed = Date.now() - started;

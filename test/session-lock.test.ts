@@ -35,7 +35,7 @@ import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { writeInstallation, writeKey, writeState } from "./key-fixtures";
-import { generateSoftwareKey } from "../vendor/bridge-agent-sdk/core/index.js";
+import { generateSoftwareKey } from "../vendor/einweave-agent-sdk/core/index.js";
 import { makeJoinState } from "./dpop-verify";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";

@@ -90,3 +90,11 @@ describe("RFC-017 D5: sessionInfo.softwareId", () => {
     expect(frame?.sessionInfo?.clientVersion).toBeTruthy(); // unchanged: sent alongside, not instead of
   }, 30_000);
 });
+
+describe("RFC-028 D1: the auth frame declares a kind", () => {
+  test("a Claude Code window authenticates as kind: session (the server never infers one)", async () => {
+    const frame = await authFrameWith("");
+    expect(frame?.type).toBe("auth");
+    expect(frame?.kind).toBe("session");
+  }, 30_000);
+});

@@ -3,7 +3,7 @@
  * entries → channel notifications, pending until the model has them.
  */
 import { describe, test, expect } from "bun:test";
-import { Pending, type Entry, type Inbound } from "../vendor/bridge-agent-sdk/index.js";
+import { Pending, type Entry, type Inbound } from "../vendor/einweave-agent-sdk/index.js";
 import { channelAdapter, render, type AdapterDeps, type Rendered } from "../link/adapter";
 import { deliveredEntryId } from "../delivery/tags";
 

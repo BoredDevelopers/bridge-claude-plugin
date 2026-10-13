@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ThreadNotes, feedContextName, inboundToFeed, launcherPath, outboundToFeed, sweepStaleFeedSockets, writeLauncher } from "../feed-tap";
-import { feedClient, type FeedClient } from "../vendor/bridge-agent-sdk/node.js";
+import { feedClient, type FeedClient } from "../vendor/einweave-agent-sdk/node.js";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
 
@@ -135,7 +135,7 @@ describe("launcher", () => {
       expect(script.startsWith("#!/bin/sh\n")).toBe(true);
       // Paths are single-quoted, with an embedded quote closed, escaped and reopened.
       // The runtime is named by absolute path: the pane's PATH may not have it.
-      expect(script).toContain(`exec '${process.execPath}' '/plugins/it'\\''s here/0.27.0/vendor/bridge-agent-sdk/tail-cli.js' --procs '${dir}' "$@"`);
+      expect(script).toContain(`exec '${process.execPath}' '/plugins/it'\\''s here/0.27.0/vendor/einweave-agent-sdk/tail-cli.js' --procs '${dir}' "$@"`);
       expect(statSync(join(dir, "bin")).mode & 0o777).toBe(0o700);
       // Rewriting (the next start, or a second window) leaves one file and no temp behind.
       writeLauncher(dir, "/plugins/next/0.28.0");

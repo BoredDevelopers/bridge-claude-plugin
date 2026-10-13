@@ -29,8 +29,8 @@ import {
   type Installation,
   type Runtime,
   type SessionClient,
-} from "../vendor/bridge-agent-sdk/index.js";
-import { fileStore, readVersioned, sweepOrphanTemps, sweepLockTombstones } from "../vendor/bridge-agent-sdk/node.js";
+} from "../vendor/einweave-agent-sdk/index.js";
+import { fileStore, readVersioned, sweepOrphanTemps, sweepLockTombstones } from "../vendor/einweave-agent-sdk/node.js";
 import {
   TokenClient,
   Clock,
@@ -43,7 +43,7 @@ import {
   type AuthMetadata,
   type EnrolGrant,
   type InstallationGoneReason,
-} from "../vendor/bridge-agent-sdk/core/index.js";
+} from "../vendor/einweave-agent-sdk/core/index.js";
 import { PLUGIN_CLIENT_ID } from "./client-id";
 import { startLoopback, type LoopbackLogin } from "./loopback";
 import { isHeadless, browserDisabled, openBrowser } from "./browser";

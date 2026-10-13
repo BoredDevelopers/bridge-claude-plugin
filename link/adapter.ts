@@ -9,8 +9,8 @@
  * those two keys come first in `meta`, in that order, for every kind — a task event's
  * or an action's entry id rides as `message_id` too: it is the id the hook confirms.
  */
-import type { DeliveryAdapter, Entry, Inbound } from "../vendor/bridge-agent-sdk/index.js";
-import { isAddressed } from "../vendor/bridge-agent-sdk/core/index.js";
+import type { DeliveryAdapter, Entry, Inbound } from "../vendor/einweave-agent-sdk/index.js";
+import { isAddressed } from "../vendor/einweave-agent-sdk/core/index.js";
 
 export type ChannelMeta = Record<string, string>;
 export type Rendered = {

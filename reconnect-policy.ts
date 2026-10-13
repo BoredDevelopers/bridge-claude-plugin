@@ -1,11 +1,11 @@
 /**
  * What the PERSON is told about a closed socket (`status`, notices). The
  * classification (which close is which class) and the reconnect schedule are the
- * SDK's (`classifyClose` / `reconnectDelay` in vendor/bridge-agent-sdk/core) — the
+ * SDK's (`classifyClose` / `reconnectDelay` in vendor/einweave-agent-sdk/core) — the
  * SDK reconnects; this file only words it.
  */
 import { UPDATE_HOWTO } from "./update-howto";
-import type { CloseClass } from "./vendor/bridge-agent-sdk/core/index.js";
+import type { CloseClass } from "./vendor/einweave-agent-sdk/core/index.js";
 export type { CloseClass };
 
 /**

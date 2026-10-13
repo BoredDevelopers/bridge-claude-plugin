@@ -55,8 +55,8 @@ import {
   OAuthError,
   classifyTokenError,
   type Signer,
-} from "../vendor/bridge-agent-sdk/core/index.js";
-import type { AgentClient } from "../vendor/bridge-agent-sdk/index.js";
+} from "../vendor/einweave-agent-sdk/core/index.js";
+import type { AgentClient } from "../vendor/einweave-agent-sdk/index.js";
 import { readInstallation, readKey, readState, readAttempt, writeKey, writeState, writeInstallation, randomB64url, agentClientOn } from "./key-fixtures";
 import { PLUGIN_CLIENT_ID } from "../auth/client-id";
 import { startAuthStub } from "./agent-auth-stub";
@@ -97,7 +97,7 @@ const SEED_TS = join(import.meta.dir, "fixtures", "real-api-seed.ts");
 /** A build one patch above this one — admitted by the server's minimum, unlike anything older. */
 const NEWER_VERSION = PLUGIN_VERSION.replace(/(\d+)$/, (n) => String(Number(n) + 1));
 const AUTH_SECRET = "test-secret-at-least-32-characters-long";
-const GRANT_EK = "urn:bridge:params:oauth:grant-type:enrolment-key";
+const GRANT_EK = "urn:einweave:params:oauth:grant-type:enrolment-key";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── the scratch database (one per run) ─────────────────────────────────────────────────
@@ -350,7 +350,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
     token_auth_algs: meta.token_endpoint_auth_signing_alg_values_supported,
     revoke_auth: meta.revocation_endpoint_auth_methods_supported,
     dpop_algs: meta.dpop_signing_alg_values_supported,
-    done_uri: typeof meta.bridge_connect_done_uri === "string",
+    done_uri: typeof meta.einweave_connect_done_uri === "string",
   };
 
   // ── enrolment (§3.2) ──
@@ -360,7 +360,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   out.enrol_bad_key_storage = oauth(await post(tokenUrl, enrolBody({ key_storage: "tpm" }), { DPoP: await proof(k1.signer, tokenUrl) }));
   out.enrol_proof_wrong_htu = oauth(await post(tokenUrl, enrolBody(), { DPoP: await proof(k1.signer, revokeUrl) }));
   out.enrol_bad_enrolment_key = oauth(
-    await post(tokenUrl, enrolBody({ enrolment_key: "brg_ek_nope" }), { DPoP: await proof(k1.signer, tokenUrl) })
+    await post(tokenUrl, enrolBody({ enrolment_key: "ew_ek_nope" }), { DPoP: await proof(k1.signer, tokenUrl) })
   );
   const e1 = await post(tokenUrl, enrolBody({ key_storage: "software" }), { DPoP: await proof(k1.signer, tokenUrl) });
   out.enrol = {
@@ -406,7 +406,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
     status: m1.status,
     token_type: m1.json?.token_type,
     expires_in: typeof m1.json?.expires_in === "number" && m1.json.expires_in > 0,
-    access_token: /^brg_at_/.test(m1.json?.access_token ?? ""),
+    access_token: /^ew_at_/.test(m1.json?.access_token ?? ""),
     join_state_seq: joinStateSeq(m1.json?.join_state ?? ""),
     session_id: UUID.test(m1.json?.session_id ?? ""),
   };
@@ -503,8 +503,8 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   const S4: string = after.json.join_state;
 
   // ── retired / unknown grants (E13) ──
-  out.grant_refresh_token = oauth(await post(tokenUrl, { grant_type: "refresh_token", refresh_token: "brg_rt_x" }));
-  out.grant_rfc014_session = oauth(await post(tokenUrl, { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "brg_it_x" }));
+  out.grant_refresh_token = oauth(await post(tokenUrl, { grant_type: "refresh_token", refresh_token: "ew_rt_x" }));
+  out.grant_rfc014_session = oauth(await post(tokenUrl, { grant_type: "urn:einweave:params:oauth:grant-type:session", installation_token: "ew_it_x" }));
   out.grant_unknown = oauth(await post(tokenUrl, { grant_type: "urn:example:nope" }));
 
   // ── a copy: a stale state LOCKS (E6d/E8) ──
@@ -763,7 +763,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       expect(joinStateSeq(readState(dir)!)).toBe(0); // …the machine never heard
       const tok = await m.accessToken();
       m.stop();
-      expect(tok).toMatch(/^brg_at_/);
+      expect(tok).toMatch(/^ew_at_/);
       const row = await grantRow(inst);
       expect(row.revoked_at).toBeNull();
       expect(Number(row.js_seq)).toBe(1); // replayed, not advanced again
@@ -923,8 +923,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
 
   test("retired RFC-014 grants answer invalid_grant rfc014_retired, which the plugin classifies update_required", async () => {
     for (const body of [
-      { grant_type: "refresh_token", refresh_token: "brg_rt_x" },
-      { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "brg_it_x", session_key: "x" },
+      { grant_type: "refresh_token", refresh_token: "ew_rt_x" },
+      { grant_type: "urn:einweave:params:oauth:grant-type:session", installation_token: "ew_it_x", session_key: "x" },
     ]) {
       const r = await fetch(`${api.url}/api/agent-auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const j = (await r.json()) as any;

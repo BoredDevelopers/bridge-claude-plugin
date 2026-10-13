@@ -1,14 +1,14 @@
 /**
  * RFC-016 credential files for tests, in the SDK `fileStore`'s on-disk format
- * (vendor/bridge-agent-sdk node/store.ts): key.json + state + installation.json, all
+ * (vendor/einweave-agent-sdk node/store.ts): key.json + state + installation.json, all
  * 0600, installation.json LAST — its presence means "enrolled". Sync, so a test can
  * seed a directory before the plugin process starts.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { generateSoftwareKey, type EcPrivateJwk, type KeyStorage } from "../vendor/bridge-agent-sdk/core/index.js";
-import { AgentClient, createRuntime } from "../vendor/bridge-agent-sdk/index.js";
-import { fileStore } from "../vendor/bridge-agent-sdk/node.js";
+import { generateSoftwareKey, type EcPrivateJwk, type KeyStorage } from "../vendor/einweave-agent-sdk/core/index.js";
+import { AgentClient, createRuntime } from "../vendor/einweave-agent-sdk/index.js";
+import { fileStore } from "../vendor/einweave-agent-sdk/node.js";
 import { PLUGIN_CLIENT_ID } from "../auth/client-id";
 
 export interface TestInstallation {

@@ -56,9 +56,9 @@ import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersio
 import { resolveProfile, profileLabel } from "./auth/profile";
 import { SignIn, describeCredential, waitFor } from "./auth/login";
 import { PLUGIN_CLIENT_ID } from "./auth/client-id";
-import { Session, createRuntime, type DeliveryAdapter, type Entry, type PendingEntry, type SessionStatus, type SessionStop } from "./vendor/bridge-agent-sdk/index.js";
-import { isAddressed, deadline } from "./vendor/bridge-agent-sdk/core/index.js";
-import { sessionLock, fileSeqStore, type SessionLockHandle, type LockRecord } from "./vendor/bridge-agent-sdk/node.js";
+import { Session, createRuntime, type DeliveryAdapter, type Entry, type PendingEntry, type SessionStatus, type SessionStop } from "./vendor/einweave-agent-sdk/index.js";
+import { isAddressed, deadline } from "./vendor/einweave-agent-sdk/core/index.js";
+import { sessionLock, fileSeqStore, type SessionLockHandle, type LockRecord } from "./vendor/einweave-agent-sdk/node.js";
 import { channelAdapter, render, shouldDismiss } from "./link/adapter";
 import { MissedTracker } from "./delivery/missed";
 import { sweepCtlDirs, removeLegacyCtlDir, type CtlServerOptions } from "./delivery/ctl-server";
@@ -1464,6 +1464,7 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire"
   let created: Session | null = null; // the adapter acts on THIS Session, not on whichever is current later
   const s = new Session(rt, client, {
     adapter: adapterFor(() => created),
+    kind: "session", // RFC-028 D1: required on the auth frame; step 3 makes it a choice
     filter: broadcastFilter,
     seqStore,
     lock: keyCheckedLock(myLock),

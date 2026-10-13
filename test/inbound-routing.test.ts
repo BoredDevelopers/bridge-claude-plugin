@@ -183,7 +183,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
 
       // `other` signs in the real way (RFC-016): a fresh key, the enrolment-key grant with a
       // DPoP proof, then a client_credentials mint — through `@bridge/agent-sdk`'s core.
-      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/bridge-agent-sdk/core/index.js");
+      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/einweave-agent-sdk/core/index.js");
       const { randomB64url } = await import("./key-fixtures");
       const clockOther = new Clock();
       const tc = new TokenClient({ clock: clockOther, clientId: "bridge-claude-plugin" });
@@ -199,7 +199,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
           reconnect: false,
         })
       ).access_token;
-      expect(TOK_OTHER, "other agent could not sign in").toMatch(/^brg_at_/);
+      expect(TOK_OTHER, "other agent could not sign in").toMatch(/^ew_at_/);
 
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
         env: {

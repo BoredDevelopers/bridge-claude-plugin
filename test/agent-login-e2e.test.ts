@@ -17,7 +17,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { startAuthStub, type StubOptions } from "./agent-auth-stub";
-import { joinStateSeq } from "../vendor/bridge-agent-sdk/core/index.js";
+import { joinStateSeq } from "../vendor/einweave-agent-sdk/core/index.js";
 import { enrolledProfile, readInstallation, readState, agentClientOn } from "./key-fixtures";
 
 /**
@@ -113,7 +113,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const ek = stub.mintEnrolmentKey();
     await withPlugin(stub, { EINWEAVE_ENROLMENT_KEY: ek }, async (client, dir) => {
       expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-      expect(stub.stats.authTokens[0]).toStartWith("brg_at_");
+      expect(stub.stats.authTokens[0]).toStartWith("ew_at_");
       expect(stub.stats.refusals.filter((r) => r.startsWith("ws:"))).toEqual([]);
       expect(stub.stats.enrols).toBe(1);
       expect(joinStateSeq(readState(dir)!)).toBe(1);
