@@ -1,0 +1,5 @@
+{
+  "name": "einweave-picker-probe",
+  "description": "Probe for the RFC-028 take picker (Claude Code mod). NOT shipped: nothing in the einweave plugin's hooks/hooks.json loads it.",
+  "version": "0.0.0"
+}
