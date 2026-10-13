@@ -25,9 +25,38 @@ import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkS
 import { join } from "path";
 
 const PREFIX = ".connect-state-";
+// RFC-028 D1: what the window declares it is. A file of its own, NOT a new value in the
+// "0"/"1" file above: a 0.30 window sharing this directory reads that one and must go on
+// reading it (the rule at the top of this file).
+const KIND_PREFIX = ".connect-kind-";
 
 export function connectStateFileFor(dir: string, key: string): string {
   return join(dir, `${PREFIX}${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+}
+
+export type ConnectKind = "gateway" | "session";
+
+export function connectKindFileFor(dir: string, key: string): string {
+  return join(dir, `${KIND_PREFIX}${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+}
+
+/** The kind this session key last declared, or undefined (no file, or content this store did not write). */
+export function readConnectKind(dir: string, key: string): ConnectKind | undefined {
+  try {
+    const raw = readFileSync(connectKindFileFor(dir, key), "utf8").trim();
+    if (raw === "gateway" || raw === "session") return raw;
+  } catch {}
+  return undefined;
+}
+
+export function writeConnectKind(dir: string, key: string, kind: ConnectKind): void {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = connectKindFileFor(dir, key);
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, kind + "\n", { mode: 0o600 });
+    renameSync(tmp, target);
+  } catch {}
 }
 
 /** true / false as stored, or undefined when there is no file. */
@@ -85,13 +114,13 @@ export function writeConnectState(dir: string, key: string, on: boolean): void {
   } catch {}
 }
 
-export function sweepConnectStateFiles(dir: string, currentPath: string, maxAgeMs: number): void {
+export function sweepConnectStateFiles(dir: string, currentPath: string, maxAgeMs: number, ...alsoCurrent: string[]): void {
   try {
     const cutoff = Date.now() - maxAgeMs;
     for (const name of readdirSync(dir)) {
-      if (!name.startsWith(PREFIX)) continue;
+      if (!name.startsWith(PREFIX) && !name.startsWith(KIND_PREFIX)) continue;
       const path = join(dir, name);
-      if (path === currentPath) continue;
+      if (path === currentPath || alsoCurrent.includes(path)) continue;
       try {
         if (statSync(path).mtimeMs < cutoff) unlinkSync(path);
       } catch {}

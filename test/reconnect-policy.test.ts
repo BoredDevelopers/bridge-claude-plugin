@@ -84,4 +84,34 @@ describe("describeClose", () => {
     expect(t).toContain("/einweave:connect takeover");
     expect(t).toContain("already connected");
   });
+
+  // RFC-028 D1/D2: three classes the SDK used to hand to `revoked`, whose wording says "run login".
+  // The credential is fine here -- the remedy is a connect, or a manager.
+  test("gateway-in-use names the holder, says it is retrying, and offers takeover or a work session", () => {
+    const t = describeClose("gateway-in-use", 4008, "gateway in use: Bellman #ab12");
+    expect(t).toContain("by Bellman #ab12");
+    expect(t).toContain("retrying");
+    expect(t).toContain("/einweave:connect gateway takeover");
+    expect(t).toContain("/einweave:connect session");
+    expect(t).not.toContain("login");
+  });
+
+  test("gateway-taken-over names the taker and says this window is no longer the gateway", () => {
+    const t = describeClose("gateway-taken-over", 4008, "gateway taken over: Mac #cd34");
+    expect(t).toContain("by Mac #cd34");
+    expect(t).toContain("no longer the gateway");
+    expect(t).toContain("/einweave:connect session");
+    expect(t).not.toContain("login");
+    expect(t).not.toContain("retrying");
+  });
+
+  test("kind-not-allowed names the refused kind and sends the person to a manager", () => {
+    const t = describeClose("kind-not-allowed", 4008, "kind not allowed: gateway");
+    expect(t).toContain("gateway connections");
+    expect(t).toContain("manager");
+    expect(t).not.toContain("login");
+    // A reason without a detail still reads.
+    expect(describeClose("kind-not-allowed", 4008, "kind not allowed")).toContain("manager");
+    expect(describeClose("gateway-in-use", 4008, undefined)).toContain("in use (");
+  });
 });

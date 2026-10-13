@@ -9,7 +9,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, utimesSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles } from "../connect-store";
+import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles, connectKindFileFor, readConnectKind, writeConnectKind } from "../connect-store";
 
 let dir = "";
 beforeEach(() => {
@@ -127,3 +127,33 @@ describe("sweepConnectStateFiles", () => {
   });
 });
 
+
+describe("RFC-028 D1: the declared kind rides in its own file", () => {
+  test("round-trips, and the 0/1 intent file a 0.30 window reads is untouched", () => {
+    writeConnectState(dir, "k", true);
+    writeConnectKind(dir, "k", "gateway");
+    expect(readConnectKind(dir, "k")).toBe("gateway");
+    expect(readConnectState(dir, "k")).toBe(true);
+    expect(readFileSync(connectStateFileFor(dir, "k"), "utf8")).toBe("1\n");
+    writeConnectKind(dir, "k", "session");
+    expect(readConnectKind(dir, "k")).toBe("session");
+  });
+
+  test("no file, and content this store did not write, read as undefined (never a crash, never a kind)", () => {
+    expect(readConnectKind(dir, "none")).toBeUndefined();
+    writeFileSync(connectKindFileFor(dir, "junk"), "observer\n");
+    expect(readConnectKind(dir, "junk")).toBeUndefined();
+  });
+
+  test("the sweep removes a stale kind file but keeps the current key's, backdated or not", () => {
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    const old = new Date(Date.now() - maxAgeMs - 60_000);
+    writeConnectKind(dir, "stale", "gateway");
+    writeConnectKind(dir, "current", "gateway");
+    utimesSync(connectKindFileFor(dir, "stale"), old, old);
+    utimesSync(connectKindFileFor(dir, "current"), old, old);
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "current"), maxAgeMs, connectKindFileFor(dir, "current"));
+    expect(existsSync(connectKindFileFor(dir, "stale"))).toBe(false);
+    expect(existsSync(connectKindFileFor(dir, "current"))).toBe(true);
+  });
+});

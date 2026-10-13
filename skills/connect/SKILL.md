@@ -20,15 +20,28 @@ Arguments passed: `$ARGUMENTS`
    - If the user gave a name as an argument (e.g. `/einweave:connect Reviewer`),
      pass it as `label` on the same call — it is applied before the connect
      handshake, so the very first auth frame already carries it.
+   - Words in the arguments choose the **kind** and what to take:
+     - `session` (the default) / `gateway` → `kind`. A window is a **work
+       session**: it gets the threads it holds, plus unheld work in its scope
+       while the agent has no live gateway. The **gateway** is the agent's one
+       triage connection and gets all unheld work. The kind is remembered for
+       this session across restarts; with no kind word the window keeps the
+       kind it has. `claudeb --gateway` (or `EINWEAVE_CONNECTION_KIND=gateway`)
+       starts a window as the gateway.
+     - `gateway takeover` → `kind: "gateway"`, `takeover: "gateway"`: move the
+       agent's gateway from the window that has it to this one (that window is
+       told and stops being the gateway). If another window holds the gateway
+       and the user did not say takeover, the connect keeps **retrying** and
+       says who has it, once.
    - If the user said `/einweave:connect takeover` (or otherwise asked to take
-     over / move Bridge to this window), pass `takeover: true`. This claims
+     over / move Bridge to this window), pass `takeover: "lock"`. This claims
      the session lock from another window of this same Claude session — even
      one running an equal or newer plugin version, or the window that just
      superseded this one — and that other window is told and stops. A
      **superseded** window (RFC-017 D3) never reconnects on its own —
      `/einweave:connect takeover` (or `/einweave:disconnect` then a plain
      `/einweave:connect`) is what resumes it.
-2. Report the result (`connected` or `connecting`).
+2. Report the result (`connected` or `connecting`, with `(gateway)` for a gateway).
 
 ## What this means
 
@@ -41,7 +54,8 @@ Arguments passed: `$ARGUMENTS`
   `/einweave:disconnect`.
 
 ## Notes
-- Idempotent — calling it while already connected is a no-op on the socket.
+- Idempotent — calling it while already connected as the same kind is a no-op on
+  the socket; naming the other kind reconnects as that kind.
 - If Bridge isn't set up yet, the tool says what is missing — no API URL →
   `/einweave:configure`; not signed in → `/einweave:login`.
 - If this session was **revoked** in Bridge, `/einweave:connect` starts a new one. A

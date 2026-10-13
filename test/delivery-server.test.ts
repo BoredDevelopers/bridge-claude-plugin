@@ -312,7 +312,7 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     await waitFor(() => stub.connected(), 15_000, "A to authenticate");
     const b = await boot(false);
     await waitFor(() => lines(b).length > 0, 8000, "B up");
-    send(b, { jsonrpc: "2.0", id: 9001, method: "tools/call", params: { name: "connect", arguments: { takeover: true } } });
+    send(b, { jsonrpc: "2.0", id: 9001, method: "tools/call", params: { name: "connect", arguments: { takeover: "lock" } } });
     await waitFor(() => lines(b).some((m) => m.id === 9001), 15_000, "B's takeover");
     let stA: any = {};
     const end = Date.now() + 15_000;

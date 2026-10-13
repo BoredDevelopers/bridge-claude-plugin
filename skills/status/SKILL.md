@@ -22,7 +22,7 @@ Arguments passed: `$ARGUMENTS`
 configured-but-idle, or connected, which decides everything else below.
 
 It returns `{ configured, wantConnected, websocket, receiving_messages,
-agent, context_id, channel_filter, delivery, auth, label, tail }` (`tail` = the launcher
+agent, context_id, kind, scope, holds, channel_filter, delivery, auth, label, tail }` (`tail` = the launcher
 for the full-message viewer, see `/einweave:tail`; `auth` = the sign-in:
 profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 
@@ -52,6 +52,9 @@ Report the snapshot itself:
   authenticated).
 - Agent identity (`agent`), this session's context id (`context_id`), and
   its display label (`label`, or "derived default" if null).
+- Kind (`kind`: `session` = work session, `gateway` = the agent's triage connection) and,
+  once authenticated, the server's `scope` (which channels' unheld work this session takes)
+  and `holds` (the thread ids it holds).
 - Channel filter (`channel_filter`) — "all" or the configured list.
 - Delivery (`delivery.state`) — whether what Bridge pushed actually reached the model:
   `confirmed`, `awaiting confirmation`, `idle` (nothing pushed yet), `unconfirmed`

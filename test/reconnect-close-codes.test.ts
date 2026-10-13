@@ -200,7 +200,7 @@ describe("close codes", () => {
       await Bun.sleep(1_000);
       expect(stub.auths()).toBe(1);
       // takeover:true is the ONE escape hatch.
-      await client.callTool({ name: "connect", arguments: { takeover: true } });
+      await client.callTool({ name: "connect", arguments: { takeover: "lock" } });
       expect(await until(() => stub.auths() >= 2, 5_000)).toBe(true);
     });
   }, 40_000);
@@ -319,7 +319,7 @@ describe("RFC-017 D3: takeover then a later ordinary close", () => {
 
       // The ONE way this window resumes (D3): an explicit takeover.
       const authed = stub.onceAuthenticated();
-      await client.callTool({ name: "connect", arguments: { takeover: true } });
+      await client.callTool({ name: "connect", arguments: { takeover: "lock" } });
       await authed;
       await Bun.sleep(300);
       expect((await status(client)).websocket).toBe("connected");

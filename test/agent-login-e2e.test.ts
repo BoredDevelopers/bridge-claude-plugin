@@ -496,7 +496,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         await client.callTool({ name: "connect", arguments: {} });
         await Bun.sleep(300);
         expect(stub.stats.authTokens).toHaveLength(1);
-        await client.callTool({ name: "connect", arguments: { takeover: true } });
+        await client.callTool({ name: "connect", arguments: { takeover: "lock" } });
         expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
         expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
 

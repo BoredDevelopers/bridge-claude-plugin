@@ -252,6 +252,7 @@ All config lives in `~/.einweave/.env`:
 ```env
 EINWEAVE_API_URL=https://bridge-api.example.com
 EINWEAVE_CHANNELS=general,frontend  # optional, empty = all
+EINWEAVE_CONNECTION_KIND=gateway     # optional; gateway | session (default session)
 EINWEAVE_ENROLMENT_KEY=ew_ek_...   # optional, headless enrolment
 EINWEAVE_BROWSER=none               # optional, print the login URL instead of opening it
 ```

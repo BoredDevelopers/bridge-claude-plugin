@@ -51,6 +51,12 @@ function isNewerThan(other: string | undefined, mine: string): boolean {
   return false;
 }
 
+/** The text after a close reason's first ": " (the SDK's `detail`): a label, or the refused kind. */
+function detailOf(reason: string | undefined): string | undefined {
+  const i = reason?.indexOf(": ") ?? -1;
+  return i === -1 ? undefined : reason!.slice(i + 2) || undefined;
+}
+
 /** A human-readable reason for `status` and notifications. */
 export function describeClose(
   cls: CloseClass,
@@ -100,6 +106,19 @@ export function describeClose(
       return `this plugin is too old for Bridge (${tail}) — ${UPDATE_HOWTO}`;
     case "session-in-use":
       return `this session is already connected from another process (${tail}) — /einweave:status shows which; /einweave:connect takeover moves it here`;
+    // RFC-028 D1/D2. The remedy is a connect, never a login: the credential is fine.
+    case "gateway-in-use": {
+      const who = detailOf(reason);
+      return `this agent's gateway is in use${who ? ` by ${who}` : ""} (${tail}) — retrying; /einweave:connect gateway takeover moves it here, /einweave:connect session works without it`;
+    }
+    case "gateway-taken-over": {
+      const who = detailOf(reason);
+      return `this window's gateway was taken over${who ? ` by ${who}` : ""} (${tail}) — it is no longer the gateway; /einweave:connect session carries on as a work session, /einweave:connect gateway takeover moves the gateway back`;
+    }
+    case "kind-not-allowed": {
+      const kind = detailOf(reason);
+      return `this agent's managers do not allow ${kind ? `${kind} ` : ""}connections (${tail}) — ask a manager to allow it in the agent's settings, or connect as another kind: /einweave:connect session | gateway`;
+    }
     default:
       return `connection closed (${tail})`;
   }

@@ -49,7 +49,7 @@ import { readFileSync, mkdirSync, chmodSync, existsSync } from "fs";
 import { homedir, hostname, tmpdir } from "os";
 import { dirname, join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
-import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles } from "./connect-store";
+import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles, readConnectKind, writeConnectKind, connectKindFileFor, type ConnectKind } from "./connect-store";
 import { describeClose, type CloseClass, type HolderIdentity } from "./reconnect-policy";
 import { writeProc, removeProc, updateProcState, listProcs, type ProcInfo } from "./proc-registry";
 import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersion, INITIAL_STALE_WATCH_STATE, type StaleWatchState } from "./stale-watcher";
@@ -132,6 +132,15 @@ let sessionLabel = "";
 // tools update it in place, the same way sessionLabel does.
 let wantConnected = false;
 
+// RFC-028 D1: what this window declares on every auth frame -- a work `session` unless a
+// person made it the agent's `gateway` (/einweave:connect gateway, or EINWEAVE_CONNECTION_KIND
+// at launch). Persisted per session key (connect-store.ts), so a restart and a re-key keep it.
+// The server never infers a kind; it is stored on the grant.
+let connectionKind: ConnectKind = "session";
+// What the server said it stored for this socket (the `authenticated` frame) -- `status` shows it.
+let serverScope: { mode: string; channelIds: string[] } | null = null;
+let serverHolds: string[] = [];
+
 // Set by `connect`/`disconnect` before they touch anything SESSION_KEY-keyed.
 // Tools are answerable before SESSION_KEY (and the wantConnected it is read
 // against) resolve — up to SESSION_MAP_WAIT_MS (see resolveSessionKey below).
@@ -140,6 +149,8 @@ let wantConnected = false;
 // assignment at the bottom of this file only fires while this is still
 // false.
 let intentExplicitlySet = false;
+// The same for the kind: a `connect` that names one before SESSION_KEY resolves.
+let kindExplicitlySet = false;
 
 // Shared awaitable for SESSION_KEY resolution, assigned once (near the bottom
 // of this file) right after mcp.connect(). Both the startup sequence AND the
@@ -667,6 +678,8 @@ const CLOSE_OWNED_ERRORS = new Set([
   "installation locked",
   "session evicted",
 ]);
+/** RFC-028 4008 reasons carry a detail after ": " (a label, a kind) -- matched on the prefix, like the SDK does. */
+const CLOSE_OWNED_ERROR_PREFIXES = ["gateway in use", "gateway taken over", "kind not allowed"];
 /**
  * Inbound-path failures, surfaced to the MODEL rather than only to stderr.
  *
@@ -1032,6 +1045,9 @@ function connectionStatus(): Record<string, unknown> {
     receiving_messages: authenticated,
     agent: agentName || agentId || null,
     context_id: myContextId || null,
+    kind: connectionKind,
+    ...(authenticated && serverScope ? { scope: serverScope } : {}),
+    ...(authenticated ? { holds: serverHolds } : {}),
     channel_filter: CHANNELS_FILTER.length > 0 ? CHANNELS_FILTER : "all",
     ...(lastServerError ? { last_server_error: lastServerError } : {}),
     ...(holder ? { holder } : {}),
@@ -1406,7 +1422,7 @@ function keyCheckedLock(inner: SessionLockHandle): SessionLockHandle {
  * watch. Replaces any Session this process has. Every automatic path is refused once
  * superseded; only `takeover` (the person's one-time choice) gets past it.
  */
-async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire" | "takeover" | "standby" | "lost" | null> {
+async function openSession(opts: { takeover?: boolean; gatewayTakeover?: boolean } = {}): Promise<"acquire" | "takeover" | "standby" | "lost" | null> {
   if (!wantConnected || shuttingDown) return null;
   if (superseded && !opts.takeover) return null;
   const moved = conversationMovedTo();
@@ -1464,7 +1480,10 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire"
   let created: Session | null = null; // the adapter acts on THIS Session, not on whichever is current later
   const s = new Session(rt, client, {
     adapter: adapterFor(() => created),
-    kind: "session", // RFC-028 D1: required on the auth frame; step 3 makes it a choice
+    kind: connectionKind,
+    // RFC-028 D2: moving the gateway lease is its own, one-time act of a person -- never a retry's
+    // and never implied by the session-lock takeover (the SDK says it on this first connect only).
+    ...(opts.gatewayTakeover && connectionKind === "gateway" ? { takeover: "gateway" as const } : {}),
     filter: broadcastFilter,
     seqStore,
     lock: keyCheckedLock(myLock),
@@ -1513,6 +1532,8 @@ function onStatus(st: SessionStatus): void {
       agentName = st.agentName ?? "";
       agentHandle = st.handle ?? "";
       myContextId = st.contextId ?? "";
+      serverScope = st.scope ?? null;
+      serverHolds = st.holds ?? [];
       // Read-tool acks that found no Session go to this one — if it is the same profile and agent.
       if (session) returnedAcks.flush(session, { profile: PROFILE_LABEL, agentId });
       noteServerAdvice(st.advice);
@@ -1549,6 +1570,10 @@ function onStatus(st: SessionStatus): void {
         last4001At = Date.now();
         if (repeat) notifyConnectionRefused(st.cls, st.code, st.reason, { myVersion: PLUGIN_VERSION });
       } else if (st.code === 4003) {
+        notifyConnectionRefused(st.cls, st.code, st.reason, { myVersion: PLUGIN_VERSION });
+      } else if (st.cls === "gateway-in-use") {
+        // RFC-028 D2: retried by the SDK (5-60 s), but the person is the one who can end it. Said once per
+        // holder per episode (notifyConnectionRefused keys on code:reason, and the reason names the holder).
         notifyConnectionRefused(st.cls, st.code, st.reason, { myVersion: PLUGIN_VERSION });
       }
       return;
@@ -1626,7 +1651,7 @@ function onStatus(st: SessionStatus): void {
 function noteServerError(message: string): void {
   lastServerError = message;
   process.stderr.write(`bridge channel: server error: ${message}\n`);
-  if (CLOSE_OWNED_ERRORS.has(message)) return;
+  if (CLOSE_OWNED_ERRORS.has(message) || CLOSE_OWNED_ERROR_PREFIXES.includes(message.split(": ")[0]!)) return;
   const now = Date.now();
   if (message === notifiedServerError && now - notifiedServerErrorAt <= SERVER_ERROR_NOTIFY_INTERVAL_MS) return;
   notifiedServerError = message;
@@ -1686,6 +1711,12 @@ function onStopped(stop: SessionStop): void {
   lastClose = { cls, code: c?.code, reason: c?.reason, ...(c?.keyDeleted !== undefined ? { keyDeleted: c.keyDeleted } : {}) };
   // A revoked or locked installation: a login (here or in another window) writes new files.
   if (c?.reason === "installation revoked" || c?.reason === "installation locked") waitingFor = "files";
+  // RFC-028 D2: this window is no longer the gateway, so a plain /einweave:connect (or the next start)
+  // must not ask for the lease again and sit in "gateway in use" behind the one that took it.
+  if (cls === "gateway-taken-over" && connectionKind === "gateway") {
+    connectionKind = "session";
+    writeConnectKind(STATE_DIR, SESSION_KEY, "session");
+  }
   const why = describeClose(cls, c?.code, c?.reason, { keyDeleted: c?.keyDeleted, myVersion: PLUGIN_VERSION });
   process.stderr.write(`bridge channel: not reconnecting — ${why}\n`);
   feedStatus("stopped", why);
@@ -1727,6 +1758,9 @@ function rekeyTo(conversationId: string): boolean {
   // The new conversation's own connect choice wins; else it carries on as this window was.
   wantConnected = readConnectState(STATE_DIR, SESSION_KEY) ?? wantConnected;
   writeConnectState(STATE_DIR, SESSION_KEY, wantConnected);
+  // Same for the kind (RFC-028 D1): the new conversation's own declaration wins; else this window's carries on.
+  connectionKind = readConnectKind(STATE_DIR, SESSION_KEY) ?? connectionKind;
+  writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
   myContextId = "";
   // A superseded/standby episode belonged to the old conversation's session.
   superseded = false;
@@ -2588,7 +2622,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "connect",
       description:
-        "Connect this session to Bridge. Idempotent — calling it while already connected is a no-op on the socket, EXCEPT takeover:true against a connection that is up but did not actually claim this session's id, which reopens the socket to retry. Persists across restarts until disconnect is called. Optionally set a display label at the same time (applied before the connect handshake, so the very first auth frame already carries it). Pass takeover:true to claim the session lock from another window of this session (equal-or-newer, or a window that superseded this one) — the other window is told and stops.",
+        "Connect this session to Bridge. Idempotent — calling it while already connected as the same kind is a no-op on the socket; a different kind reconnects as that kind. Persists across restarts until disconnect is called. Optionally set a display label at the same time (applied before the connect handshake, so the very first auth frame already carries it), and kind (session | gateway). Pass takeover:\"lock\" to claim the session lock from another window of this session (equal-or-newer, or a window that superseded this one) — the other window is told and stops; takeover:\"gateway\" (with kind gateway) moves the agent's gateway to this window.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2596,9 +2630,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "Optional display name to set at connect time.",
           },
+          kind: {
+            type: "string",
+            enum: ["session", "gateway"],
+            description:
+              "What this window is to the agent (RFC-028): \"session\" (default) is a work session -- it gets the threads it holds, and unheld work in its scope while no gateway is live; \"gateway\" is the agent's one triage connection and gets all unheld work. Persists for this session across restarts. Omitted: the kind it already has.",
+          },
           takeover: {
-            type: "boolean",
-            description: "Claim the session lock from another window, even one running an equal or newer plugin version, or the one that superseded this window.",
+            type: "string",
+            enum: ["lock", "gateway"],
+            description:
+              "\"lock\": claim the session lock from another window of this session, even one running an equal or newer plugin version, or the one that superseded this window. \"gateway\": move the agent's gateway from a live gateway to this window (needs kind \"gateway\"; the old gateway is told and stops being one).",
           },
         },
       },
@@ -3723,7 +3765,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // RFC-017 D3: the ONE way a superseded window resumes. Clearing it here (an
         // explicit person action) is what lets connectUnlessDuplicate proceed at all —
         // its own guard refuses every automatic path.
-        const takeover = args.takeover === true;
+        // `takeover` names WHAT is taken: the session lock of this conversation (another window), or
+        // the agent's gateway (RFC-028 D2). `true` is the pre-0.31 spelling of "lock".
+        const takeoverArg = args.takeover === true ? "lock" : args.takeover;
+        if (takeoverArg !== undefined && takeoverArg !== false && takeoverArg !== "lock" && takeoverArg !== "gateway") {
+          throw new Error(`takeover must be "lock" (claim this session's lock from another window) or "gateway" (move the agent's gateway here), got ${JSON.stringify(args.takeover)}.`);
+        }
+        const takeover = takeoverArg === "lock";
+        const gatewayTakeover = takeoverArg === "gateway";
+        if (args.kind !== undefined && args.kind !== "session" && args.kind !== "gateway") {
+          throw new Error(`kind must be "session" (a work session) or "gateway" (the agent's triage connection), got ${JSON.stringify(args.kind)}.`);
+        }
+        const wantedKind: ConnectKind = (args.kind as ConnectKind | undefined) ?? (gatewayTakeover ? "gateway" : connectionKind);
+        if (gatewayTakeover && wantedKind !== "gateway") {
+          return { content: [{ type: "text", text: 'takeover:"gateway" moves the agent\'s gateway to this window, so it needs kind "gateway" (a work session is not the gateway).' }] };
+        }
+        const kindChanged = wantedKind !== connectionKind;
+        connectionKind = wantedKind;
+        if (kindChanged) kindExplicitlySet = true; // like intentExplicitlySet: startup must not overwrite this
         if (takeover) superseded = false;
 
         wantConnected = true;
@@ -3735,6 +3794,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // before it settles would otherwise write under FALLBACK_SESSION_KEY.
         if (sessionKeyReady) await sessionKeyReady;
         writeConnectState(STATE_DIR, SESSION_KEY, true);
+        writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
 
         const problem = creds.configError();
         if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
@@ -3746,7 +3806,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // socket to "reconnect" would restart a connection that does not need it. Anything
         // else (a backoff in progress, a stop, standing by) is replaced by a fresh Session:
         // the person asked, so it is a new episode — a refusal that repeats is answered again.
-        if (!authenticated || takeover) {
+        // A different kind is a different auth frame: the socket is replaced, never patched.
+        const reopen = !authenticated || kindChanged;
+        if (reopen || takeover) {
           // A PLAIN connect cannot resume a superseded window; saying "connecting" would be
           // dishonest. `takeover` already cleared `superseded` above.
           if (superseded) {
@@ -3759,8 +3821,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           reconnectAttempt = 0;
           resetRefusalEpisode();
           last4001At = null;
-          if (!(authenticated && takeover)) {
-            const decided = await openSession({ takeover });
+          if (reopen) {
+            const decided = await openSession({ takeover, gatewayTakeover });
             // A PLAIN connect never takes a lock another window holds: say so, not "connecting".
             if (decided === "standby" && !takeover) {
               return {
@@ -3775,7 +3837,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           }
         }
         return {
-          content: [{ type: "text", text: authenticated ? "connected" : "connecting" }],
+          content: [{ type: "text", text: `${authenticated ? "connected" : "connecting"}${connectionKind === "gateway" ? " (gateway)" : ""}` }],
         };
       }
 
@@ -3930,7 +3992,14 @@ if (!intentExplicitlySet) {
   wantConnected = readConnectState(STATE_DIR, SESSION_KEY)
     ?? (process.env.EINWEAVE_AUTOCONNECT === "1");
 }
-sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), STATE_SWEEP_MAX_AGE_MS);
+// RFC-028 D1: the launch environment is an explicit statement (claudeb --gateway), then what this
+// key declared last, else a work session. A `connect` answered in the pre-settle window already
+// chose; it must not be overwritten by this read.
+if (!kindExplicitlySet) {
+  const fromEnv = process.env.EINWEAVE_CONNECTION_KIND;
+  connectionKind = fromEnv === "gateway" || fromEnv === "session" ? fromEnv : readConnectKind(STATE_DIR, SESSION_KEY) ?? "session";
+}
+sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), STATE_SWEEP_MAX_AGE_MS, connectKindFileFor(STATE_DIR, SESSION_KEY));
 // The one line someone debugging a lost context will need.
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`
