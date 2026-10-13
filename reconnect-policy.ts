@@ -66,40 +66,40 @@ export function describeClose(
     case "credential":
       switch (code) {
         case 4001:
-          return `Bridge refused this session's access token (${tail}) — a new one is minted; if this keeps happening, run /bridge:login`;
+          return `Bridge refused this session's access token (${tail}) — a new one is minted; if this keeps happening, run /einweave:login`;
         case 4003:
-          return `agent deactivated or workspace archived (${tail}) — retrying slowly; an admin can reactivate it, otherwise run /bridge:login`;
+          return `agent deactivated or workspace archived (${tail}) — retrying slowly; an admin can reactivate it, otherwise run /einweave:login`;
         default:
-          return `Bridge refused this session's credential (${tail}) — retrying slowly; if this keeps happening, run /bridge:login`;
+          return `Bridge refused this session's credential (${tail}) — retrying slowly; if this keeps happening, run /einweave:login`;
       }
     case "expired":
       return `access token expired (${tail}) — refreshing`;
     case "evicted":
       return `this session was evicted to make room under the agent's live-session cap (${tail}) — reconnecting with a new session`;
     case "revoked":
-      if (reason === "session revoked") return `this session was revoked in Bridge (${tail}) — /bridge:connect starts a new session`;
+      if (reason === "session revoked") return `this session was revoked in Bridge (${tail}) — /einweave:connect starts a new session`;
       if (reason === "installation revoked")
-        return `this machine was signed out of Bridge (${tail}) — run /bridge:login to connect it again`;
+        return `this machine was signed out of Bridge (${tail}) — run /einweave:login to connect it again`;
       if (reason === "installation locked")
-        return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail})${opts.keyDeleted ? "; its key was deleted here" : ""} — check this machine, then run /bridge:login to re-enrol`;
-      return `token revoked (${tail}) — run /bridge:login, then /bridge:connect`;
+        return `credential copy detected — Bridge LOCKED this machine's sign-in because a copy of its credential was used somewhere else (${tail})${opts.keyDeleted ? "; its key was deleted here" : ""} — check this machine, then run /einweave:login to re-enrol`;
+      return `token revoked (${tail}) — run /einweave:login, then /einweave:connect`;
     case "superseded": {
       const who = opts.supersededBy ? describeHolder(opts.supersededBy) : "another window";
       // Finding 6: only a genuinely NEWER holder gets the update prompt — equal, older or
       // unknown (no record, or a version this build cannot read) is a plain takeover
-      // (a person's own /bridge:connect takeover, possibly onto an older window on
+      // (a person's own /einweave:connect takeover, possibly onto an older window on
       // purpose), so telling the person to update would be wrong.
       if (opts.myVersion && isNewerThan(opts.supersededBy?.version, opts.myVersion)) {
-        return `Bridge moved to a newer plugin in ${who} (${tail}) — /reload-plugins here to update this window; /bridge:connect takeover to move Bridge back`;
+        return `Bridge moved to a newer plugin in ${who} (${tail}) — /reload-plugins here to update this window; /einweave:connect takeover to move Bridge back`;
       }
       return opts.supersededBy
-        ? `another window took over Bridge (${who}) (${tail}) — /bridge:connect takeover moves it back`
-        : `another window took over Bridge (${tail}) — /bridge:connect takeover moves it back`;
+        ? `another window took over Bridge (${who}) (${tail}) — /einweave:connect takeover moves it back`
+        : `another window took over Bridge (${tail}) — /einweave:connect takeover moves it back`;
     }
     case "too-old":
       return `this plugin is too old for Bridge (${tail}) — ${UPDATE_HOWTO}`;
     case "session-in-use":
-      return `this session is already connected from another process (${tail}) — /bridge:status shows which; /bridge:connect takeover moves it here`;
+      return `this session is already connected from another process (${tail}) — /einweave:status shows which; /einweave:connect takeover moves it here`;
     default:
       return `connection closed (${tail})`;
   }

@@ -4,7 +4,7 @@
  * second terminal pane.
  *
  * WHY IT EXISTS. The host's window cuts an incoming message to a short preview and
- * shows an outgoing one as `Called plugin:bridge:bridge` with no text. Nothing this
+ * shows an outgoing one as `Called plugin:einweave:einweave` with no text. Nothing this
  * plugin puts in a notification changes that. `tail` is where a person reads Bridge
  * messages in full, and this module is what feeds it.
  *
@@ -166,9 +166,9 @@ export function feedContextName(sessionKey: string): string {
   return sessionKey.replace(/[^A-Za-z0-9._-]/g, "_") || "session";
 }
 
-/** `<stateDir>/bin/bridge-tail` — a stable path, so a shell alias survives plugin updates. */
+/** `<stateDir>/bin/einweave-tail` — a stable path, so a shell alias survives plugin updates. */
 export function launcherPath(stateDir: string): string {
-  return join(stateDir, "bin", "bridge-tail");
+  return join(stateDir, "bin", "einweave-tail");
 }
 
 const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;

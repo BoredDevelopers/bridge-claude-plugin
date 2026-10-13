@@ -63,7 +63,7 @@ const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).
 // Same default as the server repo's scripts/run-tests.ts, so a developer who
 // has that suite working already has this one working.
 const ADMIN_URL =
-  process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+  process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://einweave:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
 
 /** Is there actually a Postgres behind ADMIN_URL? Probe, don't assume. */
 async function pgReachable(): Promise<boolean> {
@@ -186,7 +186,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/einweave-agent-sdk/core/index.js");
       const { randomB64url } = await import("./key-fixtures");
       const clockOther = new Clock();
-      const tc = new TokenClient({ clock: clockOther, clientId: "bridge-claude-plugin" });
+      const tc = new TokenClient({ clock: clockOther, clientId: "einweave-claude-plugin" });
       const meta = await tc.discover(URL_);
       const { signer: signerOther } = await generateSoftwareKey();
       const enrolled = await tc.enrolWithKey(meta, signerOther, { enrolmentKey: KEY_OTHER, installationName: "inbound-routing test" });

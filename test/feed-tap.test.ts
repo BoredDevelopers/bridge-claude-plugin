@@ -129,7 +129,7 @@ describe("launcher", () => {
     try {
       const path = writeLauncher(dir, "/plugins/it's here/0.27.0");
       expect(path).toBe(launcherPath(dir));
-      expect(path).toBe(join(dir, "bin", "bridge-tail"));
+      expect(path).toBe(join(dir, "bin", "einweave-tail"));
       expect(statSync(path).mode & 0o777).toBe(0o700);
       const script = readFileSync(path, "utf8");
       expect(script.startsWith("#!/bin/sh\n")).toBe(true);
@@ -139,7 +139,7 @@ describe("launcher", () => {
       expect(statSync(join(dir, "bin")).mode & 0o777).toBe(0o700);
       // Rewriting (the next start, or a second window) leaves one file and no temp behind.
       writeLauncher(dir, "/plugins/next/0.28.0");
-      expect(readdirSync(join(dir, "bin"))).toEqual(["bridge-tail"]);
+      expect(readdirSync(join(dir, "bin"))).toEqual(["einweave-tail"]);
       expect(readFileSync(path, "utf8")).toContain("/plugins/next/0.28.0/");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -343,7 +343,7 @@ describe("a running plugin serves its feed", () => {
     expect(statSync(rec.feed).mode & 0o777).toBe(0o600);
     expect(statSync(join(rec.feed, "..")).mode & 0o777).toBe(0o700);
     // The @handle from the authenticated frame, not the display name.
-    expect(hello).toMatchObject({ v: 1, software_id: "bridge-claude-plugin", label: "feed-test", agent: { id: "bellman-id", handle: "bellman" } });
+    expect(hello).toMatchObject({ v: 1, software_id: "einweave-claude-plugin", label: "feed-test", agent: { id: "bellman-id", handle: "bellman" } });
   }, 30_000);
 
   test("an inbound message reaches the feed IN FULL, with the channel's name, stripped", async () => {

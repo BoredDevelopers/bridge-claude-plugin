@@ -31,7 +31,7 @@ const asEntry = (m: Inbound): Entry => ({ kind: "message", id: m.id, redelivery:
 /** The host's rendering of a channel notification (measured shape, delivery/tags.ts). */
 function hostTag(r: Rendered): string {
   const attrs = Object.entries(r.meta).map(([k, v]) => `${k}="${v}"`).join(" ");
-  return `<channel source="plugin:bridge:bridge" ${attrs}>\n${r.content}\n</channel>`;
+  return `<channel source="plugin:einweave:einweave" ${attrs}>\n${r.content}\n</channel>`;
 }
 
 function harness(over: Partial<AdapterDeps> = {}) {

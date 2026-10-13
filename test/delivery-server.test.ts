@@ -166,7 +166,7 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     const n = lines(p).find((m) => m.method === "notifications/claude/channel" && m.params?.meta?.message_id === id);
     if (!n) return null;
     const attrs = Object.entries(n.params.meta).map(([k, v]) => `${k}="${v}"`).join(" ");
-    return `<channel source="plugin:bridge:bridge" ${attrs}>\n${n.params.content}\n</channel>`;
+    return `<channel source="plugin:einweave:einweave" ${attrs}>\n${n.params.content}\n</channel>`;
   };
   async function runHook(prompt: string) {
     const env: Record<string, string> = { ...(process.env as Record<string, string>), EINWEAVE_STATE_DIR: dir, CLAUDE_PID: String(process.pid) };
@@ -338,7 +338,7 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     const rid = nextId++;
     send(a, { jsonrpc: "2.0", id: rid, method: "tools/call", params: { name: "read_deliveries", arguments: {} } });
     await waitFor(() => lines(a).some((m) => m.id === rid), 8000, "read_deliveries on A");
-    expect(lines(a).find((m) => m.id === rid).result.content[0].text).toMatch(/session has stopped \(superseded\).*\/bridge:connect takeover/);
+    expect(lines(a).find((m) => m.id === rid).result.content[0].text).toMatch(/session has stopped \(superseded\).*\/einweave:connect takeover/);
   }, 90_000);
 
   test("startup removes what dead processes left: migration temps (credential bytes) and half-bound control sockets", async () => {

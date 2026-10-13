@@ -372,7 +372,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
     expect(r.tookOver, "this must be a TAKEOVER line, not a plain first acquisition").toBe(true);
     expect(r.lock.pid, "the record now names the new (winning) process").not.toBe(process.pid);
     expect(r.lock.version).toBe(MY_VERSION);
-    expect(r.lock.software).toBe("bridge-claude-plugin");
+    expect(r.lock.software).toBe("einweave-claude-plugin");
     // finding 5/10: the TAKEOVER write path (tmp + rename), not just the first-ever
     // O_EXCL acquire, must also land at 0600.
     expect(r.lockMode).toBe(0o600);
@@ -933,11 +933,11 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
 
       // B is OLDER, so this is a plain takeover notice, not the "/reload-plugins" one.
       const noticeDeadline = Date.now() + 5000;
-      while (Date.now() < noticeDeadline && !noticesA.some((c) => c.includes("/bridge:connect takeover moves it back"))) {
+      while (Date.now() < noticeDeadline && !noticesA.some((c) => c.includes("/einweave:connect takeover moves it back"))) {
         await Bun.sleep(30);
       }
       expect(
-        noticesA.some((c) => c.includes("/bridge:connect takeover moves it back")),
+        noticesA.some((c) => c.includes("/einweave:connect takeover moves it back")),
         "equal/older holder — plain takeover wording, not /reload-plugins"
       ).toBe(true);
     } finally {

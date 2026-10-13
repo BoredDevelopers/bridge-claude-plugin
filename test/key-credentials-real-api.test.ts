@@ -80,7 +80,7 @@ const PLUGIN_VERSION: string = pkg.version;
 const API_DIR = process.env.EINWEAVE_API_DIR ?? "";
 const HAVE_SERVER = !!API_DIR && (await Bun.file(join(API_DIR, "src/index.ts")).exists().catch(() => false));
 // Same default as the server repo's scripts/run-tests.ts.
-const ADMIN_URL = process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://bridge:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
+const ADMIN_URL = process.env.EINWEAVE_TEST_PG_ADMIN_URL ?? "postgres://einweave:bridge-test-not-a-secret@127.0.0.1:5433/bridge";
 async function pgReachable(): Promise<boolean> {
   try {
     const probe = new Bun.SQL(ADMIN_URL);
@@ -824,7 +824,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
     }
   }, 90_000);
 
-  test("an owner revokes the session: 4008 \"session revoked\" → no mint of its own → /bridge:connect mints with reconnect=true and opens a NEW session", async () => {
+  test("an owner revokes the session: 4008 \"session revoked\" → no mint of its own → /einweave:connect mints with reconnect=true and opens a NEW session", async () => {
     const dir = tmp("keys-real-revoke-");
     const p = await plugin(api.url, dir, { EINWEAVE_ENROLMENT_KEY: enrolmentKey(), EINWEAVE_SESSION_KEY: "revoke-s1" });
     try {
@@ -834,7 +834,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       const del = await human(api.url, "DELETE", `/api/agents/${seed.agentId}/installations/${inst}/sessions/${s.id}`);
       expect(del.status).toBe(200);
       expect(await until(() => p.stderr().includes("WebSocket closed (4008 session revoked)"), 10_000), p.stderr()).toBe(true);
-      expect(await until(() => p.notices.some((n) => n.includes("/bridge:connect")), 10_000), JSON.stringify(p.notices)).toBe(true);
+      expect(await until(() => p.notices.some((n) => n.includes("/einweave:connect")), 10_000), JSON.stringify(p.notices)).toBe(true);
       // Blocked: nothing re-opens the session on its own.
       await Bun.sleep(3000);
       expect(await p.connected()).toBe(false);

@@ -169,7 +169,7 @@ describe("close codes", () => {
     });
   }, 40_000);
 
-  test("4008 (token revoked) stops — and /bridge:connect tries again", async () => {
+  test("4008 (token revoked) stops — and /einweave:connect tries again", async () => {
     const stub = startStub({ code: 4008, reason: "token revoked" });
     await withPlugin(stub, async (client) => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
@@ -182,20 +182,20 @@ describe("close codes", () => {
     });
   }, 40_000);
 
-  test("RFC-017 D3: 4008 'session superseded' stops, a plain /bridge:connect does NOT retry, only takeover:true does", async () => {
+  test("RFC-017 D3: 4008 'session superseded' stops, a plain /einweave:connect does NOT retry, only takeover:true does", async () => {
     const stub = startStub({ code: 4008, reason: "session superseded: a newer Bridge plugin took over in another window of this session" });
     await withPlugin(stub, async (client, notices) => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
       await Bun.sleep(300);
       const s = await status(client);
-      expect(s.websocket).toContain("/bridge:connect takeover");
+      expect(s.websocket).toContain("/einweave:connect takeover");
       expect(s.websocket).not.toContain("reconnect attempt");
-      expect(notices().some((c) => c.includes("Bridge disconnected this session") && c.includes("/bridge:connect takeover"))).toBe(true);
+      expect(notices().some((c) => c.includes("Bridge disconnected this session") && c.includes("/einweave:connect takeover"))).toBe(true);
       // A plain connect (no takeover) must NOT mint/auth again — the whole point of D3's
       // "never auto-reconnects, only takeover resumes". Finding 4: it must also say so
       // honestly rather than claim "connecting", which would never actually happen.
       const plain: any = await client.callTool({ name: "connect", arguments: {} });
-      expect(plain.content[0].text).toContain("/bridge:connect takeover");
+      expect(plain.content[0].text).toContain("/einweave:connect takeover");
       expect(plain.content[0].text).not.toBe("connecting");
       await Bun.sleep(1_000);
       expect(stub.auths()).toBe(1);
@@ -206,7 +206,7 @@ describe("close codes", () => {
   }, 40_000);
 
   test("RFC-017 D5/D6: 4008 'client too old' stops (never reconnects on its own), and says the update instruction", async () => {
-    const stub = startStub({ code: 4008, reason: "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins" });
+    const stub = startStub({ code: 4008, reason: "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins" });
     await withPlugin(stub, async (client) => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
       await Bun.sleep(300);
@@ -215,7 +215,7 @@ describe("close codes", () => {
       expect(s.websocket).toContain("/reload-plugins");
       expect(s.websocket).not.toContain("reconnect attempt");
       // Unlike "superseded", too-old is not gated by the extra `superseded` flag — a
-      // plain /bridge:connect is free to try again (and would be refused again by a
+      // plain /einweave:connect is free to try again (and would be refused again by a
       // real server; the stub here just accepts every later auth, same as the
       // existing 4008 token-revoked test above).
       await client.callTool({ name: "connect", arguments: {} });
@@ -224,7 +224,7 @@ describe("close codes", () => {
   }, 40_000);
 
   test("RFC-017 D6: 'client version withdrawn' (blocked) maps to the SAME too-old stop, not a new class", async () => {
-    const stub = startStub({ code: 4008, reason: "client version withdrawn: open /plugin → Installed → bridge → Update now, then /reload-plugins" });
+    const stub = startStub({ code: 4008, reason: "client version withdrawn: open /plugin → Installed → einweave → Update now, then /reload-plugins" });
     await withPlugin(stub, async (client) => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
       await Bun.sleep(300);
@@ -234,7 +234,7 @@ describe("close codes", () => {
     });
   }, 40_000);
 
-  test("/bridge:connect during a backoff cancels the pending retry — one socket, not two", async () => {
+  test("/einweave:connect during a backoff cancels the pending retry — one socket, not two", async () => {
     // 4007, so the pending retry is 15–30s out: a wide, race-free window.
     const stub = startStub({ code: 4007, reason: "Too many sessions" });
     await withPlugin(stub, async (client) => {
@@ -315,7 +315,7 @@ describe("RFC-017 D3: takeover then a later ordinary close", () => {
       expect(await until(() => stub.auths() >= 1, 15_000)).toBe(true);
       await Bun.sleep(300);
       const stopped = await status(client);
-      expect(stopped.websocket).toContain("/bridge:connect takeover");
+      expect(stopped.websocket).toContain("/einweave:connect takeover");
 
       // The ONE way this window resumes (D3): an explicit takeover.
       const authed = stub.onceAuthenticated();
@@ -331,7 +331,7 @@ describe("RFC-017 D3: takeover then a later ordinary close", () => {
       // scheduleReconnect()/connectWs() directly, which never reads `superseded` at
       // all, so this test stays green even with that line deleted (checked by hand).
       // That line's real job is downstream of THIS reconnect: it is what lets a LATER
-      // restartConnection() (a fresh /bridge:login, or the credential watch noticing
+      // restartConnection() (a fresh /einweave:login, or the credential watch noticing
       // files reappear — server.ts's `onLoggedIn` / `credentialWatch`) proceed at all;
       // without it, `connectUnlessDuplicate()` from either path returns immediately
       // because `superseded` is still stuck `true`. Kept as coverage for "a takeover

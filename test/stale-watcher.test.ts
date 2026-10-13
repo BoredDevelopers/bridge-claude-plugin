@@ -165,7 +165,7 @@ describe("findInstalledVersion", () => {
     expect(findInstalledVersion({ CLAUDE_CODE_PLUGIN_CACHE_DIR: dir })).toBeUndefined();
   });
 
-  test("the highest semver among every bridge@* entry, across scopes", () => {
+  test("the highest semver among every einweave@* entry, across scopes", () => {
     const dir = tmp();
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     writeFileSync(
@@ -173,7 +173,7 @@ describe("findInstalledVersion", () => {
       JSON.stringify({
         version: 2,
         plugins: {
-          "bridge@bored-marketplace": [
+          "einweave@einweave": [
             { scope: "user", installPath: "/a", version: "0.25.0" },
             { scope: "project", installPath: "/b", version: "0.26.0" },
           ],
@@ -197,7 +197,7 @@ describe("findInstalledVersion", () => {
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     writeFileSync(
       join(dir, "installed_plugins.json"),
-      JSON.stringify({ plugins: { "bridge@bored-marketplace": [{ version: "not-a-version" }] } })
+      JSON.stringify({ plugins: { "einweave@einweave": [{ version: "not-a-version" }] } })
     );
     expect(findInstalledVersion({ CLAUDE_CODE_PLUGIN_CACHE_DIR: dir })).toBeUndefined();
   });
@@ -210,11 +210,11 @@ describe("findInstalledVersion", () => {
     mkdirSync(join(configDir, "plugins"), { recursive: true });
     writeFileSync(
       join(configDir, "plugins", "installed_plugins.json"),
-      JSON.stringify({ plugins: { "bridge@bored-marketplace": [{ version: "0.20.0" }] } })
+      JSON.stringify({ plugins: { "einweave@einweave": [{ version: "0.20.0" }] } })
     );
     writeFileSync(
       join(cacheDir, "installed_plugins.json"),
-      JSON.stringify({ plugins: { "bridge@bored-marketplace": [{ version: "0.30.0" }] } })
+      JSON.stringify({ plugins: { "einweave@einweave": [{ version: "0.30.0" }] } })
     );
     expect(
       findInstalledVersion({ CLAUDE_CODE_PLUGIN_CACHE_DIR: cacheDir, CLAUDE_CONFIG_DIR: configDir })
@@ -227,7 +227,7 @@ describe("findInstalledVersion", () => {
     mkdirSync(join(configDir, "plugins"), { recursive: true });
     writeFileSync(
       join(configDir, "plugins", "installed_plugins.json"),
-      JSON.stringify({ plugins: { "bridge@bored-marketplace": [{ version: "0.20.0" }] } })
+      JSON.stringify({ plugins: { "einweave@einweave": [{ version: "0.20.0" }] } })
     );
     expect(findInstalledVersion({ CLAUDE_CONFIG_DIR: configDir })).toBe("0.20.0");
   });

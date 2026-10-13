@@ -15,7 +15,7 @@
  * is closed on the WRITE side: `writeConnectState` checks the CURRENT file first and
  * refuses to clobber content that PARSES as a JSON record declaring a `format` this
  * store does not know (a genuinely newer window's own encoding), rather than blindly
- * overwriting. Losing a stale connect-intent flag is recoverable (/bridge:connect); a
+ * overwriting. Losing a stale connect-intent flag is recoverable (/einweave:connect); a
  * newer window's own encoding must not be destroyed by an older one passing through.
  * Plain garbage (unparseable, or JSON with no higher `format`) is NOT that — it is
  * corrupt, not a newer plugin's file, and must not wedge this store shut forever: it is

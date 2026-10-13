@@ -458,7 +458,7 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
     mkdirSync(join(dir, "locks"), { recursive: true, mode: 0o700 });
     writeFileSync(
       join(dir, "locks", `${key}.lock`),
-      JSON.stringify({ format: 0, pid: holder.pid, procStart: procStartOf(holder.pid), sessionKey: key, at: new Date().toISOString(), software: "bridge-claude-plugin", version: "99.0.0" }),
+      JSON.stringify({ format: 0, pid: holder.pid, procStart: procStartOf(holder.pid), sessionKey: key, at: new Date().toISOString(), software: "einweave-claude-plugin", version: "99.0.0" }),
       { mode: 0o600 }
     );
 
@@ -666,7 +666,7 @@ describe("connect-on-demand: REST tool guard", () => {
       expect(result?.isError).not.toBe(true);
       const text = (result?.content as any)?.[0]?.text ?? "";
       expect(text).toContain("not configured");
-      expect(text).toContain("/bridge:configure");
+      expect(text).toContain("/einweave:configure");
     } finally {
       await client.close().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
@@ -698,7 +698,7 @@ describe("connect-on-demand: REST tool guard", () => {
         await Bun.sleep(100);
       }
       expect(text).toContain("not connected");
-      expect(text).toContain("/bridge:connect");
+      expect(text).toContain("/einweave:connect");
     } finally {
       await client.close().catch(() => {});
       stub.stop();
@@ -770,7 +770,7 @@ describe("connect-on-demand: REST tool guard", () => {
  * ALWAYS-ON — unlike the 9 REST tools above, `status` is NOT gated by
  * requireBridge(): it must answer with the connection/intent snapshot even
  * when unconfigured or idle, since that snapshot is precisely how a session
- * (or the /bridge:status skill) tells those two states apart. Returns text
+ * (or the /einweave:status skill) tells those two states apart. Returns text
  * containing a JSON object: `{ ...connectionStatus(), wantConnected,
  * configured, label }`.
  */

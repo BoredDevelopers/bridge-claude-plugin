@@ -115,14 +115,14 @@ const GRANT_ENROLMENT_KEY = "urn:einweave:params:oauth:grant-type:enrolment-key"
 const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 const ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const SKEW_S = 300;
-const UPDATE_PLUGIN_HINT = "update the Bridge plugin and run /bridge:login";
+const UPDATE_PLUGIN_HINT = "update the Bridge plugin and run /einweave:login";
 const RETIRED_RFC014_GRANTS = new Set(["refresh_token", "urn:einweave:params:oauth:grant-type:session"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** C4. */
 const ATTEMPT_RE = /^[A-Za-z0-9_-]{22,128}$/;
 const SESSION_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 /** The plugin's public client (AGENT_AUTH_CLIENTS). */
-export const STUB_CLIENT_ID = "bridge-claude-plugin";
+export const STUB_CLIENT_ID = "einweave-claude-plugin";
 /** RFC 7636 §4.1. */
 const PKCE_VALUE_RE = /^[A-Za-z0-9._~-]{43,128}$/;
 const JKT_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -524,7 +524,7 @@ export function createAuthCore(opts: StubOptions = {}) {
           // nothing below this line runs (no chain read, no lock, no session).
           if ((opts.tooOldMints ?? 0) > 0) {
             opts.tooOldMints!--;
-            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: bridge-claude-plugin >= 0.26.0 required — open /plugin → Installed → bridge → Update now, then /reload-plugins", 400);
+            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: einweave-claude-plugin >= 0.26.0 required — open /plugin → Installed → einweave → Update now, then /reload-plugins", 400);
           }
           if ((opts.rateLimitMints ?? 0) > 0) {
             opts.rateLimitMints!--;
@@ -752,7 +752,7 @@ export function startAuthStub(opts: StubOptions = {}) {
           // RFC-027 §5, as the server: a v1 frame (no `v: 2`, or a `since` cursor) is a client too old.
           if (f.v !== 2 || f.since !== undefined) {
             core.stats.refusals.push("ws:v1");
-            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins");
+            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
           }
           // RFC-028 D1, as the server: a connection declares its kind; the server never infers one.
           core.stats.authDeclared.push({ kind: f.kind, scope: f.scope, takeover: f.takeover });

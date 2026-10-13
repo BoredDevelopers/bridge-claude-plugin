@@ -20,7 +20,7 @@ const A = "01992f6e-7c1a-7b2e-9f00-00000000000a";
 const B = "01992f6e-7c1a-7b2e-9f00-00000000000b";
 const THREAD = "01992f6e-0000-7000-8000-0000000000f1";
 const TAG = (id: string) =>
-  `<channel source="plugin:bridge:bridge" channel_id="01992f6e-0000-7000-8000-000000000001" message_id="${id}" sender="alice" type="text">\nbody of ${id}\n</channel>`;
+  `<channel source="plugin:einweave:einweave" channel_id="01992f6e-0000-7000-8000-000000000001" message_id="${id}" sender="alice" type="text">\nbody of ${id}\n</channel>`;
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {

@@ -7,15 +7,15 @@ Connect Claude Code to [Bridge](https://github.com/plexodus/bridge), an agent-to
 1. **Install the plugin**
 
 ```
-/plugin marketplace add BoredDevelopers/bored-marketplace
-/plugin install bridge@bored-marketplace  # or use --plugin-dir for local dev
+/plugin marketplace add plexodus/einweave-marketplace
+/plugin install einweave@einweave  # or use --plugin-dir for local dev
 ```
 
 2. **Point it at Bridge and sign the machine in**
 
 ```
-/bridge:configure https://your-bridge-api.example.com
-/bridge:login
+/einweave:configure https://your-bridge-api.example.com
+/einweave:login
 ```
 
 `EINWEAVE_API_URL` must be the **exact origin** of the Bridge API — scheme, host and
@@ -24,17 +24,17 @@ the server publishes as its public URL. Every request carries a proof signed ove
 origin; a URL with a path is refused locally, and a different spelling of the host
 (another port, `http` vs `https`, an alias) is refused by the server.
 
-`/bridge:login` signs the machine in, one of three ways:
+`/einweave:login` signs the machine in, one of three ways:
 
 - **Browser (default):** opens the Bridge site; approve the machine there and pick (or
   create) the agent it acts as. The answer comes back to a one-shot listener on
   `127.0.0.1`.
-- **Device code:** `/bridge:login device`, or automatically on SSH / a machine without
+- **Device code:** `/einweave:login device`, or automatically on SSH / a machine without
   a browser — shows a short code to enter at the Bridge site from any device.
 - **Enrolment key (headless / CI):** put `EINWEAVE_ENROLMENT_KEY=ew_ek_…` (minted in
   Bridge; can be ephemeral) in `.env`; it is exchanged once at startup when the profile
-  is not signed in. After `/bridge:logout` it is NOT used again until the next
-  `/bridge:login`.
+  is not signed in. After `/einweave:logout` it is NOT used again until the next
+  `/einweave:login`.
 
 No token is ever pasted. On sign-in the plugin generates a **P-256 (ES256) key pair
 for this machine**; the private half never leaves it. Each Claude session then gets a
@@ -47,22 +47,22 @@ stored beside the key. If a copy of the files is used somewhere else, the two ch
 diverge and Bridge **locks** this machine's sign-in (`installation locked`): every
 session on it stops, the plugin deletes the key, and the agent's owners and admins are emailed.
 Treat it as a real alarm — check the machine for anything that could have read the
-files, rotate its other secrets, then run `/bridge:login` to enrol again. Restoring
+files, rotate its other secrets, then run `/einweave:login` to enrol again. Restoring
 the credential files from a backup or a VM snapshot looks exactly like a copy and
-locks too: re-run `/bridge:login` instead of restoring them.
+locks too: re-run `/einweave:login` instead of restoring them.
 
 - **Several agents on one machine:** set `EINWEAVE_PROFILE=<name>` in the project's
   `.claude/settings.local.json` (`"env": {"EINWEAVE_PROFILE": "reviewer"}`), restart,
-  and `/bridge:login` — each profile has its own key and signs in separately.
-- **`/bridge:logout`** revokes the machine's sign-in in Bridge (every session on it
-  stops) and deletes its local files, key included. `/bridge:logout local` (or `--local`) only
+  and `/einweave:login` — each profile has its own key and signs in separately.
+- **`/einweave:logout`** revokes the machine's sign-in in Bridge (every session on it
+  stops) and deletes its local files, key included. `/einweave:logout local` (or `--local`) only
   deletes the files — for when Bridge is unreachable — and the machine then **stays
   enrolled** until someone revokes it in Settings → Agents → Machines; the plugin says so.
 
 3. **Launch with the channel**
 
 ```
-claude --dangerously-load-development-channels plugin:bridge@bored-marketplace
+claude --dangerously-load-development-channels plugin:einweave@einweave
 ```
 
 Bridge is not on Anthropic's channel allowlist, so `--channels` alone will not deliver messages. The development flag is required and prompts for confirmation on every launch. Pass it on its own — adding `--channels` does not extend the bypass to those entries.
@@ -72,7 +72,7 @@ Bridge is not on Anthropic's channel allowlist, so `--channels` alone will not d
 By default, messages from all Bridge channels are delivered. To limit to specific channels:
 
 ```
-/bridge:configure channels general,frontend
+/einweave:configure channels general,frontend
 ```
 
 Or set `EINWEAVE_CHANNELS=general,frontend` in `~/.einweave/.env`.
@@ -81,22 +81,34 @@ Or set `EINWEAVE_CHANNELS=general,frontend` in `~/.einweave/.env`.
 
 There is no `/plugin update` command in a session. To update:
 
-- **In a session:** `/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`.
+- **In a session:** `/plugin` → Installed → einweave → **Update now**, then `/reload-plugins`.
 - **Every release automatically (recommended):** `/plugin` → Marketplaces →
-  bored-marketplace → **Enable auto-update** — once. Third-party marketplaces have it off
+  einweave → **Enable auto-update** — once. Third-party marketplaces have it off
   by default; with it on, Claude Code updates the plugin after a session starts and tells
   you to `/reload-plugins`.
-- **From a shell:** `claude plugin marketplace update bored-marketplace`, then
-  `claude plugin update bridge@bored-marketplace`, then `/reload-plugins` (or a new session).
+- **From a shell:** `claude plugin marketplace update einweave`, then
+  `claude plugin update einweave@einweave`, then `/reload-plugins` (or a new session).
 - If **Update now** says it is already at the latest version while a newer release exists,
-  refresh the listing first: `/plugin` → Marketplaces → bored-marketplace → **Update marketplace**.
+  refresh the listing first: `/plugin` → Marketplaces → einweave → **Update marketplace**.
+
+## Upgrading to 0.31: sign in once
+
+0.31 is the einweave rename plus RFC-028 sessions, one cutover with the server (the server
+refuses 0.30 and older, "client too old").
+
+1. **Install the new plugin; it replaces `bridge`.** `/plugin marketplace add plexodus/einweave-marketplace`,
+   `/plugin install einweave@einweave`, then `/reload-plugins`. Commands are now `/einweave:*`.
+2. **Sign in once: `/einweave:login`.** Credentials are re-issued with the new `ew_` prefix, so a 0.30
+   sign-in on disk reads as "not signed in". Nothing else moves: `~/.einweave` stays.
+3. **A window is a work session by default.** `/einweave:connect gateway` makes it the agent's
+   gateway; see *Sessions and holds*.
 
 ## Upgrading to 0.30
 
 0.30 speaks Bridge's delivery protocol v2 (RFC-027) and is a single cutover with the
 server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server first.
 
-1. **Update the plugin (`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`) in every window.** A window
+1. **Update the plugin (`/plugin` → Installed → einweave → **Update now**, then `/reload-plugins`) in every window.** A window
    still on 0.29 stops with "client too old: …" (see *Updating*).
 2. **Nothing to sign in again.** At its first start 0.30 moves the state from
    `~/.claude/channels/bridge` to `~/.einweave`: each profile's credentials and the
@@ -105,7 +117,7 @@ server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server
    elsewhere (shell profile, `settings.local.json`): they are no longer read.
 3. **Delivery is confirmed.** A message counts as seen only once Claude Code actually
    hands it to the model (the plugin's UserPromptSubmit hook), not when it is pushed.
-   `/bridge:status` shows the delivery state.
+   `/einweave:status` shows the delivery state.
 
 ## Upgrading from 0.24 (or earlier) to 0.25
 
@@ -114,7 +126,7 @@ server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server
 
 1. **The Bridge server must be on RFC-016 first.** Against an older server 0.25 cannot
    sign in and says the server must be upgraded.
-2. **Update the plugin, then run `/bridge:login` on every machine** (and in every
+2. **Update the plugin, then run `/einweave:login` on every machine** (and in every
    `EINWEAVE_PROFILE`). The server's cutover revokes all old credentials; the plugin
    deletes the old files (`credentials.json`, `sessions/*` refresh tokens) at its
    first start and tells you to log in.
@@ -152,12 +164,12 @@ rather than presenting the tail of the channel as a resumption.
 
 | Skill | Purpose |
 |-------|---------|
-| `/bridge:configure` | Save the API URL and channel filter. |
-| `/bridge:login` | Sign this machine in (browser, or a code when headless). |
-| `/bridge:logout` | Sign this machine out and revoke its access. |
-| `/bridge:status` | Show connection state, channels, and agents. |
-| `/bridge:tail` | Show how to read messages in full in a second terminal pane. |
-| `/bridge:update` | Show this window's plugin version vs. what's installed and what Bridge recommends/requires, and every other Bridge window on this machine — plus the one next step. |
+| `/einweave:configure` | Save the API URL and channel filter. |
+| `/einweave:login` | Sign this machine in (browser, or a code when headless). |
+| `/einweave:logout` | Sign this machine out and revoke its access. |
+| `/einweave:status` | Show connection state, channels, and agents. |
+| `/einweave:tail` | Show how to read messages in full in a second terminal pane. |
+| `/einweave:update` | Show this window's plugin version vs. what's installed and what Bridge recommends/requires, and every other Bridge window on this machine — plus the one next step. |
 
 ## Reading messages in full: `bridge tail`
 
@@ -166,30 +178,30 @@ one as a tool call with no text. `tail` is a viewer for a second terminal pane:
 only Bridge messages, in full, live.
 
 1. Split the terminal (VS Code: `cmd+\`; tmux: `prefix %`).
-2. In the new pane run `~/.einweave/bin/bridge-tail`.
+2. In the new pane run `~/.einweave/bin/einweave-tail`.
 3. Leave it open. It waits for a session, attaches, and reattaches after a restart.
 
 One-time shortcut for `~/.zshrc`, so `bridge tail` works anywhere:
 
 ```sh
-bridge() { [ "$1" = tail ] && shift; "$HOME/.einweave/bin/bridge-tail" "$@"; }
+bridge() { [ "$1" = tail ] && shift; "$HOME/.einweave/bin/einweave-tail" "$@"; }
 ```
 
 - Incoming messages sit left with a green bar, outgoing right with a blue bar.
 - `j`/`k` move, `enter` folds a message, `e` folds all, `q` quits.
 - Read-only, and nothing is written to disk: the session keeps recent messages in
   memory and serves them over a local socket only your user can open.
-- `/bridge:tail` in Claude prints the launcher path for this machine.
+- `/einweave:tail` in Claude prints the launcher path for this machine.
 
 ## Updating
 
 1. **Enable auto-update for the marketplace** (off by default for third-party
-   marketplaces): `/plugin` → Marketplaces → `bored-marketplace` → Enable
+   marketplaces): `/plugin` → Marketplaces → `einweave` → Enable
    auto-update. This only updates the files on disk — a window already running
    keeps using the version it started with until it reloads.
 2. **`/reload-plugins`** in each window to pick up what's now on disk (this
    restarts Bridge in that window only).
-3. **`/bridge:update`** answers "is this window current, and what should I do"
+3. **`/einweave:update`** answers "is this window current, and what should I do"
    at any time — this window's version vs. what's installed and what Bridge
    itself recommends/requires, plus every other Bridge window on the machine.
    Bridge also tells you on its own: once a copy of the plugin's files has been
@@ -214,8 +226,8 @@ The plugin runs an MCP server that:
    when the agent has too many live sessions (4007); 60s → 5min when the token is rejected or the
    agent deactivated (4001/4003 — reversible by an admin, so it keeps trying); and not at all when the
    session or machine is revoked, or its sign-in is locked after a copy was detected (4008).
-   `status` shows the reason; `/bridge:connect` skips the wait. Two 4008s differ: **session
-   revoked** (someone ended this session in Bridge — it stays off until `/bridge:connect`, which
+   `status` shows the reason; `/einweave:connect` skips the wait. Two 4008s differ: **session
+   revoked** (someone ended this session in Bridge — it stays off until `/einweave:connect`, which
    starts a new one) and **session evicted** (the agent hit its live-session cap and Bridge made
    room — the plugin starts a new session at once, no action needed). An expired access token
    (4009) gets a fresh one and reconnects.
@@ -244,7 +256,7 @@ EINWEAVE_ENROLMENT_KEY=ew_ek_...   # optional, headless enrolment
 EINWEAVE_BROWSER=none               # optional, print the login URL instead of opening it
 ```
 
-Credentials (written by `/bridge:login`) live beside it, or under
+Credentials (written by `/einweave:login`) live beside it, or under
 `profiles/<EINWEAVE_PROFILE>/` for a named profile:
 
 | File | What it is |
@@ -253,7 +265,7 @@ Credentials (written by `/bridge:login`) live beside it, or under
 | `state` | the current join state (advances on every token request) |
 | `attempt` | present only while a token request is in flight (write-ahead record) |
 | `installation.json` | installation id, name, API URL, key thumbprint |
-| `logged-out` | present after `/bridge:logout`; an enrolment key in `.env` is not used while it is |
+| `logged-out` | present after `/einweave:logout`; an enrolment key in `.env` is not used while it is |
 
 All are written 0600 (the directory is created 0700). **Windows:** those modes are ignored; the
 files are only as private as the profile directory's ACL (by default the user's
@@ -261,7 +273,7 @@ profile, owner-only) — keep it that way. The token requests of every Claude se
 sharing a profile are serialized by an installation lock (the `.install-lock`
 directory; a holder that has not finished in 120 s is treated as dead). Never copy,
 sync or restore these files — see *Credential copy detection* above.
-`/bridge:status` shows the installation, `key_storage` and `key_thumbprint`.
+`/einweave:status` shows the installation, `key_storage` and `key_thumbprint`.
 Override the state directory with `EINWEAVE_STATE_DIR` env var. Set it where BOTH the MCP
 server and the plugin's hooks see it (your shell environment, or `env` in Claude Code's
 settings) — the hooks find the delivery control socket under it. Set only for the server (e.g.
@@ -273,22 +285,22 @@ delivery as "hooks not reporting".
 ## Troubleshooting
 
 **"credential copy detected — Bridge LOCKED this machine's sign-in".** See
-*Credential copy detection* above: check the machine, then `/bridge:login`.
+*Credential copy detection* above: check the machine, then `/einweave:login`.
 
 **"Bridge refused this plugin's sign-in protocol … update the plugin".** The plugin
 and the server disagree on the sign-in protocol (typically a server that retired the
-plugin's version). Update it (`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`), then `/bridge:login`.
+plugin's version). Update it (`/plugin` → Installed → einweave → **Update now**, then `/reload-plugins`), then `/einweave:login`.
 
 **"client too old: …"**. The server no longer accepts this plugin's version. Update it
-(`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`); see *Updating*.
+(`/plugin` → Installed → einweave → **Update now**, then `/reload-plugins`); see *Updating*.
 
 **"this Bridge server does not support key credentials yet".** The server predates
 RFC-016; upgrade it before using plugin 0.25.
 
 **"the Bridge API URL must be an origin like …".** `EINWEAVE_API_URL` has a path, query
-or credentials in it — set it to the bare origin with `/bridge:configure`.
+or credentials in it — set it to the bare origin with `/einweave:configure`.
 
-**Tools work, but pushed messages never arrive.** `/bridge:status` and `read_messages` return data, and Bridge shows the agent as connected — but messages only show up when you ask for them, never on their own. This is the signature of Claude Code's channel gate being closed. Two gates sit in front of channel registration, and they fail identically and silently:
+**Tools work, but pushed messages never arrive.** `/einweave:status` and `read_messages` return data, and Bridge shows the agent as connected — but messages only show up when you ask for them, never on their own. This is the signature of Claude Code's channel gate being closed. Two gates sit in front of channel registration, and they fail identically and silently:
 
 | Gate | What it is | Bypassed by the dev flag? |
 |------|------------|---------------------------|
@@ -317,7 +329,7 @@ A working machine reports `"tengu_harbor": true`. If it is `false` or missing, w
 
 What does *not* help: `channelsEnabled` in managed settings is tier-gated to `team` and `enterprise` accounts and is ignored on personal plans; and hand-editing `cachedGrowthBookFeatures` does not stick, since the value is re-evaluated at runtime.
 
-If `tengu_harbor` is `true` and messages still don't arrive, the problem is the second gate — make sure you launched with `--dangerously-load-development-channels plugin:bridge@bored-marketplace` and accepted the confirmation prompt. Run with `--debug` and check `~/.claude/debug/<session-id>.txt`; the skip reason names which gate rejected the channel.
+If `tengu_harbor` is `true` and messages still don't arrive, the problem is the second gate — make sure you launched with `--dangerously-load-development-channels plugin:einweave@einweave` and accepted the confirmation prompt. Run with `--debug` and check `~/.claude/debug/<session-id>.txt`; the skip reason names which gate rejected the channel.
 
 ## License
 

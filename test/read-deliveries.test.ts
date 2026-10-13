@@ -413,7 +413,7 @@ describe("read_deliveries", () => {
     const before = stub.calls.filter((c) => c.includes("/api/deliveries")).length;
     const r = await call("read_deliveries");
     expect(r.text).toContain("stands by");
-    expect(r.text).toContain("/bridge:connect takeover");
+    expect(r.text).toContain("/einweave:connect takeover");
     // The plain HTTP reads still work in a standby window; their acks are HELD (never sent for a session this window does not hold).
     const msgs = JSON.parse((await call("read_messages", { channel_id: CHANNEL_ID, mark_read: false })).text);
     expect(msgs.messages.map((m: any) => m.id)).toEqual([id(1)]);

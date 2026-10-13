@@ -1,10 +1,10 @@
 ---
 name: tail
-description: Show how to read this session's Bridge messages in full in a second terminal pane (bridge tail). Use when the user says /bridge:tail, says Bridge messages are cut off or hard to read, asks how to see the full text of an incoming or sent message, or asks about the tail pane.
+description: Show how to read this session's Bridge messages in full in a second terminal pane (bridge tail). Use when the user says /einweave:tail, says Bridge messages are cut off or hard to read, asks how to see the full text of an incoming or sent message, or asks about the tail pane.
 user-invocable: true
 ---
 
-# /bridge:tail — read Bridge messages in full, in a second pane
+# /einweave:tail — read Bridge messages in full, in a second pane
 
 The Claude window shows an incoming Bridge message as a short preview and a sent
 one as a tool call with no text. `tail` is a separate viewer for a second terminal
@@ -23,7 +23,7 @@ Arguments passed: `$ARGUMENTS`
 1. Call the `status` Bridge tool and read `tail`.
    - A path → that is the launcher. Go on to step 2.
    - `null` → this session's local feed did not start (or the plugin is older
-     than 0.27.0). Say so plainly; `/bridge:update` shows whether an update is
+     than 0.27.0). Say so plainly; `/einweave:update` shows whether an update is
      pending. Do not invent a path.
 2. Tell the user, briefly:
    - Split the terminal (VS Code: `cmd+\`, or the split icon in the terminal

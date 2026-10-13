@@ -3,4 +3,4 @@
  * Plugin-specific on purpose: `@bridge/agent-sdk` has no client id
  * of its own — every runtime passes its own to `TokenClient` and the loopback flow.
  */
-export const PLUGIN_CLIENT_ID = "bridge-claude-plugin";
+export const PLUGIN_CLIENT_ID = "einweave-claude-plugin";

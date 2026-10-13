@@ -1,7 +1,7 @@
 /**
  * The process registry (RFC-017 D2): every Bridge plugin process on the machine writes
  * `~/.einweave/procs/<pid>.json` describing itself, so a person (or a
- * future `status` / `/bridge:update`, D9) can answer "where is the other window" — the
+ * future `status` / `/einweave:update`, D9) can answer "where is the other window" — the
  * question the RFC-016 rollout could not answer (see the RFC's §1, item 3).
  *
  * Liveness is pid + procStart — the SAME guard server.ts's session lock uses
@@ -29,7 +29,7 @@ export interface ProcInfo {
   pid: number;
   /** `ps -o lstart= -p <pid>` at write time — "" if `ps` is unavailable (e.g. Windows). */
   procStart: string;
-  software: "bridge-claude-plugin";
+  software: "einweave-claude-plugin";
   version: string;
   sessionKey: string;
   profile: string;

@@ -126,9 +126,9 @@ function compareSemver(a: [number, number, number], b: [number, number, number])
 
 /**
  * Best-effort — ANY failure (missing/corrupt `installed_plugins.json`, no `plugins` key,
- * no `bridge@*` entry, a version that doesn't parse) drops the version from the message
+ * no `einweave@*` entry, a version that doesn't parse) drops the version from the message
  * rather than throwing (D7: "a read or parse failure only drops the number"). Picks the
- * HIGHEST semver among every `bridge@*` entry's `version` — a plugin can be installed at
+ * HIGHEST semver among every `einweave@*` entry's `version` — a plugin can be installed at
  * more than one scope (user + project) at once.
  */
 export function findInstalledVersion(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -141,7 +141,7 @@ export function findInstalledVersion(env: NodeJS.ProcessEnv = process.env): stri
     let best: string | undefined;
     let bestParsed: [number, number, number] | null = null;
     for (const [key, entries] of Object.entries(plugins)) {
-      if (!key.startsWith("bridge@") || !Array.isArray(entries)) continue;
+      if (!key.startsWith("einweave@") || !Array.isArray(entries)) continue;
       for (const entry of entries) {
         const v =
           entry && typeof entry === "object" ? (entry as Record<string, unknown>).version : undefined;

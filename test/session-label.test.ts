@@ -86,7 +86,7 @@ describe("RFC-017 D5: sessionInfo.softwareId", () => {
   test("every auth frame identifies this build as bridge-claude-plugin", async () => {
     const frame = await authFrameWith("");
     expect(frame?.type).toBe("auth");
-    expect(frame?.sessionInfo?.softwareId).toBe("bridge-claude-plugin");
+    expect(frame?.sessionInfo?.softwareId).toBe("einweave-claude-plugin");
     expect(frame?.sessionInfo?.clientVersion).toBeTruthy(); // unchanged: sent alongside, not instead of
   }, 30_000);
 });

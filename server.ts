@@ -10,7 +10,7 @@
  * from ~/.claude/channels/bridge once, see state-dir.ts):
  *   EINWEAVE_API_URL=https://bridge-api.example.com
  *   EINWEAVE_CHANNELS=general,dev (optional, empty = all)
- * Credentials come from /bridge:login (RFC-016): a per-machine P-256 key and
+ * Credentials come from /einweave:login (RFC-016): a per-machine P-256 key and
  * join state in <state>/{key.json,state,installation.json} (or
  * <state>/profiles/<EINWEAVE_PROFILE>/). Every Claude session mints its own 1 h
  * DPoP-bound access token from them; every HTTP request and WS auth/reauth
@@ -88,7 +88,7 @@ if (!process.env.EINWEAVE_STATE_DIR) {
   if (moved.kind === "migrated") {
     process.stderr.write(`bridge channel: moved ${moved.profiles} credential profile(s)${moved.env ? " and .env" : ""} to ${STATE_DIR}\n`);
   } else if (moved.kind === "failed") {
-    process.stderr.write(`bridge channel: could not move the old state to ${STATE_DIR} (${moved.error}); sign in again with /bridge:login\n`);
+    process.stderr.write(`bridge channel: could not move the old state to ${STATE_DIR} (${moved.error}); sign in again with /einweave:login\n`);
   }
 }
 const ENV_FILE = join(STATE_DIR, ".env");
@@ -874,18 +874,18 @@ function channelDecision(channelId: string): ChannelDecision {
 
 // ── Refusal episode ──────────────────────────────────────────────────────────
 // One episode runs from a refusal to the next thing that can end it: a completed
-// auth, or the person acting (/bridge:connect, a login — both via restartConnection
+// auth, or the person acting (/einweave:connect, a login — both via restartConnection
 // or the connect tool). resetRefusalEpisode() is the one place it ends.
 
 /**
  * What a STOPPED session waits for before the credential watch reconnects it:
  * - "files": no usable sign-in on disk (never signed in, signed out, revoked,
  *   locked) — a login in ANOTHER session writes the files; picked up without a
- *   /bridge:connect here.
+ *   /einweave:connect here.
  * - "stop-lift": minting is stopped by a refusal retrying will not fix
  *   (creds.refreshStop()); the files are still there, so it waits for the stop to
  *   lift (the profile holds a different installation) instead of reconnecting into it.
- * - null: nothing the watch can see ends it (a revoked session, E9: /bridge:connect).
+ * - null: nothing the watch can see ends it (a revoked session, E9: /einweave:connect).
  */
 let waitingFor: null | "files" | "stop-lift" = null;
 /**
@@ -957,7 +957,7 @@ function notifyModel(content: string, type: "error" | "status"): void {
  * no frame (the server just closes), and 4008 may not either. A 4001 carries
  * "Invalid token" — but a SECOND in a row (after C14's immediate re-mint) means a
  * freshly minted token was refused too, which that frame does not say: this adds
- * what to do (/bridge:login).
+ * what to do (/einweave:login).
  */
 function notifyConnectionRefused(
   cls: CloseClass,
@@ -1423,7 +1423,7 @@ async function openSession(opts: { takeover?: boolean } = {}): Promise<"acquire"
   const myLock = sessionLock({
     dir: STATE_DIR,
     sessionKey: SESSION_KEY,
-    software: "bridge-claude-plugin",
+    software: "einweave-claude-plugin",
     version: PLUGIN_VERSION,
     identity: { tty: id.tty, termProgram: id.termProgram, cwd: id.cwd },
     retryMs: LOCK_RETRY_MS,
@@ -1631,7 +1631,7 @@ function noteServerError(message: string): void {
   if (message === notifiedServerError && now - notifiedServerErrorAt <= SERVER_ERROR_NOTIFY_INTERVAL_MS) return;
   notifiedServerError = message;
   notifiedServerErrorAt = now;
-  notifyModel(`⚠️ Bridge server error: ${message}${authenticated ? "" : " (not authenticated — run /bridge:status to see the credential)"}`, "error");
+  notifyModel(`⚠️ Bridge server error: ${message}${authenticated ? "" : " (not authenticated — run /einweave:status to see the credential)"}`, "error");
 }
 
 /** The Session will never reconnect again. What the person is told, and what (if anything) ends it. */
@@ -1769,7 +1769,7 @@ function notifyStandby(rec: LockRecord): void {
   notifyModel(
     `Bridge is connected in another window of this session: pid ${rec.pid}, ${rec.version ?? "0.25.0"}` +
       `${rec.tty ? `, ${rec.tty}` : ""}${rec.termProgram ? ` (${rec.termProgram})` : ""}${rec.cwd ? `, ${rec.cwd}` : ""}` +
-      `, since ${since}. This window stands by. /bridge:connect takeover moves it here.${forkHint()}`,
+      `, since ${since}. This window stands by. /einweave:connect takeover moves it here.${forkHint()}`,
     "status"
   );
 }
@@ -1914,11 +1914,11 @@ function audienceReasonText(r: any): string {
  * join_channel, leave_channel, who_can_see, list_agents, list_presence, list_contexts,
  * read_messages, claim_task, update_task_status, cancel_task, list_my_tasks,
  * …). Distinct hints because they are distinct fixes: unconfigured needs
- * /bridge:configure, idle needs /bridge:connect.
+ * /einweave:configure, idle needs /einweave:connect.
  *
  * Gated on `wantConnected` (INTENT), not on whether the socket has actually
  * finished its handshake — a session mid-reconnect still intends to be
- * connected and must not be told to run /bridge:connect again; `reply`
+ * connected and must not be told to run /einweave:connect again; `reply`
  * already warns separately when the socket happens to be down at send time.
  *
  * `connect`/`disconnect`/`set_session_label` are NOT gated — they are how a
@@ -1930,7 +1930,7 @@ function requireBridge(): { content: { type: "text"; text: string }[] } | null {
   if (!wantConnected)
     return {
       content: [
-        { type: "text", text: "Bridge not connected — run /bridge:connect first." },
+        { type: "text", text: "Bridge not connected — run /einweave:connect first." },
       ],
     };
   return null;
@@ -2000,17 +2000,17 @@ async function requireHolder(): Promise<{ content: { type: "text"; text: string 
   const stopped = session.stopReason();
   if (stopped) {
     // A superseded window can only get Bridge back by taking it over; a plain connect does nothing there.
-    const how = stopped.kind === "superseded" ? "/bridge:connect takeover moves Bridge back to this window" : "/bridge:connect starts a new one";
+    const how = stopped.kind === "superseded" ? "/einweave:connect takeover moves Bridge back to this window" : "/einweave:connect starts a new one";
     return say(`This window's Bridge session has stopped (${stopped.kind}) — nothing was read or acknowledged. ${how}.`);
   }
   if (standbyHolder) {
     return say(
-      `This window stands by — another window holds this Bridge session, and reading here would acknowledge entries on its behalf. /bridge:connect takeover moves Bridge to this window.${forkHint()}`
+      `This window stands by — another window holds this Bridge session, and reading here would acknowledge entries on its behalf. /einweave:connect takeover moves Bridge to this window.${forkHint()}`
     );
   }
   if (!sessionEverAuthenticated) return say("Bridge is still connecting (no authenticated session yet) — nothing was read or acknowledged. Try again in a moment.");
   if (!authenticated) return say("Bridge is reconnecting — acks can't be sent yet, so nothing was read or acknowledged; try again shortly.");
-  if (!(await holdsLiveLock())) return say("Another window holds Bridge now (this window's lock was lost; its session is about to stop) — nothing was read or acknowledged. /bridge:connect takeover moves Bridge back to this window.");
+  if (!(await holdsLiveLock())) return say("Another window holds Bridge now (this window's lock was lost; its session is about to stop) — nothing was read or acknowledged. /einweave:connect takeover moves Bridge back to this window.");
   return null;
 }
 
@@ -2153,11 +2153,11 @@ async function markReadUpTo(
 // reported 0.10.0, which is the one number an operator can actually see when
 // checking whether the new plugin is live.
 const mcp = new Server(
-  { name: "bridge", version: PLUGIN_VERSION },
+  { name: "einweave", version: PLUGIN_VERSION },
   {
     capabilities: { tools: {}, experimental: { "claude/channel": {} } },
     instructions: [
-      "Bridge is an agent-to-agent messaging platform. Messages from other agents arrive as <channel source=\"bridge\" channel_id=\"...\" message_id=\"...\" sender=\"...\" type=\"...\">.",
+      "Bridge is an agent-to-agent messaging platform. Messages from other agents arrive as <channel source=\"einweave\" channel_id=\"...\" message_id=\"...\" sender=\"...\" type=\"...\">.",
       "",
       "Use the reply tool to send messages to a Bridge channel. Pass channel_id from the inbound message. To reply in a thread, set thread_id to the thread_id shown on the message you are replying to — every inbound message carries the id of its thread. Omit thread_id to start a new root message.",
       "",
@@ -2734,7 +2734,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           rememberSentMessage(result.id, type);
         }
         // RFC-022 D8: an accepted send goes to the feed — the host shows a reply as
-        // `Called plugin:bridge:bridge` with no text, so `tail` is where it can be read.
+        // `Called plugin:einweave:einweave` with no text, so `tail` is where it can be read.
         {
           // The server's id for the channel: a reply names only its thread, and a root
           // may have been addressed by channel NAME.
@@ -3752,7 +3752,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           if (superseded) {
             return {
               content: [
-                { type: "text", text: "another window took over this session — /bridge:connect takeover to move it back" },
+                { type: "text", text: "another window took over this session — /einweave:connect takeover to move it back" },
               ],
             };
           }
@@ -3767,7 +3767,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 content: [
                   {
                     type: "text",
-                    text: `Another window of this session holds Bridge, so this window stands by (it keeps retrying; it does not take over). /bridge:connect takeover moves Bridge here.${forkHint()}`,
+                    text: `Another window of this session holds Bridge, so this window stands by (it keeps retrying; it does not take over). /einweave:connect takeover moves Bridge here.${forkHint()}`,
                   },
                 ],
               };
@@ -3937,7 +3937,7 @@ process.stderr.write(
 );
 sessionKeySettled = true;
 
-// RFC-017 D2: register this process so a person (or a future `status` / /bridge:update)
+// RFC-017 D2: register this process so a person (or a future `status` / /einweave:update)
 // can answer "where is the other window" — the question the RFC-016 rollout could not
 // answer. `myIdentity()` reuses the SAME ancestry walk resolveSessionKey() already did;
 // re-running it here (rather than threading the pid through) costs a few more `ps` calls
@@ -4004,7 +4004,7 @@ try {
   myProc = {
     pid: process.pid,
     procStart: procStartOf(process.pid),
-    software: "bridge-claude-plugin",
+    software: "einweave-claude-plugin",
     version: PLUGIN_VERSION,
     sessionKey: SESSION_KEY,
     profile: PROFILE_LABEL,

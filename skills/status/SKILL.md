@@ -7,7 +7,7 @@ allowed-tools:
   - Bash(curl *)
 ---
 
-# /bridge:status — Bridge Channel Status
+# /einweave:status — Bridge Channel Status
 
 Shows the current state of the Bridge connection.
 
@@ -23,7 +23,7 @@ configured-but-idle, or connected, which decides everything else below.
 
 It returns `{ configured, wantConnected, websocket, receiving_messages,
 agent, context_id, channel_filter, delivery, auth, label, tail }` (`tail` = the launcher
-for the full-message viewer, see `/bridge:tail`; `auth` = the sign-in:
+for the full-message viewer, see `/einweave:tail`; `auth` = the sign-in:
 profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 
 ### 1. Unconfigured (`configured: false`)
@@ -31,7 +31,7 @@ profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 Bridge has no API URL, or this machine is not signed in (or its sign-in was
 locked / revoked). Report `auth.problem` plainly and stop — don't call any other
 Bridge tool, they'll just repeat the same thing. Next step: whatever it names
-(`/bridge:configure` for the URL, `/bridge:login` to sign in).
+(`/einweave:configure` for the URL, `/einweave:login` to sign in).
 
 ### 2. Idle (`configured: true`, `wantConnected: false`)
 
@@ -39,7 +39,7 @@ Bridge is set up but this session hasn't joined it (or was disconnected).
 Report:
 - Configured: yes.
 - Connected: no — this session is not receiving Bridge messages.
-- Next step: run `/bridge:connect` (or use `claudeb`, which auto-connects).
+- Next step: run `/einweave:connect` (or use `claudeb`, which auto-connects).
 
 Don't call `list_channels`/`list_agents` here — they're gated and will just
 return the same "not connected" hint.
@@ -62,7 +62,7 @@ Report the snapshot itself:
   when it is not 0.
 - Sign-in (`auth`): installation name, `key_storage` (`software`), and
   `key_thumbprint`; if `auth.session` says the session was revoked, the next
-  step is `/bridge:connect`.
+  step is `/einweave:connect`.
 
 Then, for the fuller picture, also call:
 - **Channels** — the `list_channels` Bridge tool: available channels with
