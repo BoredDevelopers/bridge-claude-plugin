@@ -94,13 +94,13 @@ export function randomBase62(len: number): string {
   return Array.from(bytes, (b) => B62[b % 62]).join("");
 }
 
-/** A server-side join state `brg_js_<seq>_<43 base62><6 base62 CRC32>` (RFC-016 §3.1). */
+/** A server-side join state `ew_js_<seq>_<43 base62><6 base62 CRC32>` (RFC-016 §3.1). */
 export function makeJoinState(seq: number): string {
-  const body = `brg_js_${seq}_${randomBase62(43)}`;
+  const body = `ew_js_${seq}_${randomBase62(43)}`;
   return body + base62(crc32(body), 6);
 }
 
 export function joinStateCrcOk(s: string): boolean {
-  const m = /^(brg_js_\d+_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
+  const m = /^(ew_js_\d+_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
   return !!m && base62(crc32(m[1]!), 6) === m[2];
 }

@@ -12,7 +12,7 @@
  */
 export type DeliveryState = "idle" | "unconfirmed" | "confirmed" | "hooks not reporting" | "awaiting confirmation";
 
-export const CHANNELS_LAUNCH = "claude --dangerously-load-development-channels plugin:bridge@bored-marketplace";
+export const CHANNELS_LAUNCH = "claude --dangerously-load-development-channels plugin:einweave@einweave-marketplace";
 
 export interface DeliveryInputs {
   /** The control socket is open. */

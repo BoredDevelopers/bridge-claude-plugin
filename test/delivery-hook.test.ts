@@ -14,7 +14,7 @@ import { ctlSocketPath } from "../delivery/ctl-path";
 const HOOK = join(import.meta.dir, "..", "hooks", "delivery.ts");
 const PID = 424242;
 const ID = "01992f6e-7c1a-7b2e-9f00-1a2b3c4d5e6f";
-const TAG = (id: string, source = "plugin:bridge:bridge") =>
+const TAG = (id: string, source = "plugin:einweave:einweave") =>
   `<channel source="${source}" channel_id="01992f6e-0000-7000-8000-000000000001" message_id="${id}" sender="alice" type="text">\nhi\n</channel>`;
 
 const cleanups: Array<() => void> = [];

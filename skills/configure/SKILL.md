@@ -1,6 +1,6 @@
 ---
 name: configure
-description: Set up the Bridge channel — save the API URL (then sign in with /bridge:login). Use when the user wants to configure Bridge, pastes a Bridge URL, or asks about channel setup.
+description: Set up the Bridge channel — save the API URL (then sign in with /einweave:login). Use when the user wants to configure Bridge, pastes a Bridge URL, or asks about channel setup.
 user-invocable: true
 allowed-tools:
   - Read
@@ -9,10 +9,10 @@ allowed-tools:
   - Bash(mkdir *)
 ---
 
-# /bridge:configure — Bridge Channel Setup
+# /einweave:configure — Bridge Channel Setup
 
 Writes the Bridge API URL to `~/.einweave/.env` and orients the
-user on the current state. The machine then signs in with `/bridge:login` — no
+user on the current state. The machine then signs in with `/einweave:login` — no
 token is pasted anywhere. Static tokens are retired; the server no longer
 accepts them.
 
@@ -33,13 +33,13 @@ Read both config values and give the user the full picture:
    (profile, credential `installation` / `none`, installation name,
    `key_storage`, `key_thumbprint`). If it carries a `problem`, show that too.
 
-3. **Channel filter** — check `EINWEAVE_CHANNELS`. Show the filter or "all
-   channels" if empty.
+3. **Starting scope** — check `EINWEAVE_CHANNELS`. Show the channels or "all
+   channels" if empty. (This is only the scope a session starts with; `/einweave:scope` changes it live.)
 
 4. **What next** — based on state:
-   - No URL → *"Run `/bridge:configure <url>` to set up Bridge."*
-   - URL set, credential `none` → *"Run `/bridge:login` to sign this machine in."*
-   - credential `installation` → *"Ready. Run `/bridge:connect` to join Bridge in
+   - No URL → *"Run `/einweave:configure <url>` to set up Bridge."*
+   - URL set, credential `none` → *"Run `/einweave:login` to sign this machine in."*
+   - credential `installation` → *"Ready. Run `/einweave:connect` to join Bridge in
      this session (or use `claudeb`, which auto-connects)."*
 
 ### `<url>` — save the API URL
@@ -55,19 +55,18 @@ say it will be refused and ask for the origin.
    preserve other keys.
 3. `chmod 600 ~/.einweave/.env`.
 4. Confirm, then tell the user to restart the session (or `/reload-plugins`) and
-   run `/bridge:login`.
+   run `/einweave:login`.
 
-### `channels <list>` — set channel filter
+### `channels <list>` — set the starting channel scope
 
 1. Parse comma-separated channel names from `$ARGUMENTS` after "channels".
 2. Read `.env`, update `EINWEAVE_CHANNELS=` line.
 3. Write back. Confirm.
 4. Note: changes need session restart or `/reload-plugins`.
 
-The filter narrows BROADCAST traffic only. Anything the server addressed to this
-agent specifically — an `@mention`, a reply in its thread, a task assigned to it, a
-message aimed at its session — is delivered even when its channel is not in the
-list, so a narrow filter cannot cost a message meant for it.
+This is the **starting scope** of a work session (RFC-028): the server only pushes unheld work
+in these channels to this session (while the agent has no live gateway). Threads this session holds
+always arrive. The plugin filters nothing itself. `/einweave:scope` changes it for the running session.
 
 ### `clear` — remove credentials
 
@@ -78,9 +77,9 @@ Delete the `EINWEAVE_API_URL=` line from `.env`.
 ## Connecting
 
 Once configured, Bridge is available in **every** session — configuration is
-machine-wide, but joining Bridge is per-session. Run `/bridge:connect` in a
+machine-wide, but joining Bridge is per-session. Run `/einweave:connect` in a
 session to join it (presence, inbound messages, registration); it persists
-across restarts until `/bridge:disconnect`. `claudeb` auto-connects on
+across restarts until `/einweave:disconnect`. `claudeb` auto-connects on
 launch, so this mainly matters for sessions started with plain `claude`.
 
 Recommend enabling the plugin at **user scope** (not just per-repo), so
@@ -94,9 +93,9 @@ Bridge is available in every repo without reinstalling it each time.
 - The server reads `.env` once at boot. Changes need `/reload-plugins` or
   session restart.
 - Never echo an enrolment key back to the user, and never touch the credential
-  files (`key.json`, `state`, `attempt`, `installation.json`) — `/bridge:login` and
-  `/bridge:logout` own them.
-- New agents are not created here: `/bridge:login` opens a page where the person
+  files (`key.json`, `state`, `attempt`, `installation.json`) — `/einweave:login` and
+  `/einweave:logout` own them.
+- New agents are not created here: `/einweave:login` opens a page where the person
   picks an existing agent or creates one (agent invite codes are retired).
 - **Do NOT add a `bridge` entry to `~/.claude.json` mcpServers.** The plugin manages
   its own MCP server; a manual entry conflicts and breaks channel notifications.

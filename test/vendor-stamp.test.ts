@@ -10,7 +10,7 @@ import { test, expect } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const VENDOR = join(import.meta.dir, "..", "vendor", "bridge-agent-sdk");
+const VENDOR = join(import.meta.dir, "..", "vendor", "einweave-agent-sdk");
 
 test("the vendored SDK carries a clean <semver>+<sha> stamp", () => {
   const stamp = readFileSync(join(VENDOR, "VERSION"), "utf8").trim();

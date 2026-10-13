@@ -7,7 +7,7 @@ allowed-tools:
   - Bash(curl *)
 ---
 
-# /bridge:status — Bridge Channel Status
+# /einweave:status — Bridge Channel Status
 
 Shows the current state of the Bridge connection.
 
@@ -22,8 +22,8 @@ Arguments passed: `$ARGUMENTS`
 configured-but-idle, or connected, which decides everything else below.
 
 It returns `{ configured, wantConnected, websocket, receiving_messages,
-agent, context_id, channel_filter, delivery, auth, label, tail }` (`tail` = the launcher
-for the full-message viewer, see `/bridge:tail`; `auth` = the sign-in:
+agent, context_id, kind, scope, holds, threads_that_need_someone, delivery, auth, label, tail }` (`tail` = the launcher
+for the full-message viewer, see `/einweave:tail`; `auth` = the sign-in:
 profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 
 ### 1. Unconfigured (`configured: false`)
@@ -31,7 +31,7 @@ profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 Bridge has no API URL, or this machine is not signed in (or its sign-in was
 locked / revoked). Report `auth.problem` plainly and stop — don't call any other
 Bridge tool, they'll just repeat the same thing. Next step: whatever it names
-(`/bridge:configure` for the URL, `/bridge:login` to sign in).
+(`/einweave:configure` for the URL, `/einweave:login` to sign in).
 
 ### 2. Idle (`configured: true`, `wantConnected: false`)
 
@@ -39,7 +39,7 @@ Bridge is set up but this session hasn't joined it (or was disconnected).
 Report:
 - Configured: yes.
 - Connected: no — this session is not receiving Bridge messages.
-- Next step: run `/bridge:connect` (or use `claudeb`, which auto-connects).
+- Next step: run `/einweave:connect` (or use `claudeb`, which auto-connects).
 
 Don't call `list_channels`/`list_agents` here — they're gated and will just
 return the same "not connected" hint.
@@ -52,7 +52,11 @@ Report the snapshot itself:
   authenticated).
 - Agent identity (`agent`), this session's context id (`context_id`), and
   its display label (`label`, or "derived default" if null).
-- Channel filter (`channel_filter`) — "all" or the configured list.
+- Kind (`kind`: `session` = work session, `gateway` = the agent's triage connection) and,
+  once authenticated, the server's `scope` (which channels' unheld work this session takes)
+  and `holds` (the thread ids it holds).
+- `threads_that_need_someone` (when connected): threads nobody holds that are addressed to this agent. Show
+  them and offer `/einweave:take` (which lists them numbered; the bullets here are not numbers to pick from).
 - Delivery (`delivery.state`) — whether what Bridge pushed actually reached the model:
   `confirmed`, `awaiting confirmation`, `idle` (nothing pushed yet), `unconfirmed`
   (entries were missed: this session runs without channels — give the person
@@ -62,11 +66,11 @@ Report the snapshot itself:
   when it is not 0.
 - Sign-in (`auth`): installation name, `key_storage` (`software`), and
   `key_thumbprint`; if `auth.session` says the session was revoked, the next
-  step is `/bridge:connect`.
+  step is `/einweave:connect`.
 
 Then, for the fuller picture, also call:
 - **Channels** — the `list_channels` Bridge tool: available channels with
-  unread state. Note which match the filter (if `channel_filter` narrows it).
+  unread state. Note which are in this session's `scope`.
 - **Agents** — the `list_agents` Bridge tool: connected agents, their state,
   and skills.
 

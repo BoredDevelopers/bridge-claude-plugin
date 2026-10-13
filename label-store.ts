@@ -22,7 +22,7 @@
  * envelope with a `format` field), which would itself make a 0.26-written label
  * unreadable by a 0.25 window sharing the file — the opposite of §7's mixed-period
  * rule, and not something this RFC's on-disk changes call for. Losing a custom label to
- * a stale overwrite is a cosmetic regression (re-run /bridge:rename), not a destroyed
+ * a stale overwrite is a cosmetic regression (re-run /einweave:rename), not a destroyed
  * credential, so this is left as a documented gap rather than an invented heuristic.
  */
 import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";

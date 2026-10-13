@@ -5,19 +5,19 @@
  * silently.
  */
 import { test, expect, describe } from "bun:test";
-import { ciVerdict, peeled, pinListing, releaseVersion, tagAction } from "../scripts/release";
+import { ciVerdict, peeled, pinListing, releaseVersion, tagAction, MARKETPLACE_REPO, PLUGIN_NAME } from "../scripts/release";
 
 const SHA = "f4d0019c0ffee0000000000000000000000000ab";
 const LISTING = JSON.stringify(
   {
-    name: "bored-marketplace",
+    name: "einweave-marketplace",
     plugins: [
       { name: "other", source: { source: "url", url: "https://example.test/other.git" }, version: "9.9.9" },
       {
-        name: "bridge",
-        source: { source: "url", url: "https://github.com/BoredDevelopers/bridge-claude-plugin.git" },
+        name: "einweave",
+        source: { source: "url", url: "https://github.com/plexodus/einweave-claude-code.git" },
         version: "0.28.0",
-        tags: ["bridge"],
+        tags: ["einweave"],
       },
     ],
   },
@@ -57,15 +57,15 @@ describe("ciVerdict", () => {
 describe("pinListing", () => {
   test("pins bridge to the tag and sha, drops its dead version, touches nothing else", () => {
     const out = JSON.parse(pinListing(LISTING, "0.28.1", SHA));
-    const bridge = out.plugins.find((p: any) => p.name === "bridge");
+    const bridge = out.plugins.find((p: any) => p.name === "einweave");
     expect(bridge.source).toEqual({
       source: "url",
-      url: "https://github.com/BoredDevelopers/bridge-claude-plugin.git",
+      url: "https://github.com/plexodus/einweave-claude-code.git",
       ref: "v0.28.1",
       sha: SHA,
     });
     expect(bridge.version).toBeUndefined(); // plugin.json wins; a listing copy can only drift
-    expect(bridge.tags).toEqual(["bridge"]);
+    expect(bridge.tags).toEqual(["einweave"]);
     expect(out.plugins.find((p: any) => p.name === "other")).toEqual(JSON.parse(LISTING).plugins[0]);
   });
   test("never goes backwards — from the legacy version, then from the pinned tag", () => {
@@ -80,7 +80,7 @@ describe("pinListing", () => {
   test("bridge listed zero or two times refuses", () => {
     const none = JSON.stringify({ plugins: [] });
     expect(() => pinListing(none, "0.28.1", SHA)).toThrow(/found 0/);
-    const two = JSON.stringify({ plugins: [{ name: "bridge" }, { name: "bridge" }] });
+    const two = JSON.stringify({ plugins: [{ name: "einweave" }, { name: "einweave" }] });
     expect(() => pinListing(two, "0.28.1", SHA)).toThrow(/found 2/);
   });
 });
@@ -105,5 +105,12 @@ describe("resumable tagging", () => {
     expect(peeled(annotated)).toBe(HEAD);
     expect(peeled(`${HEAD}\trefs/tags/v0.28.1\n`)).toBe(HEAD);
     expect(peeled("")).toBeNull();
+  });
+});
+
+describe("the marketplace the release pins (Jörgen's decision: its NAME is einweave-marketplace, like its repo)", () => {
+  test("the listing repo and plugin name", () => {
+    expect(MARKETPLACE_REPO).toBe("plexodus/einweave-marketplace");
+    expect(PLUGIN_NAME).toBe("einweave");
   });
 });

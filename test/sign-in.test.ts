@@ -10,11 +10,11 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRuntime, AgentClientError, isTerminalCredentialError } from "../vendor/bridge-agent-sdk/index.js";
-import { withInstallationLock, STALE_MS, LOCK_DIR_NAME } from "../vendor/bridge-agent-sdk/node.js";
-import { joinStateSeq } from "../vendor/bridge-agent-sdk/core/index.js";
+import { createRuntime, AgentClientError, isTerminalCredentialError } from "../vendor/einweave-agent-sdk/index.js";
+import { withInstallationLock, STALE_MS, LOCK_DIR_NAME } from "../vendor/einweave-agent-sdk/node.js";
+import { joinStateSeq } from "../vendor/einweave-agent-sdk/core/index.js";
 import { startAuthStub } from "./agent-auth-stub";
-import { enrolledProfile, readInstallation, readKey, readState, readAttempt, agentClientOn } from "./key-fixtures";
+import { enrolledProfile, readInstallation, readKey, readState, readAttempt, agentClientOn, writeState } from "./key-fixtures";
 import { SignIn, describeCredential, waitFor, type SignInDeps } from "../auth/login";
 import { resolveProfile } from "../auth/profile";
 
@@ -100,6 +100,16 @@ describe("credential errors in this plugin's words", () => {
 });
 
 describe("profiles and configuration", () => {
+  test("0.31 hard switch: a stored brg_ join state is not a sign-in -- the person is told to run /einweave:login", async () => {
+    const { stub, dir } = setup();
+    await enrolledProfile(stub, dir);
+    // What 0.30 left on disk: the same installation, but a join state in the retired `brg_` format.
+    writeState(dir, "brg_js_0_" + "A".repeat(49));
+    const { m } = signIn(dir, stub.url);
+    await expect(use(m)).rejects.toThrow(/\/einweave:login/);
+    expect(Object.values(stub.stats.tokenRequests).reduce((a, b) => a + b, 0)).toBe(0); // never even tried to mint
+  });
+
   test("a named profile without credentials is an error", async () => {
     const { stub, dir } = setup();
     const { m } = signIn(dir, stub.url, { profile: "reviewer" });
@@ -117,7 +127,7 @@ describe("profiles and configuration", () => {
     const oldTmp = join(dir, "key.json.4242.1758000000000.AbCd.tmp");
     const freshTmp = join(dir, "state.4242.1758000000001.XyZw.tmp");
     writeFileSync(oldTmp, '{"d":"secret"}');
-    writeFileSync(freshTmp, "brg_js_…");
+    writeFileSync(freshTmp, "ew_js_…");
     age(oldTmp, 10 * 60_000);
     const oldTomb = join(dir, `${LOCK_DIR_NAME}.released-${crypto.randomUUID()}`);
     const freshTomb = join(dir, `${LOCK_DIR_NAME}.released-${crypto.randomUUID()}`);
@@ -166,14 +176,14 @@ describe("profiles and configuration", () => {
 });
 
 describe("stop-lift: a stop is about ONE installation", () => {
-  test("a stop-class refusal stands until a DIFFERENT installation is on disk — or /bridge:connect", async () => {
+  test("a stop-class refusal stands until a DIFFERENT installation is on disk — or /einweave:connect", async () => {
     const { stub, dir } = setup({ sessionCap: 0 });
     await enrolledProfile(stub, dir);
     const { m } = signIn(dir, stub.url);
     await expect(use(m)).rejects.toThrow(/too many live sessions/);
     expect((await m.refreshStop())?.code).toBe("session_limit");
     expect((await m.refreshStop())?.code).toBe("session_limit"); // the same installation: still stopped
-    await enrolledProfile(stub, dir); // a /bridge:login in ANOTHER window
+    await enrolledProfile(stub, dir); // a /einweave:login in ANOTHER window
     expect(await m.refreshStop()).toBeNull();
   });
 });
@@ -188,7 +198,7 @@ describe("the Session's client", () => {
     const err = await c.wsAuth().catch((e) => e);
     expect(isTerminalCredentialError(err)).toBe(true);
     expect(waitFor(err)).toBe("files");
-    expect(describeCredential(err, "9.9.9")).toMatch(/run \/bridge:login/);
+    expect(describeCredential(err, "9.9.9")).toMatch(/run \/einweave:login/);
     expect(stub.stats.mintBodies).toHaveLength(0);
   });
 
@@ -198,7 +208,7 @@ describe("the Session's client", () => {
     const err = await (await m.sessionClient())!.wsAuth().catch((e) => e);
     expect(isTerminalCredentialError(err)).toBe(true);
     expect(waitFor(err)).toBe("files");
-    expect(describeCredential(err, "9.9.9")).toBe("this machine is not signed in to Bridge — run /bridge:login");
+    expect(describeCredential(err, "9.9.9")).toBe("this machine is not signed in to Bridge — run /einweave:login");
   });
   test("signed in to ANOTHER API: stopped with the configuration text, nothing sent", async () => {
     const { stub, dir } = setup();
@@ -238,7 +248,7 @@ describe("RFC-017 D8: a newer-format installation.json is never mistaken for 'no
     expect(events.notices.join()).toBe(""); // headless: never through chat, log only
   });
 
-  test("a /bridge:login run in the stale window refuses up front: no browser, nothing exchanged, the newer file survives", async () => {
+  test("a /einweave:login run in the stale window refuses up front: no browser, nothing exchanged, the newer file survives", async () => {
     const { stub, dir } = setup();
     const snapshot = await newerFormatProfile(stub, dir);
     const before = snapshot();
@@ -266,7 +276,7 @@ describe("RFC-017 P5: too_old", () => {
   });
 
   test("a description with no `>= x.y.z` (client_blocked) falls back gracefully", async () => {
-    const { stub, dir } = setup({ tooOldMints: 1, tooOldReason: "client_blocked: bridge-claude-plugin 9.9.9 is withdrawn — open /plugin → Installed → bridge → Update now, then /reload-plugins" });
+    const { stub, dir } = setup({ tooOldMints: 1, tooOldReason: "client_blocked: bridge-claude-plugin 9.9.9 is withdrawn — open /plugin → Installed → einweave → Update now, then /reload-plugins" });
     await enrolledProfile(stub, dir);
     const { m } = signIn(dir, stub.url);
     await expect(use(m)).rejects.toThrow("this plugin (9.9.9) is older than Bridge accepts — " + UPDATE_HOWTO);
@@ -589,7 +599,7 @@ describe("logout and enrolment keys", () => {
     expect(stub.stats.locks).toBe(0);
   });
 
-  test("after /bridge:logout an enrolment key still in .env does not sign the machine back in; login clears that", async () => {
+  test("after /einweave:logout an enrolment key still in .env does not sign the machine back in; login clears that", async () => {
     const { stub, dir } = setup();
     const { m } = signIn(dir, stub.url, { enrolmentKey: stub.mintEnrolmentKey(5) });
     await m.enrolFromKeyIfNeeded();

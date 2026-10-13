@@ -153,7 +153,7 @@ Note the ledger holds exactly four plugins and Bridge is not among them. That's 
 This is the decisive one, because it's the live evaluation rather than a cached value.
 
 ```bash
-claude --debug --dangerously-load-development-channels plugin:bridge@bored-marketplace
+claude --debug --dangerously-load-development-channels plugin:einweave@einweave-marketplace
 ```
 
 Accept the "I am using this for local development" prompt. Let it start, then in another WSL terminal:
@@ -205,13 +205,13 @@ If gate 1 is fine and you're being rejected at gate 2, the exact invocation matt
 
 ```bash
 # correct
-claude --dangerously-load-development-channels plugin:bridge@bored-marketplace
+claude --dangerously-load-development-channels plugin:einweave@einweave-marketplace
 
 # wrong — no marketplace suffix
-claude --dangerously-load-development-channels plugin:bridge
+claude --dangerously-load-development-channels plugin:einweave
 
 # wrong — --channels alone can't work, Bridge isn't on the allowlist
-claude --channels plugin:bridge@bored-marketplace
+claude --channels plugin:einweave@einweave-marketplace
 ```
 
 Pass the dev flag **on its own**. Adding `--channels` alongside it does not extend the bypass to those entries, and combining them has been reported to fail.

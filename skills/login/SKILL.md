@@ -1,17 +1,17 @@
 ---
 name: login
-description: Sign this machine in to Bridge — one click in the browser (or a short code on a headless/SSH machine). Use when the user says /bridge:login, wants to connect this machine to Bridge, or Bridge says the machine is not signed in.
+description: Sign this machine in to Bridge — one click in the browser (or a short code on a headless/SSH machine). Use when the user says /einweave:login, wants to connect this machine to Bridge, or Bridge says the machine is not signed in.
 user-invocable: true
 ---
 
-# /bridge:login — sign this machine in to Bridge
+# /einweave:login — sign this machine in to Bridge
 
 Arguments passed: `$ARGUMENTS`
 
 ## What to do
 
 1. Call the `login` MCP tool.
-   - `/bridge:login device` (or the user is on SSH / has no browser) → pass `mode: "device"`.
+   - `/einweave:login device` (or the user is on SSH / has no browser) → pass `mode: "device"`.
    - Otherwise omit `mode` (auto: browser unless headless).
    - A third way needs no call: `EINWEAVE_ENROLMENT_KEY` in `~/.einweave/.env`
      is exchanged at startup when the profile is not signed in (headless / CI).
@@ -34,21 +34,21 @@ Arguments passed: `$ARGUMENTS`
 - If Bridge says **"credential copy detected — Bridge LOCKED this machine's sign-in"**, a
   copy of the machine's credential files was used somewhere else, or a backup / VM
   snapshot of them was restored. Tell the user plainly, relay the text verbatim, suggest
-  they check the machine (and rotate its other secrets), then run `/bridge:login` again.
+  they check the machine (and rotate its other secrets), then run `/einweave:login` again.
   Never suggest restoring or copying the credential files.
 - **"Bridge refused this plugin's sign-in protocol … update the plugin"** → the user runs
-  updates the plugin (`/plugin` → Installed → bridge → **Update now**, then `/reload-plugins`), then `/bridge:login`.
+  updates the plugin (`/plugin` → Installed → einweave → **Update now**, then `/reload-plugins`), then `/einweave:login`.
 - **"the Bridge API URL must be an origin …"** → `EINWEAVE_API_URL` must be the bare origin
   (scheme, host, port — no path), exactly the server's public URL origin; fix it with
-  `/bridge:configure <url>`.
+  `/einweave:configure <url>`.
 - After upgrading the plugin from 0.24 or earlier to 0.25, every machine and every
-  profile needs one `/bridge:login` (the old sign-in cannot be carried over).
+  profile needs one `/einweave:login` (the old sign-in cannot be carried over).
 - The browser page lets the person pick which agent this machine acts as, or create a
   new one.
 - **Several agents on one machine:** set `EINWEAVE_PROFILE=<name>` in the project's
-  `.claude/settings.local.json` under `env`, restart the session, then `/bridge:login`.
+  `.claude/settings.local.json` under `env`, restart the session, then `/einweave:login`.
   Each profile is signed in separately.
-- Re-running `/bridge:login` replaces this profile's sign-in; the old one is revoked
+- Re-running `/einweave:login` replaces this profile's sign-in; the old one is revoked
   once the new one succeeds.
 - Never ask the user to paste a token or enrolment key into the chat. Headless
   machines use `EINWEAVE_ENROLMENT_KEY` in `~/.einweave/.env` instead.

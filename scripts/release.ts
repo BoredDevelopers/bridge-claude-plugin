@@ -4,7 +4,7 @@
  *
  *   1. Preflight: HEAD is origin/main, tree clean, the two versions agree and are a
  *      plain x.y.z, tag `v<version>` is absent or already on HEAD, every CI check passed.
- *   2. Prepare the marketplace listing (`BoredDevelopers/bored-marketplace`) from a
+ *   2. Prepare the marketplace listing (`plexodus/einweave-marketplace`) from a
  *      FRESH clone: pin `source.ref` + `source.sha`; `claude plugin validate` it.
  *      Nothing has been pushed yet, so any failure so far leaves no trace.
  *   3. Tag `v<version>` (annotated) on HEAD and push it.
@@ -31,10 +31,10 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const PLUGIN_REPO = "BoredDevelopers/bridge-claude-plugin";
-const MARKETPLACE_REPO = "BoredDevelopers/bored-marketplace";
+const PLUGIN_REPO = "plexodus/einweave-claude-code";
+export const MARKETPLACE_REPO = "plexodus/einweave-marketplace";
 const MARKETPLACE_FILE = ".claude-plugin/marketplace.json";
-const PLUGIN_NAME = "bridge";
+export const PLUGIN_NAME = "einweave";
 
 /** The version both files declare, or why there isn't one. */
 export function releaseVersion(pkg: { version?: unknown }, manifest: { version?: unknown }): string {
@@ -137,7 +137,7 @@ async function main(): Promise<void> {
   if (ci) throw new Error(ci);
   step(`${version} at ${head.slice(0, 7)} — ${runs.length} CI checks green`);
 
-  const dir = mkdtempSync(join(tmpdir(), "bored-marketplace-"));
+  const dir = mkdtempSync(join(tmpdir(), "einweave-marketplace-"));
   try {
     // 2. The listing, prepared and validated BEFORE anything is pushed, from a fresh
     // clone so a stale local checkout cannot be what ships.
@@ -181,7 +181,7 @@ ${dry ? "Dry run — nothing was pushed." : `Released ${PLUGIN_NAME} ${version}.
      ssh jorgen_admin@thenas "cd /volume1/docker/bridge && sudo /usr/local/bin/docker compose up -d api"
   2. Post it in #einweave → releases.
   3. Each machine: /plugin → Installed → ${PLUGIN_NAME} → Update now, then /reload-plugins
-     (or once: /plugin → Marketplaces → bored-marketplace → Enable auto-update).`);
+     (or once: /plugin → Marketplaces → einweave-marketplace → Enable auto-update).`);
 }
 
 if (import.meta.main) {

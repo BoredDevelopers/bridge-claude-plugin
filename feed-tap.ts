@@ -4,7 +4,7 @@
  * second terminal pane.
  *
  * WHY IT EXISTS. The host's window cuts an incoming message to a short preview and
- * shows an outgoing one as `Called plugin:bridge:bridge` with no text. Nothing this
+ * shows an outgoing one as `Called plugin:einweave:einweave` with no text. Nothing this
  * plugin puts in a notification changes that. `tail` is where a person reads Bridge
  * messages in full, and this module is what feeds it.
  *
@@ -17,7 +17,7 @@
  * else. The only thing written to disk is the launcher script, which holds two paths.
  *
  * The socket, the ring and the wire format are `@bridge/agent-sdk`'s, from the vendored
- * build (`vendor/bridge-agent-sdk`, stamped by `VERSION`). This file only translates the
+ * build (`vendor/einweave-agent-sdk`, stamped by `VERSION`). This file only translates the
  * plugin's own shapes — an inbound WS message, a `reply` tool call — into feed frames.
  */
 import { chmodSync, mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -25,8 +25,8 @@ import { join } from "node:path";
 // TYPES only. The vendored build is loaded with `await import()` inside startFeedTap's
 // try block: a missing or half-written chunk (an update in progress) must cost this
 // session its feed, not its boot.
-import type { FeedServer, FeedHelloInfo } from "./vendor/bridge-agent-sdk/node.js";
-import type { FeedMessage, FeedStatusState } from "./vendor/bridge-agent-sdk/core/index.js";
+import type { FeedServer, FeedHelloInfo } from "./vendor/einweave-agent-sdk/node.js";
+import type { FeedMessage, FeedStatusState } from "./vendor/einweave-agent-sdk/core/index.js";
 
 /** What the tap remembers about a thread, learned from its root as it passes through. */
 interface ThreadNote {
@@ -123,18 +123,13 @@ export interface OutboundSend {
   text: string;
   /** This session's agent, as the sender. */
   self: { id: string; handle: string };
-  /** The caller forced a broadcast reply: it has no single recipient. */
-  broadcast: boolean;
-  /** The session the server actually targeted, when it targeted one. */
-  targetContextId: string;
 }
 
 /**
  * A successful `reply` → a feed frame. An outgoing message is always shown as addressed
  * (`targeted: true`): it is this session's own, never broadcast noise to its reader.
  * The recipient of a thread reply is whoever started the thread, when this session saw
- * the root; a new root, a forced broadcast, and a reply into our own thread have no single
- * recipient and carry none. The targeted session rides along when the server named one.
+ * the root; a new root and a reply into our own thread have no single recipient and carry none.
  */
 export function outboundToFeed(send: OutboundSend, threads: ThreadNotes): FeedMessage {
   const isRoot = !send.threadId;
@@ -155,9 +150,7 @@ export function outboundToFeed(send: OutboundSend, threads: ThreadNotes): FeedMe
   };
   if (threadId) frame.thread_id = threadId;
   if (note?.title) frame.thread_title = note.title;
-  if (!isRoot && !send.broadcast && note?.rootSender && note.rootSender !== send.self.handle) {
-    frame.to = send.targetContextId ? { handle: note.rootSender, context_id: send.targetContextId } : { handle: note.rootSender };
-  }
+  if (!isRoot && note?.rootSender && note.rootSender !== send.self.handle) frame.to = { handle: note.rootSender };
   return frame;
 }
 
@@ -166,9 +159,9 @@ export function feedContextName(sessionKey: string): string {
   return sessionKey.replace(/[^A-Za-z0-9._-]/g, "_") || "session";
 }
 
-/** `<stateDir>/bin/bridge-tail` — a stable path, so a shell alias survives plugin updates. */
+/** `<stateDir>/bin/einweave-tail` — a stable path, so a shell alias survives plugin updates. */
 export function launcherPath(stateDir: string): string {
-  return join(stateDir, "bin", "bridge-tail");
+  return join(stateDir, "bin", "einweave-tail");
 }
 
 const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -188,7 +181,7 @@ export function writeLauncher(stateDir: string, pluginRoot: string): string {
   const script =
     "#!/bin/sh\n" +
     "# Written by the Bridge plugin on every start (RFC-022 D10). Do not edit: it is replaced.\n" +
-    `exec ${shq(process.execPath)} ${shq(join(pluginRoot, "vendor", "bridge-agent-sdk", "tail-cli.js"))} --procs ${shq(stateDir)} "$@"\n`;
+    `exec ${shq(process.execPath)} ${shq(join(pluginRoot, "vendor", "einweave-agent-sdk", "tail-cli.js"))} --procs ${shq(stateDir)} "$@"\n`;
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, script, { mode: 0o700 });
   chmodSync(tmp, 0o700);
@@ -256,7 +249,7 @@ export async function startFeedTap(o: FeedTapOptions): Promise<FeedTap> {
     timer = setTimeout(() => reject(new Error(`did not open within ${FEED_OPEN_TIMEOUT_MS} ms`)), FEED_OPEN_TIMEOUT_MS);
   });
   const opening = (async () => {
-    const { feedServer } = await import("./vendor/bridge-agent-sdk/node.js");
+    const { feedServer } = await import("./vendor/einweave-agent-sdk/node.js");
     return feedServer({ stateDir: o.stateDir, contextId: feedContextName(o.sessionKey), hello: o.hello });
   })();
   // If the timeout wins, a late open is closed again rather than left serving unannounced.

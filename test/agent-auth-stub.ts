@@ -14,7 +14,7 @@
  *     CRC is checked before any database read): corrupt_state, attempt_invalid,
  *     session_key_invalid (mint); scope_invalid, corrupt_state, attempt_invalid,
  *     session_key_invalid (revoke);
- *   - every secret (`brg_ek_` / `brg_ac_` / `brg_dc_`) in the server's format with its CRC,
+ *   - every secret (`ew_ek_` / `ew_ac_` / `ew_dc_`) in the server's format with its CRC,
  *     judged (invalid_grant) BEFORE key_storage and the proof, as agent-credentials.ts does;
  *     an authorization code is burnt by ANY mismatch; the device grant checks client_id,
  *     paces polls (`interval`, default the server's 5 s ⇒ `slow_down`), and answers
@@ -93,6 +93,12 @@ export interface StubOptions {
    * repo's own manager.ts tests need.
    */
   tooOldMints?: number;
+  /** What GET /api/channels answers (`{channels}`); unset = the generic empty answer. */
+  channels?: Array<{ id: string; name: string }>;
+  /** Answers `/api/*` requests the stub does not know (after the credential check): return a Response to take it over. */
+  api?: (req: Request, url: URL) => Response | Promise<Response | undefined> | undefined;
+  /** The thread ids the `authenticated` frame reports as held (RFC-028). */
+  holds?: string[];
   /** The `error_description` `tooOldMints` answers with. Default: a `client_too_old:` one WITH a `>= x.y.z`; set to a `client_blocked:` one (which names none) to test the no-minimum fallback. */
   tooOldReason?: string;
 }
@@ -111,30 +117,30 @@ type Inst = {
 };
 type Sess = { id: string; instId: string; key: string; revoked: null | "manual" | "evicted" | "client_revoked"; lastUsed: number };
 
-const GRANT_ENROLMENT_KEY = "urn:bridge:params:oauth:grant-type:enrolment-key";
+const GRANT_ENROLMENT_KEY = "urn:einweave:params:oauth:grant-type:enrolment-key";
 const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 const ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const SKEW_S = 300;
-const UPDATE_PLUGIN_HINT = "update the Bridge plugin and run /bridge:login";
+const UPDATE_PLUGIN_HINT = "update the einweave plugin and run /einweave:login";
 const RETIRED_RFC014_GRANTS = new Set(["refresh_token", "urn:bridge:params:oauth:grant-type:session"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** C4. */
 const ATTEMPT_RE = /^[A-Za-z0-9_-]{22,128}$/;
 const SESSION_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 /** The plugin's public client (AGENT_AUTH_CLIENTS). */
-export const STUB_CLIENT_ID = "bridge-claude-plugin";
+export const STUB_CLIENT_ID = "einweave-claude-code";
 /** RFC 7636 §4.1. */
 const PKCE_VALUE_RE = /^[A-Za-z0-9._~-]{43,128}$/;
 const JKT_RE = /^[A-Za-z0-9_-]{43}$/;
 
-/** The server's secret format (agent-tokens.ts): `brg_<kind>_<43 base62><6 base62 CRC32>`. */
+/** The server's secret format (agent-tokens.ts): `ew_<kind>_<43 base62><6 base62 CRC32>`. */
 export function mintAgentToken(kind: "at" | "ek" | "ac" | "dc"): string {
-  const head = `brg_${kind}_${randomBase62(43)}`;
+  const head = `ew_${kind}_${randomBase62(43)}`;
   return head + base62(crc32(head), 6);
 }
 export function isAgentToken(kind: string, s: unknown): boolean {
   if (typeof s !== "string") return false;
-  const m = /^(brg_(at|ek|ac|dc)_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
+  const m = /^(ew_(at|ek|ac|dc)_[0-9A-Za-z]{43})([0-9A-Za-z]{6})$/.exec(s);
   return !!m && m[2] === kind && base62(crc32(m[1]!), 6) === m[3];
 }
 
@@ -170,6 +176,8 @@ export function createAuthCore(opts: StubOptions = {}) {
     apiHits: 0,
     /** Every refusal, as `<where>:<reason>` — the first thing to read when a test fails. */
     refusals: [] as string[],
+    /** The `kind` (and starting scope / takeover) of each WS auth frame, in order (RFC-028 D1). */
+    authDeclared: [] as Array<{ kind: unknown; scope?: unknown; takeover?: unknown }>,
   };
   const mint = mintAgentToken;
   const sockets = new Set<any>();
@@ -367,7 +375,7 @@ export function createAuthCore(opts: StubOptions = {}) {
         token_endpoint_auth_signing_alg_values_supported: ["ES256"],
         revocation_endpoint_auth_methods_supported: ["private_key_jwt"],
         dpop_signing_alg_values_supported: ["ES256"],
-        bridge_connect_done_uri: `${url.origin}/connect/done`,
+        einweave_connect_done_uri: `${url.origin}/connect/done`,
       });
     }
     if (url.pathname === "/api/agent-auth/authorize") {
@@ -522,7 +530,7 @@ export function createAuthCore(opts: StubOptions = {}) {
           // nothing below this line runs (no chain read, no lock, no session).
           if ((opts.tooOldMints ?? 0) > 0) {
             opts.tooOldMints!--;
-            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: bridge-claude-plugin >= 0.26.0 required — open /plugin → Installed → bridge → Update now, then /reload-plugins", 400);
+            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: einweave-claude-code >= 0.26.0 required — open /plugin → Installed → einweave → Update now, then /reload-plugins", 400);
           }
           if ((opts.rateLimitMints ?? 0) > 0) {
             opts.rateLimitMints!--;
@@ -669,7 +677,7 @@ export function createAuthCore(opts: StubOptions = {}) {
       enrolmentKeys.set(key, uses);
       return key;
     },
-    /** Register a specific key; it must be in the server's format (`brg_ek_…` + CRC) or it could never be redeemed. */
+    /** Register a specific key; it must be in the server's format (`ew_ek_…` + CRC) or it could never be redeemed. */
     addEnrolmentKey(key: string, uses = 1) {
       if (!isAgentToken("ek", key)) throw new Error(`stub: ${key} is not a well-formed enrolment key (use mintEnrolmentKey())`);
       enrolmentKeys.set(key, uses);
@@ -726,6 +734,16 @@ export function startAuthStub(opts: StubOptions = {}) {
       if (url.pathname === "/ws" && srv.upgrade(req, { data: { session: "" } })) return;
       const auth = await core.handleAuth(req);
       if (auth) return auth;
+      // A test's own API (and the channel list for EINWEAVE_CHANNELS names, RFC-028 D6). The credential is
+      // checked ONCE: a DPoP proof is single-use, so a second check of the same request would be a replay.
+      if (url.pathname.startsWith("/api/") && (opts.api || (url.pathname === "/api/channels" && opts.channels))) {
+        const denied = core.checkResource(req);
+        if (denied) return denied;
+        const r = await opts.api?.(req, url);
+        if (r) return core.withDate(r);
+        if (url.pathname === "/api/channels" && opts.channels) return core.withDate(Response.json({ channels: opts.channels }));
+        return core.withDate(Response.json([]));
+      }
       if (url.pathname.startsWith("/api/")) return core.checkResource(req) ?? core.withDate(Response.json([]));
       return core.withDate(new Response("not found", { status: 404 }));
     },
@@ -750,8 +768,9 @@ export function startAuthStub(opts: StubOptions = {}) {
           // RFC-027 §5, as the server: a v1 frame (no `v: 2`, or a `since` cursor) is a client too old.
           if (f.v !== 2 || f.since !== undefined) {
             core.stats.refusals.push("ws:v1");
-            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → bridge → Update now, then /reload-plugins");
+            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
           }
+          core.stats.authDeclared.push({ kind: f.kind, scope: f.scope, takeover: f.takeover });
           const forced = core.takeForcedAuthClose();
           if (forced) {
             core.stats.refusals.push(`ws:forced ${forced.code}`);
@@ -759,9 +778,14 @@ export function startAuthStub(opts: StubOptions = {}) {
           }
           const a = core.wsCheck(origin, f);
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
+          // RFC-028 D1, as the server: the credential is judged first (4001), THEN a connection must declare its kind.
+          if (!["gateway", "session", "observer"].includes(f.kind)) {
+            core.stats.refusals.push("ws:no-kind");
+            return core.closeLikeServer(ws, 4008, "client too old: open /plugin → Installed → einweave → Update now, then /reload-plugins");
+          }
           ws.data.session = a.session;
           const s = core.sessions.get(a.session)!;
-          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "agent-1", agentName: "Agent", contextId: s.key } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "agent-1", agentName: "Agent", contextId: s.key, kind: f.kind, scope: f.scope ? { mode: f.scope.mode, channelIds: f.scope.channelIds ?? [] } : { mode: "all", channelIds: [] }, holds: opts.holds ?? [] } }));
         } else if (f.type === "reauth") {
           const a = core.wsCheck(origin, f);
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");

@@ -35,7 +35,7 @@ import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { writeInstallation, writeKey, writeState } from "./key-fixtures";
-import { generateSoftwareKey } from "../vendor/bridge-agent-sdk/core/index.js";
+import { generateSoftwareKey } from "../vendor/einweave-agent-sdk/core/index.js";
 import { makeJoinState } from "./dpop-verify";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
@@ -372,7 +372,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
     expect(r.tookOver, "this must be a TAKEOVER line, not a plain first acquisition").toBe(true);
     expect(r.lock.pid, "the record now names the new (winning) process").not.toBe(process.pid);
     expect(r.lock.version).toBe(MY_VERSION);
-    expect(r.lock.software).toBe("bridge-claude-plugin");
+    expect(r.lock.software).toBe("einweave-claude-code");
     // finding 5/10: the TAKEOVER write path (tmp + rename), not just the first-ever
     // O_EXCL acquire, must also land at 0600.
     expect(r.lockMode).toBe(0o600);
@@ -933,11 +933,11 @@ describe("finding 1 (2026-09-27 re-review): the reconnect gate must not re-decid
 
       // B is OLDER, so this is a plain takeover notice, not the "/reload-plugins" one.
       const noticeDeadline = Date.now() + 5000;
-      while (Date.now() < noticeDeadline && !noticesA.some((c) => c.includes("/bridge:connect takeover moves it back"))) {
+      while (Date.now() < noticeDeadline && !noticesA.some((c) => c.includes("/einweave:connect takeover moves it back"))) {
         await Bun.sleep(30);
       }
       expect(
-        noticesA.some((c) => c.includes("/bridge:connect takeover moves it back")),
+        noticesA.some((c) => c.includes("/einweave:connect takeover moves it back")),
         "equal/older holder — plain takeover wording, not /reload-plugins"
       ).toBe(true);
     } finally {
@@ -1134,10 +1134,14 @@ describe("finding 4 (2026-09-27 re-review): the standby retry must not carry a s
       expect(afterFailedWrite.pid, "the failed write must not have claimed the lock").toBe(process.pid);
       expect(afterFailedWrite.version, "still the older holder's own record").toBe("0.1.0");
 
-      // Restore permissions, then plant a GENUINELY NEWER live holder — standing in for
-      // whoever legitimately holds the key by the time the retry fires.
-      chmodSync(locksDir, 0o700);
+      // Plant a GENUINELY NEWER live holder — standing in for whoever legitimately holds the key by the time
+      // the retry fires — WHILE THE DIRECTORY IS STILL READ-ONLY (the record is rewritten in place, which a
+      // 0o500 directory allows). Restoring permissions first left a window in which a 300 ms retry saw the OLDER
+      // 0.1.0 record, rightly took it over (a newer plugin may take an older holder), and its write could land
+      // after this test's plant: a flake that was the test's race, not the plugin's. Now there is no moment at
+      // which the plugin can write AND the lock still names the older holder.
       writeLock({ pid: process.pid, procStart: procStart(process.pid), sessionKey: SESSION_ID, at: new Date().toISOString(), version: "99.0.0" });
+      chmodSync(locksDir, 0o700);
 
       // Past several 300ms retry cycles.
       await Bun.sleep(300 * 4);

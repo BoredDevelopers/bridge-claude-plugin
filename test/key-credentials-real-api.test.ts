@@ -55,8 +55,8 @@ import {
   OAuthError,
   classifyTokenError,
   type Signer,
-} from "../vendor/bridge-agent-sdk/core/index.js";
-import type { AgentClient } from "../vendor/bridge-agent-sdk/index.js";
+} from "../vendor/einweave-agent-sdk/core/index.js";
+import type { AgentClient } from "../vendor/einweave-agent-sdk/index.js";
 import { readInstallation, readKey, readState, readAttempt, writeKey, writeState, writeInstallation, randomB64url, agentClientOn } from "./key-fixtures";
 import { PLUGIN_CLIENT_ID } from "../auth/client-id";
 import { startAuthStub } from "./agent-auth-stub";
@@ -92,12 +92,20 @@ async function pgReachable(): Promise<boolean> {
   }
 }
 const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
+// EINWEAVE_API_DIR says the person WANTS this gate. A Postgres that cannot be reached must then fail the file,
+// loudly -- a skip here reads as green and has already hidden a wrong default role (the container's is `bridge`).
+if (process.env.EINWEAVE_API_DIR && HAVE_SERVER && !HAVE_PG) {
+  throw new Error(`EINWEAVE_API_DIR is set but Postgres is not reachable at ${ADMIN_URL.replace(/:[^:@/]*@/, ":***@")} -- set EINWEAVE_TEST_PG_ADMIN_URL (the test container's role is "bridge"). Refusing to skip.`);
+}
+if (process.env.EINWEAVE_API_DIR && !HAVE_SERVER) {
+  throw new Error(`EINWEAVE_API_DIR=${process.env.EINWEAVE_API_DIR} has no src/index.ts. Refusing to skip.`);
+}
 const SERVER_TS = join(import.meta.dir, "..", "server.ts");
 const SEED_TS = join(import.meta.dir, "fixtures", "real-api-seed.ts");
 /** A build one patch above this one — admitted by the server's minimum, unlike anything older. */
 const NEWER_VERSION = PLUGIN_VERSION.replace(/(\d+)$/, (n) => String(Number(n) + 1));
 const AUTH_SECRET = "test-secret-at-least-32-characters-long";
-const GRANT_EK = "urn:bridge:params:oauth:grant-type:enrolment-key";
+const GRANT_EK = "urn:einweave:params:oauth:grant-type:enrolment-key";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── the scratch database (one per run) ─────────────────────────────────────────────────
@@ -237,7 +245,8 @@ async function plugin(apiUrl: string, dir: string, env: Record<string, string>):
     stderr: () => log,
     status,
     call,
-    connected: async () => (await status()).websocket === "connected",
+    // `local`: no API call -- a status that fetched the thread list would renew a token inside its expiry slack.
+    connected: async () => JSON.parse((await call("status", { local: true })).content[0].text).websocket === "connected",
     close: () => client.close().catch(() => {}),
   };
 }
@@ -350,7 +359,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
     token_auth_algs: meta.token_endpoint_auth_signing_alg_values_supported,
     revoke_auth: meta.revocation_endpoint_auth_methods_supported,
     dpop_algs: meta.dpop_signing_alg_values_supported,
-    done_uri: typeof meta.bridge_connect_done_uri === "string",
+    done_uri: typeof meta.einweave_connect_done_uri === "string",
   };
 
   // ── enrolment (§3.2) ──
@@ -360,7 +369,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   out.enrol_bad_key_storage = oauth(await post(tokenUrl, enrolBody({ key_storage: "tpm" }), { DPoP: await proof(k1.signer, tokenUrl) }));
   out.enrol_proof_wrong_htu = oauth(await post(tokenUrl, enrolBody(), { DPoP: await proof(k1.signer, revokeUrl) }));
   out.enrol_bad_enrolment_key = oauth(
-    await post(tokenUrl, enrolBody({ enrolment_key: "brg_ek_nope" }), { DPoP: await proof(k1.signer, tokenUrl) })
+    await post(tokenUrl, enrolBody({ enrolment_key: "ew_ek_nope" }), { DPoP: await proof(k1.signer, tokenUrl) })
   );
   const e1 = await post(tokenUrl, enrolBody({ key_storage: "software" }), { DPoP: await proof(k1.signer, tokenUrl) });
   out.enrol = {
@@ -406,7 +415,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
     status: m1.status,
     token_type: m1.json?.token_type,
     expires_in: typeof m1.json?.expires_in === "number" && m1.json.expires_in > 0,
-    access_token: /^brg_at_/.test(m1.json?.access_token ?? ""),
+    access_token: /^ew_at_/.test(m1.json?.access_token ?? ""),
     join_state_seq: joinStateSeq(m1.json?.join_state ?? ""),
     session_id: UUID.test(m1.json?.session_id ?? ""),
   };
@@ -448,7 +457,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   const wsProof = (token: string, htu = wsHtu(base)) => dpopProof(k1.signer, clock, { htm: "GET", htu, accessToken: token });
   const errors = (s: Sock) => s.frames.filter((f) => f.type === "error").map((f) => f.data?.message ?? f.message ?? null);
   const s1 = await openSocket(base);
-  s1.send({ type: "auth", v: 2, token: at, dpop: await wsProof(at) });
+  s1.send({ type: "auth", v: 2, kind: "session", token: at, dpop: await wsProof(at) });
   await s1.wait(() => s1.frames.some((f) => f.type === "authenticated") || s1.closed() !== null);
   out.ws_auth = { authenticated: s1.frames.some((f) => f.type === "authenticated"), closed: s1.closed() };
   const m3 = await mint({ state: S2 });
@@ -457,9 +466,9 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   await s1.wait(() => s1.frames.some((f) => f.type === "reauthenticated") || s1.closed() !== null);
   out.ws_reauth = { reauthenticated: s1.frames.some((f) => f.type === "reauthenticated"), closed: s1.closed() };
   for (const [name, frame] of [
-    ["ws_auth_no_proof", { type: "auth", v: 2, token: m3.json.access_token }],
-    ["ws_auth_wrong_htu", { type: "auth", v: 2, token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) }],
-    ["ws_auth_http_proof", { type: "auth", v: 2, token: m3.json.access_token, dpop: await resProof("GET", "/api/channels", m3.json.access_token) }],
+    ["ws_auth_no_proof", { type: "auth", v: 2, kind: "session", token: m3.json.access_token }],
+    ["ws_auth_wrong_htu", { type: "auth", v: 2, kind: "session", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) }],
+    ["ws_auth_http_proof", { type: "auth", v: 2, kind: "session", token: m3.json.access_token, dpop: await resProof("GET", "/api/channels", m3.json.access_token) }],
     // RFC-027 §5: a v1 frame (no `v`) is refused as a client too old — the cutover's one gate.
     ["ws_auth_v1", { type: "auth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) }],
   ] as const) {
@@ -472,7 +481,7 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   s1.close();
   await s1.wait(() => s1.closed() !== null);
   const s2 = await openSocket(base);
-  s2.send({ type: "auth", v: 2, token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) });
+  s2.send({ type: "auth", v: 2, kind: "session", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token) });
   await s2.wait(() => s2.frames.some((f) => f.type === "authenticated") || s2.closed() !== null);
   s2.send({ type: "reauth", token: m3.json.access_token, dpop: await wsProof(m3.json.access_token, `${base}/api/ws`) });
   await s2.wait(() => s2.closed() !== null);
@@ -503,13 +512,13 @@ async function probeWire(base: string, ek: string): Promise<Record<string, unkno
   const S4: string = after.json.join_state;
 
   // ── retired / unknown grants (E13) ──
-  out.grant_refresh_token = oauth(await post(tokenUrl, { grant_type: "refresh_token", refresh_token: "brg_rt_x" }));
-  out.grant_rfc014_session = oauth(await post(tokenUrl, { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "brg_it_x" }));
+  out.grant_refresh_token = oauth(await post(tokenUrl, { grant_type: "refresh_token", refresh_token: "ew_rt_x" }));
+  out.grant_rfc014_session = oauth(await post(tokenUrl, { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "ew_it_x" }));
   out.grant_unknown = oauth(await post(tokenUrl, { grant_type: "urn:example:nope" }));
 
   // ── a copy: a stale state LOCKS (E6d/E8) ──
   const s3 = await openSocket(base);
-  s3.send({ type: "auth", v: 2, token: after.json.access_token, dpop: await wsProof(after.json.access_token) });
+  s3.send({ type: "auth", v: 2, kind: "session", token: after.json.access_token, dpop: await wsProof(after.json.access_token) });
   await s3.wait(() => s3.frames.some((f) => f.type === "authenticated") || s3.closed() !== null);
   out.mint_stale_state_locks = oauth(await mint({ state: S1 }));
   await s3.wait(() => s3.closed() !== null);
@@ -763,7 +772,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       expect(joinStateSeq(readState(dir)!)).toBe(0); // …the machine never heard
       const tok = await m.accessToken();
       m.stop();
-      expect(tok).toMatch(/^brg_at_/);
+      expect(tok).toMatch(/^ew_at_/);
       const row = await grantRow(inst);
       expect(row.revoked_at).toBeNull();
       expect(Number(row.js_seq)).toBe(1); // replayed, not advanced again
@@ -824,7 +833,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
     }
   }, 90_000);
 
-  test("an owner revokes the session: 4008 \"session revoked\" → no mint of its own → /bridge:connect mints with reconnect=true and opens a NEW session", async () => {
+  test("an owner revokes the session: 4008 \"session revoked\" → no mint of its own → /einweave:connect mints with reconnect=true and opens a NEW session", async () => {
     const dir = tmp("keys-real-revoke-");
     const p = await plugin(api.url, dir, { EINWEAVE_ENROLMENT_KEY: enrolmentKey(), EINWEAVE_SESSION_KEY: "revoke-s1" });
     try {
@@ -834,7 +843,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       const del = await human(api.url, "DELETE", `/api/agents/${seed.agentId}/installations/${inst}/sessions/${s.id}`);
       expect(del.status).toBe(200);
       expect(await until(() => p.stderr().includes("WebSocket closed (4008 session revoked)"), 10_000), p.stderr()).toBe(true);
-      expect(await until(() => p.notices.some((n) => n.includes("/bridge:connect")), 10_000), JSON.stringify(p.notices)).toBe(true);
+      expect(await until(() => p.notices.some((n) => n.includes("/einweave:connect")), 10_000), JSON.stringify(p.notices)).toBe(true);
       // Blocked: nothing re-opens the session on its own.
       await Bun.sleep(3000);
       expect(await p.connected()).toBe(false);
@@ -852,6 +861,14 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       rmSync(dir, { recursive: true, force: true });
     }
   }, 90_000);
+
+  /** Is any session of THIS database waiting on a lock right now? */
+  const lockWaitSeen = async (): Promise<boolean> =>
+    (await q(`SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`)).length > 0;
+
+  test("the lock-wait barrier needs a real wait: with the gate never taken it times out (control)", async () => {
+    expect(await until(lockWaitSeen, 1_500)).toBe(false);
+  });
 
   test("the live-session cap evicts this session (AGENT_MAX_LIVE_SESSIONS=2): 4008 \"session evicted\" → a new session at once, no block, nothing told to the model", async () => {
     const dir = tmp("keys-real-evict-");
@@ -876,7 +893,10 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       const minting = s3.accessToken();
       expect(await entered("evict"), "the eviction gate was never reached").toBe(true);
       await p.call("connect");
-      expect(await until(p.connected, 8_000), p.stderr()).toBe(true);
+      // RFC-028: a socket's auth now WRITES the grant (its declared kind), and s1's grant row is locked by the
+      // gated eviction transaction -- so the auth cannot finish until the gate opens. Wait until Postgres shows a
+      // session blocked on a lock (the plugin's auth), do not wait for `connected` (that would wait on ourselves).
+      expect(await until(lockWaitSeen, 10_000), "no session ever waited on a lock: the barrier saw nothing to wait for").toBe(true);
       release("evict");
       await minting;
       expect(await until(() => p.stderr().includes("WebSocket closed (4008 session evicted)"), 10_000), p.stderr()).toBe(true);
@@ -923,8 +943,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
 
   test("retired RFC-014 grants answer invalid_grant rfc014_retired, which the plugin classifies update_required", async () => {
     for (const body of [
-      { grant_type: "refresh_token", refresh_token: "brg_rt_x" },
-      { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "brg_it_x", session_key: "x" },
+      { grant_type: "refresh_token", refresh_token: "ew_rt_x" },
+      { grant_type: "urn:bridge:params:oauth:grant-type:session", installation_token: "ew_it_x", session_key: "x" },
     ]) {
       const r = await fetch(`${api.url}/api/agent-auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const j = (await r.json()) as any;
@@ -1069,6 +1089,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
         // Past token 1's 4009: had the reauth been refused (4001) or ignored (4009 on token 1), the socket would be closed.
         await Bun.sleep(Math.max(0, T + 23_500 - Date.now()));
         expect(p.stderr()).not.toContain("WebSocket closed");
+        // `connected` asks `status {local: true}`: no API call. (A full status lists the threads that need someone -- an
+        // authenticated HTTP use that, inside the expiry slack, would mint and reauth token 2 and prevent this 4009.)
         expect(await p.connected()).toBe(true);
         // Token 2 (minted ≈ T+4 s) runs out at ≈ T+26 s — before the plugin's 15 s ticker (≥ T+29.5 s) renews it.
         expect(await until(() => p.stderr().includes("WebSocket closed (4009 token expired)"), 15_000), p.stderr()).toBe(true);

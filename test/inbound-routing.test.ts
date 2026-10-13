@@ -14,10 +14,12 @@
  *
  * WHAT IT PINS
  *   A  subscribed channel,   untargeted   -> surfaces
- *   B  other channel,       untargeted    -> filtered (EINWEAVE_CHANNELS honoured)
- *   C  other channel,       TARGETED      -> surfaces anyway
- *   D  our own `me-tasks`,  untargeted    -> filtered, like any other channel
- *   E  other channel,       @MENTION      -> surfaces anyway
+ *   B  other channel,       untargeted    -> not pushed (EINWEAVE_CHANNELS is the starting SCOPE, server-side)
+ *   D  our own `me-tasks`,  untargeted    -> not pushed, like any other channel
+ *   E  other channel,       @MENTION      -> not pushed either: scope narrows all UNHELD work (D6)
+ *
+ * 0.31.0 (RFC-028): the plugin filters nothing itself. Case C (explicit `contextId` targeting) is gone with
+ * the field -- the server answers 400; the hold is the target.
  *
  * C and E are the ones that matter most: a message addressed to THIS session
  * must arrive regardless of channel subscriptions. B is their control — without
@@ -77,6 +79,14 @@ async function pgReachable(): Promise<boolean> {
   }
 }
 const HAVE_PG = HAVE_SERVER ? await pgReachable() : false;
+// EINWEAVE_API_DIR says the person WANTS this gate. A Postgres that cannot be reached must then fail the file,
+// loudly -- a skip here reads as green and has already hidden a wrong default role (the container's is `bridge`).
+if (process.env.EINWEAVE_API_DIR && HAVE_SERVER && !HAVE_PG) {
+  throw new Error(`EINWEAVE_API_DIR is set but Postgres is not reachable at ${ADMIN_URL.replace(/:[^:@/]*@/, ":***@")} -- set EINWEAVE_TEST_PG_ADMIN_URL (the test container's role is "bridge"). Refusing to skip.`);
+}
+if (process.env.EINWEAVE_API_DIR && !HAVE_SERVER) {
+  throw new Error(`EINWEAVE_API_DIR=${process.env.EINWEAVE_API_DIR} has no src/index.ts. Refusing to skip.`);
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -88,7 +98,7 @@ afterAll(async () => {
 
 describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
   test(
-    "targeted messages bypass the channel filter; untargeted ones respect it",
+    "the session scope (EINWEAVE_CHANNELS) narrows all unheld work: in-scope surfaces, out-of-scope -- mentions included -- does not",
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "bridge-plugin-test-"));
 
@@ -183,10 +193,10 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
 
       // `other` signs in the real way (RFC-016): a fresh key, the enrolment-key grant with a
       // DPoP proof, then a client_credentials mint — through `@bridge/agent-sdk`'s core.
-      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/bridge-agent-sdk/core/index.js");
+      const { TokenClient, Clock, generateSoftwareKey, dpopProof, httpHtu } = await import("../vendor/einweave-agent-sdk/core/index.js");
       const { randomB64url } = await import("./key-fixtures");
       const clockOther = new Clock();
-      const tc = new TokenClient({ clock: clockOther, clientId: "bridge-claude-plugin" });
+      const tc = new TokenClient({ clock: clockOther, clientId: "einweave-claude-code" });
       const meta = await tc.discover(URL_);
       const { signer: signerOther } = await generateSoftwareKey();
       const enrolled = await tc.enrolWithKey(meta, signerOther, { enrolmentKey: KEY_OTHER, installationName: "inbound-routing test" });
@@ -199,7 +209,7 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
           reconnect: false,
         })
       ).access_token;
-      expect(TOK_OTHER, "other agent could not sign in").toMatch(/^brg_at_/);
+      expect(TOK_OTHER, "other agent could not sign in").toMatch(/^ew_at_/);
 
       const plugin = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
         env: {
@@ -303,9 +313,6 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       await post(CH["other-tasks"]!, "case-B-unsubscribed-untargeted");
       const gotB = await awaitArrival("case-B-unsubscribed-untargeted");
 
-      await post(CH["other-tasks"]!, "case-C-targeted", ctx);
-      const gotC = await awaitArrival("case-C-targeted");
-
       // D: OUR OWN `me-tasks`, unsubscribed and unaddressed. Delivered
       // unconditionally before the exemption was removed.
       await post(CH["me-tasks"]!, "case-D-own-tasks-channel");
@@ -322,8 +329,8 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
        * same filter, opposite outcome — so E is not vacuous. Mentions are on by
        * default server-side; `@me` is matched as a whole token against the id.
        */
-      await post(CH["other-tasks"]!, "@me case-E-mention-pierces-filter");
-      const gotE = await awaitArrival("case-E-mention-pierces-filter");
+      await post(CH["other-tasks"]!, "@me case-E-mention-out-of-scope");
+      const gotE = await awaitArrival("case-E-mention-out-of-scope");
 
       // The inbound path must never throw. This is the assertion that would
       // have caught 0.11.0 on the very first message.
@@ -332,14 +339,13 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
 
       expect(threw, `inbound handler threw: ${threw.join(" | ")}`).toEqual([]);
       expect(gotA, "subscribed + untargeted should surface").toBe(true);
-      expect(gotB, "unsubscribed + untargeted should be filtered").toBe(false);
-      expect(gotC, "TARGETED at this session must surface regardless of filter").toBe(true);
-      expect(gotD, "our own `-tasks` channel no longer bypasses the filter").toBe(false);
-      expect(gotE, "an @mention must pierce the channel filter").toBe(true);
-      expect(errLines.some((l) => l.includes(`FILTERED ch=${CH["other-tasks"]}`)),
-        "expected the client filter to log the drop").toBe(true);
-      expect(errLines.some((l) => l.includes(`FILTERED ch=${CH["me-tasks"]}`)),
-        "expected our own -tasks channel to be dropped by the filter too").toBe(true);
+      expect(gotB, "unsubscribed + untargeted is outside the session's scope: the server does not push it").toBe(false);
+      expect(gotD, "our own `-tasks` channel has no exemption from the scope").toBe(false);
+      // E, decided 2026-10-13 (RFC-028 D6): scope narrows ALL unheld work, mentions included. A mention in a
+      // channel outside this session's scope is not pushed to it -- it goes to the gateway, or waits in the
+      // takeable list. (0.30 let a mention pierce the plugin's filter; that filter is gone.)
+      expect(gotE, "an @mention in an out-of-scope channel is unheld work: not pushed to this session").toBe(false);
+      expect(errLines.some((l) => l.includes("FILTERED ch="))).toBe(false); // the client has no filter left to log one
     },
     120_000
   );

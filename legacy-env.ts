@@ -18,7 +18,7 @@ const LEGACY: ReadonlyArray<readonly [string, string]> = [
   ["BRIDGE_SESSION_KEY", "EINWEAVE_SESSION_KEY"],
   ["BRIDGE_SESSION_LABEL", "EINWEAVE_SESSION_LABEL"],
   ["BRIDGE_BROWSER", "EINWEAVE_BROWSER"],
-  ["BRIDGE_TOKEN", "nothing — static tokens are retired; sign in with /bridge:login"],
+  ["BRIDGE_TOKEN", "nothing — static tokens are retired; sign in with /einweave:login"],
   ["BRIDGE_CONTEXT_CLAIM_MODE", "nothing — no longer used"],
 ];
 

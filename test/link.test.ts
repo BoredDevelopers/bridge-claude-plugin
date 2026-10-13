@@ -3,7 +3,7 @@
  * entries → channel notifications, pending until the model has them.
  */
 import { describe, test, expect } from "bun:test";
-import { Pending, type Entry, type Inbound } from "../vendor/bridge-agent-sdk/index.js";
+import { Pending, type Entry, type Inbound } from "../vendor/einweave-agent-sdk/index.js";
 import { channelAdapter, render, type AdapterDeps, type Rendered } from "../link/adapter";
 import { deliveredEntryId } from "../delivery/tags";
 
@@ -21,7 +21,7 @@ function msg(id: string, over: Partial<Inbound> = {}): Inbound {
     agentName: "Kai",
     senderHandle: "kai",
     senderContextId: "01992f6e-0000-7000-8000-00000000bbbb",
-    metadata: JSON.stringify({ contextId: ME.grant, contextLabel: "my window" }),
+    metadata: JSON.stringify({}),
     deliveryReasons: ["broadcast" as never],
     ...over,
   } as Inbound;
@@ -31,7 +31,7 @@ const asEntry = (m: Inbound): Entry => ({ kind: "message", id: m.id, redelivery:
 /** The host's rendering of a channel notification (measured shape, delivery/tags.ts). */
 function hostTag(r: Rendered): string {
   const attrs = Object.entries(r.meta).map(([k, v]) => `${k}="${v}"`).join(" ");
-  return `<channel source="plugin:bridge:bridge" ${attrs}>\n${r.content}\n</channel>`;
+  return `<channel source="plugin:einweave:einweave" ${attrs}>\n${r.content}\n</channel>`;
 }
 
 function harness(over: Partial<AdapterDeps> = {}) {
@@ -60,7 +60,7 @@ describe("link/adapter — what reaches the model", () => {
     const r = render(asEntry(msg("01992f6e-0000-7000-8000-0000000000a1")));
     expect(Object.keys(r.meta).slice(0, 2)).toEqual(["channel_id", "message_id"]);
     expect(deliveredEntryId(hostTag(r))).toBe(r.meta.message_id);
-    expect(r.meta).toMatchObject({ sender: "Kai", sender_handle: "kai", type: "question", context_id: ME.grant, context_label: "my window", sender_context_id: "01992f6e-0000-7000-8000-00000000bbbb" });
+    expect(r.meta).toMatchObject({ sender: "Kai", sender_handle: "kai", type: "question", sender_context_id: "01992f6e-0000-7000-8000-00000000bbbb" });
   });
 
   test("task events and action requests carry their entry id as message_id, first", () => {
@@ -90,12 +90,16 @@ describe("link/adapter — what reaches the model", () => {
     expect(h.pushed).toEqual(["b2"]);
   });
 
-  test("targeted at another session of this agent → dismissed; at this one → surfaced", async () => {
+  test("RFC-028: a sibling session's contribution to a thread this session holds is surfaced, naming the holder; the old per-message target is gone", async () => {
     const h = harness();
+    // A pre-0.31 server stamped contextId; it means nothing now -- the hold is the target.
     await h.adapter.push!(asEntry(msg("e1", { metadata: JSON.stringify({ contextId: "other-grant", contextAgentId: ME.agent }) })));
-    await h.adapter.push!(asEntry(msg("e2", { metadata: JSON.stringify({ contextId: ME.grant, contextAgentId: ME.agent }) })));
-    expect(h.dismissed).toEqual(["e1"]);
-    expect(h.pushed).toEqual(["e2"]);
+    await h.adapter.push!(asEntry(msg("e2", { agentId: ME.agent, deliveryReasons: ["thread" as never], metadata: JSON.stringify({ contribution: { holder: { id: ME.grant, label: "my window #aaaa" } } }) })));
+    expect(h.dismissed).toEqual([]);
+    expect(h.pushed).toEqual(["e1", "e2"]);
+    expect(h.notified[0]!.meta.context_id).toBeUndefined();
+    expect(h.notified[1]!.meta).toMatchObject({ contribution_holder_id: ME.grant, contribution_holder: "my window #aaaa" });
+    expect(Object.keys(h.notified[1]!.meta).slice(0, 2)).toEqual(["channel_id", "message_id"]);
   });
 
   test("nothing is pushed before the host is ready", async () => {

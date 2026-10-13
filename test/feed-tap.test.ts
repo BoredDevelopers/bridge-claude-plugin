@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ThreadNotes, feedContextName, inboundToFeed, launcherPath, outboundToFeed, sweepStaleFeedSockets, writeLauncher } from "../feed-tap";
-import { feedClient, type FeedClient } from "../vendor/bridge-agent-sdk/node.js";
+import { feedClient, type FeedClient } from "../vendor/einweave-agent-sdk/node.js";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
 
@@ -81,7 +81,7 @@ describe("inboundToFeed", () => {
 
 describe("outboundToFeed", () => {
   const self = { id: "a-me", handle: "bellman" };
-  const send = { id: "o1", channelId: "c1", channelName: "dev", threadId: "", resultThreadId: "t9", title: "", type: "task", text: "Please rerun the suite.\nOnly recovery.", self, broadcast: false, targetContextId: "" };
+  const send = { id: "o1", channelId: "c1", channelName: "dev", threadId: "", resultThreadId: "t9", title: "", type: "task", text: "Please rerun the suite.\nOnly recovery.", self };
 
   test("a new root: no recipient, the title is the explicit one or the first line", () => {
     const f = outboundToFeed(send, new ThreadNotes());
@@ -97,10 +97,6 @@ describe("outboundToFeed", () => {
     const f = outboundToFeed(reply, threads);
     expect(f).toMatchObject({ is_root: false, thread_id: "t1", thread_title: "Is it safe?" });
     expect(f.to).toEqual({ handle: "kevin" });
-    // The session the server actually targeted rides along…
-    expect(outboundToFeed({ ...reply, id: "o4", targetContextId: "ctx-kevin-2" }, threads).to).toEqual({ handle: "kevin", context_id: "ctx-kevin-2" });
-    // …and a forced broadcast has no single recipient at all.
-    expect(outboundToFeed({ ...reply, id: "o5", broadcast: true }, threads).to).toBeUndefined();
   });
 
   test("a reply into our own thread, or one we never saw, names no recipient", () => {
@@ -129,17 +125,17 @@ describe("launcher", () => {
     try {
       const path = writeLauncher(dir, "/plugins/it's here/0.27.0");
       expect(path).toBe(launcherPath(dir));
-      expect(path).toBe(join(dir, "bin", "bridge-tail"));
+      expect(path).toBe(join(dir, "bin", "einweave-tail"));
       expect(statSync(path).mode & 0o777).toBe(0o700);
       const script = readFileSync(path, "utf8");
       expect(script.startsWith("#!/bin/sh\n")).toBe(true);
       // Paths are single-quoted, with an embedded quote closed, escaped and reopened.
       // The runtime is named by absolute path: the pane's PATH may not have it.
-      expect(script).toContain(`exec '${process.execPath}' '/plugins/it'\\''s here/0.27.0/vendor/bridge-agent-sdk/tail-cli.js' --procs '${dir}' "$@"`);
+      expect(script).toContain(`exec '${process.execPath}' '/plugins/it'\\''s here/0.27.0/vendor/einweave-agent-sdk/tail-cli.js' --procs '${dir}' "$@"`);
       expect(statSync(join(dir, "bin")).mode & 0o777).toBe(0o700);
       // Rewriting (the next start, or a second window) leaves one file and no temp behind.
       writeLauncher(dir, "/plugins/next/0.28.0");
-      expect(readdirSync(join(dir, "bin"))).toEqual(["bridge-tail"]);
+      expect(readdirSync(join(dir, "bin"))).toEqual(["einweave-tail"]);
       expect(readFileSync(path, "utf8")).toContain("/plugins/next/0.28.0/");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -343,7 +339,7 @@ describe("a running plugin serves its feed", () => {
     expect(statSync(rec.feed).mode & 0o777).toBe(0o600);
     expect(statSync(join(rec.feed, "..")).mode & 0o777).toBe(0o700);
     // The @handle from the authenticated frame, not the display name.
-    expect(hello).toMatchObject({ v: 1, software_id: "bridge-claude-plugin", label: "feed-test", agent: { id: "bellman-id", handle: "bellman" } });
+    expect(hello).toMatchObject({ v: 1, software_id: "einweave-claude-code", label: "feed-test", agent: { id: "bellman-id", handle: "bellman" } });
   }, 30_000);
 
   test("an inbound message reaches the feed IN FULL, with the channel's name, stripped", async () => {
@@ -379,7 +375,7 @@ describe("a running plugin serves its feed", () => {
     }
   }
 
-  test("a message the plugin does NOT surface is not in the feed: every skip, each at its own point", async () => {
+  test("a message the plugin does NOT surface is not in the feed: every skip, each at its own point (RFC-028: no per-message target any more -- the hold decides)", async () => {
     await boot();
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
@@ -387,8 +383,6 @@ describe("a running plugin serves its feed", () => {
       { data: { id: "skip-own-send", channelId: "chan-dev-id", agentName: "bellman", content: "echo", senderContextId: "ctx-under-test" }, deliveryReasons: ["target"] },
       // Skipped in the adapter: this agent's own message from another of its sessions, unaddressed.
       { data: { id: "skip-own-agent", channelId: "chan-dev-id", agentId: "bellman-id", agentName: "bellman", content: "from my other window", senderContextId: "ctx-other" } },
-      // Skipped in the adapter: targeted at ANOTHER session of this agent.
-      { data: { id: "skip-other-context", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "for the other window", metadata: JSON.stringify({ contextId: "ctx-other", contextAgentId: "bellman-id" }) }, deliveryReasons: ["mention"] },
     ]);
     expect(seen).toEqual(["msg-barrier"]);
   }, 30_000);
@@ -432,16 +426,14 @@ describe("a running plugin serves its feed", () => {
     expect(order).toEqual([["ord-2-new-channel", "ops"], ["ord-3-known-channel", "dev"]]);
   }, 40_000);
 
-  test("a channel outside EINWEAVE_CHANNELS is filtered from the feed exactly as from the host", async () => {
+  test("there is no client-side channel filter (RFC-028 D6): EINWEAVE_CHANNELS no longer drops what the server pushes", async () => {
     await boot({ EINWEAVE_CHANNELS: "ops" });
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
-      // Broadcast traffic in #dev, which is not in the filter: dropped by the Session's broadcast filter.
-      { data: { id: "skip-filtered", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "broadcast in a filtered channel" }, deliveryReasons: ["channel"] },
+      // #dev is not in EINWEAVE_CHANNELS. The server's scope keeps such work from being sent at all; what it DOES send, the client shows.
+      { data: { id: "not-filtered", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "broadcast in another channel" }, deliveryReasons: ["channel"] },
     ]);
-    // The barrier is a mention, which bypasses the filter — and is the only thing in the feed.
-    expect(seen).toEqual(["msg-barrier"]);
-    expect(out).not.toContain("skip-filtered");
+    expect(seen).toEqual(["not-filtered", "msg-barrier"]);
   }, 30_000);
 
   test("the feed says what the link is doing: reconnecting after a drop, connected again, stopped when it is not coming back", async () => {

@@ -2,7 +2,7 @@
  * RFC-016 through the real MCP server (server.ts over stdio) against the strict
  * agent-auth stub: the socket authenticates with a DPoP token + proof, 4009 mints
  * again, a scheduled mint reauths in-band with a proof, 4008 stops per reason, an
- * HTTP 401 mints once, every HTTP request is proven, and /bridge:login switches the
+ * HTTP 401 mints once, every HTTP request is proven, and /einweave:login switches the
  * live connection.
  *
  * Task 7 ports the RFC-014 suite scenario for scenario (same names where the
@@ -17,7 +17,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { startAuthStub, type StubOptions } from "./agent-auth-stub";
-import { joinStateSeq } from "../vendor/bridge-agent-sdk/core/index.js";
+import { joinStateSeq } from "../vendor/einweave-agent-sdk/core/index.js";
 import { enrolledProfile, readInstallation, readState, agentClientOn } from "./key-fixtures";
 
 /**
@@ -113,7 +113,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     const ek = stub.mintEnrolmentKey();
     await withPlugin(stub, { EINWEAVE_ENROLMENT_KEY: ek }, async (client, dir) => {
       expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-      expect(stub.stats.authTokens[0]).toStartWith("brg_at_");
+      expect(stub.stats.authTokens[0]).toStartWith("ew_at_");
       expect(stub.stats.refusals.filter((r) => r.startsWith("ws:"))).toEqual([]);
       expect(stub.stats.enrols).toBe(1);
       expect(joinStateSeq(readState(dir)!)).toBe(1);
@@ -186,7 +186,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("C14: 4001 drops the token and re-mints ONCE immediately; a second 4001 in a row takes the slow backoff (from its FIRST step) and says /bridge:login once; /bridge:connect re-arms", async () => {
+  test("C14: 4001 drops the token and re-mints ONCE immediately; a second 4001 in a row takes the slow backoff (from its FIRST step) and says /einweave:login once; /einweave:connect re-arms", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
@@ -203,7 +203,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(stub.stats.mints).toBe(2);
         // The second 4001 (before any `authenticated`): slow, and the model is told once.
         expect(await until(() => refusedNotices().length === 1, 5_000)).toBe(true);
-        expect(refusedNotices()[0]).toContain("/bridge:login");
+        expect(refusedNotices()[0]).toContain("/einweave:login");
         // C1: the immediate re-mint did not spend attempt 1 — the slow retry is the 30–60 s step.
         const ws = String((await status(client)).websocket);
         expect(ws).toContain("4001");
@@ -214,7 +214,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         await Bun.sleep(1_000); // a negative: nothing inside the slow step
         expect(stub.stats.authTokens).toHaveLength(2);
         expect(refusedNotices()).toHaveLength(1);
-        // The person acts: /bridge:connect re-arms the one immediate re-mint.
+        // The person acts: /einweave:connect re-arms the one immediate re-mint.
         await client.callTool({ name: "connect", arguments: {} });
         expect(await until(connected, 5_000)).toBe(true);
         stub.closeAll(4001, "Invalid token");
@@ -227,7 +227,7 @@ describe("plugin on key credentials (RFC-016)", () => {
 
   // The re-arm after a socket stayed up REMINT_REARM_MS (30 s) is the SDK Session's, proven
   // there on a fake clock (agent-sdk test/runtime/session.test.ts "M2").
-  test("C14 flap guard: a 4001 soon after the immediate re-mint's auth is NOT immediate again; /bridge:connect re-arms it", async () => {
+  test("C14 flap guard: a 4001 soon after the immediate re-mint's auth is NOT immediate again; /einweave:connect re-arms it", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
@@ -312,7 +312,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 40_000);
 
-  test("4008 session revoked: stops, says /bridge:connect, and connect mints with reconnect=true into a new session", async () => {
+  test("4008 session revoked: stops, says /einweave:connect, and connect mints with reconnect=true into a new session", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
@@ -321,7 +321,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
         const inst = readInstallation(dir)!.installationId;
         stub.revokeSession(stub.sessionsFor(inst)[0]!.id);
-        expect(await until(() => notices().some((n) => n.includes("/bridge:connect starts a new session")), 5_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("/einweave:connect starts a new session")), 5_000)).toBe(true);
         await Bun.sleep(1_000); // a negative
         expect(stub.stats.authTokens).toHaveLength(1);
         // A tool call in between must not sneak a mint through.
@@ -353,7 +353,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(stub.sessionsFor(inst)).toHaveLength(2);
         expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
         expect(notices()).toEqual([]);
-        // Not blocked: a tool call works without /bridge:connect.
+        // Not blocked: a tool call works without /einweave:connect.
         const r: any = await client.callTool({ name: "list_channels", arguments: {} });
         expect(r.isError).not.toBe(true);
       },
@@ -361,7 +361,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("4008 installation revoked: key + state deleted, told to run /bridge:login, no reconnect", async () => {
+  test("4008 installation revoked: key + state deleted, told to run /einweave:login, no reconnect", async () => {
     const stub = startAuthStub();
     await withPlugin(
       stub,
@@ -369,7 +369,7 @@ describe("plugin on key credentials (RFC-016)", () => {
       async (client, dir, notices) => {
         expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
         stub.revokeInstallation(readInstallation(dir)!.installationId);
-        expect(await until(() => notices().some((n) => n.includes("/bridge:login")), 5_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("/einweave:login")), 5_000)).toBe(true);
         expect(readInstallation(dir)).toBeNull();
         expect(existsSync(join(dir, "key.json"))).toBe(false);
         await Bun.sleep(1_000); // a negative
@@ -446,7 +446,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     }
   }, 30_000);
 
-  test("locked by ANOTHER process of this machine: the 4008 'installation locked' alone signs this one out, and a later /bridge:login elsewhere is picked up", async () => {
+  test("locked by ANOTHER process of this machine: the 4008 'installation locked' alone signs this one out, and a later /einweave:login elsewhere is picked up", async () => {
     const stub = startAuthStub();
     const loot = mkdtempSync(join(tmpdir(), "loot2-"));
     try {
@@ -465,7 +465,7 @@ describe("plugin on key credentials (RFC-016)", () => {
           expect(stub.stats.locks).toBe(1);
           expect(await until(() => notices().some((n) => n.includes("credential copy detected")), 5_000)).toBe(true);
           expect((await status(client)).configured).toBe(false);
-          // The person re-enrols in another session; this one follows without /bridge:connect.
+          // The person re-enrols in another session; this one follows without /einweave:connect.
           await enrolledProfile(stub, dir);
           expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
         },
@@ -491,12 +491,12 @@ describe("plugin on key credentials (RFC-016)", () => {
           "session superseded: a newer Bridge plugin took over in another window of this session"
         );
         expect(await until(() => stub.stats.authTokens.length >= 1, 10_000)).toBe(true);
-        expect(await until(() => notices().some((n) => n.includes("/bridge:connect takeover")), 5_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("/einweave:connect takeover")), 5_000)).toBe(true);
         // D3: a plain connect must not resume it — only takeover:true does.
         await client.callTool({ name: "connect", arguments: {} });
         await Bun.sleep(300);
         expect(stub.stats.authTokens).toHaveLength(1);
-        await client.callTool({ name: "connect", arguments: { takeover: true } });
+        await client.callTool({ name: "connect", arguments: { takeover: "lock" } });
         expect(await until(() => stub.stats.authTokens.length >= 2, 5_000)).toBe(true);
         expect(await until(async () => (await status(client)).websocket === "connected", 5_000)).toBe(true);
 
@@ -508,11 +508,11 @@ describe("plugin on key credentials (RFC-016)", () => {
         // reconnect — including this one — is dead on arrival.
         const installationId = readInstallation(dir)!.installationId;
         stub.revokeInstallation(installationId);
-        expect(await until(() => notices().some((n) => n.includes("/bridge:login")), 5_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("/einweave:login")), 5_000)).toBe(true);
         expect(readInstallation(dir)).toBeNull();
 
         // Another session on this machine logs in — the credential watch notices the
-        // files reappear and reconnects WITHOUT a /bridge:connect (same shape as
+        // files reappear and reconnects WITHOUT a /einweave:connect (same shape as
         // "locked by ANOTHER process" above). If `superseded` never got cleared, this
         // call is `connectUnlessDuplicate()` with no `takeover` — it returns
         // immediately and this assertion times out.
@@ -616,7 +616,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("/bridge:login on an unconfigured machine: URL returned, approval connects the session", async () => {
+  test("/einweave:login on an unconfigured machine: URL returned, approval connects the session", async () => {
     const stub = startAuthStub();
     await withPlugin(stub, {}, async (client, dir, notices) => {
       expect((await status(client)).configured).toBe(false);
@@ -644,7 +644,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         stub.revokeInstallation(old); // …and revoked the old one.
         expect(await until(() => stub.stats.authTokens.length >= 2, 10_000)).toBe(true);
         expect(stub.sessionsFor(fresh)).toHaveLength(1);
-        expect(notices().some((n) => n.includes("/bridge:login"))).toBe(false);
+        expect(notices().some((n) => n.includes("/einweave:login"))).toBe(false);
       },
       enrolledIn(stub)
     );
@@ -670,7 +670,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(stub.stats.authTokens).toHaveLength(1); // no reconnect needed
         expect((await status(client)).websocket).toBe("connected");
         expect(readInstallation(dir)?.installationId).toBe(fresh);
-        expect(notices().some((n) => n.includes("/bridge:login"))).toBe(false);
+        expect(notices().some((n) => n.includes("/einweave:login"))).toBe(false);
       },
       enrolledIn(stub)
     );
@@ -689,7 +689,7 @@ describe("plugin on key credentials (RFC-016)", () => {
         expect(await until(() => stub.stats.reauthTokens.length >= 1, 5_000)).toBe(true);
         const session = stub.sessionsFor(fresh)[0]!;
         stub.revokeSession(session.id); // closes this socket 4008 "session revoked"
-        expect(await until(() => notices().some((n) => n.includes("/bridge:connect starts a new session")), 5_000)).toBe(true);
+        expect(await until(() => notices().some((n) => n.includes("/einweave:connect starts a new session")), 5_000)).toBe(true);
         const mints = stub.stats.mintBodies.length;
         // Blocked HERE, without asking the server: a tool call sends no mint.
         await client.callTool({ name: "list_channels", arguments: {} });
@@ -733,7 +733,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("a login done in ANOTHER session is picked up without /bridge:connect here", async () => {
+  test("a login done in ANOTHER session is picked up without /einweave:connect here", async () => {
     const stub = startAuthStub();
     await withPlugin(stub, { EINWEAVE_TEST_CREDENTIAL_WATCH_MS: "200" }, async (client, dir, _n, _p, stderr) => {
       expect((await status(client)).configured).toBe(false);
@@ -782,7 +782,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("a stop-class refusal (a pre-RFC-016 server): told once — the credential watch neither reopens the socket nor re-mints; a new installation on disk, or /bridge:connect, tries again", async () => {
+  test("a stop-class refusal (a pre-RFC-016 server): told once — the credential watch neither reopens the socket nor re-mints; a new installation on disk, or /einweave:connect, tries again", async () => {
     const stub = startAuthStub({ legacyServer: true });
     const told = (notices: () => string[]) => notices().filter((n) => n.includes("must be upgraded")).length;
     await withPlugin(
@@ -812,7 +812,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("a clock refusal (C13) stops, keeping the files; /bridge:connect after the fix connects — and the credential watch then leaves the healthy socket alone", async () => {
+  test("a clock refusal (C13) stops, keeping the files; /einweave:connect after the fix connects — and the credential watch then leaves the healthy socket alone", async () => {
     const opts: StubOptions = { rejectAssertions: true };
     const stub = startAuthStub(opts);
     await withPlugin(
@@ -834,7 +834,7 @@ describe("plugin on key credentials (RFC-016)", () => {
     );
   }, 30_000);
 
-  test("/bridge:connect out of a stop starts a new episode: a pending credential watch does not ALSO reconnect over it (exactly one socket)", async () => {
+  test("/einweave:connect out of a stop starts a new episode: a pending credential watch does not ALSO reconnect over it (exactly one socket)", async () => {
     const opts: StubOptions = { rejectAssertions: true };
     const stub = startAuthStub(opts);
     await withPlugin(

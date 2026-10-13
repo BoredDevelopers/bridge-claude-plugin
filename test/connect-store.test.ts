@@ -9,7 +9,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, utimesSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles } from "../connect-store";
+import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles, connectKindFileFor, readConnectKind, writeConnectKind, readScopeSet, writeScopeSet, connectScopeFileFor, touchSessionFiles } from "../connect-store";
 
 let dir = "";
 beforeEach(() => {
@@ -127,3 +127,86 @@ describe("sweepConnectStateFiles", () => {
   });
 });
 
+
+describe("RFC-028 D1: the declared kind rides in its own file", () => {
+  test("round-trips, and the 0/1 intent file a 0.30 window reads is untouched", () => {
+    writeConnectState(dir, "k", true);
+    writeConnectKind(dir, "k", "gateway");
+    expect(readConnectKind(dir, "k")).toBe("gateway");
+    expect(readConnectState(dir, "k")).toBe(true);
+    expect(readFileSync(connectStateFileFor(dir, "k"), "utf8")).toBe("1\n");
+    writeConnectKind(dir, "k", "session");
+    expect(readConnectKind(dir, "k")).toBe("session");
+  });
+
+  test("no file, and content this store did not write, read as undefined (never a crash, never a kind)", () => {
+    expect(readConnectKind(dir, "none")).toBeUndefined();
+    writeFileSync(connectKindFileFor(dir, "junk"), "observer\n");
+    expect(readConnectKind(dir, "junk")).toBeUndefined();
+  });
+
+  test("the sweep removes a stale kind file but keeps the current key's, backdated or not", () => {
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    const old = new Date(Date.now() - maxAgeMs - 60_000);
+    writeConnectKind(dir, "stale", "gateway");
+    writeConnectKind(dir, "current", "gateway");
+    utimesSync(connectKindFileFor(dir, "stale"), old, old);
+    utimesSync(connectKindFileFor(dir, "current"), old, old);
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "current"), maxAgeMs, connectKindFileFor(dir, "current"));
+    expect(existsSync(connectKindFileFor(dir, "stale"))).toBe(false);
+    expect(existsSync(connectKindFileFor(dir, "current"))).toBe(true);
+  });
+});
+
+describe("RFC-028 D6: the scope-set marker, and keeping a live window's files out of the sweep", () => {
+  test("round-trips; a missing file reads false", () => {
+    expect(readScopeSet(dir, "k")).toBe(false);
+    writeScopeSet(dir, "k");
+    expect(readScopeSet(dir, "k")).toBe(true);
+  });
+
+  test("touching a window's files refreshes their age, so another window's 24 h sweep leaves them alone", () => {
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    const old = new Date(Date.now() - maxAgeMs - 60_000);
+    writeConnectState(dir, "alive", true);
+    writeConnectKind(dir, "alive", "gateway");
+    writeScopeSet(dir, "alive");
+    for (const f of [connectStateFileFor(dir, "alive"), connectKindFileFor(dir, "alive"), connectScopeFileFor(dir, "alive")]) utimesSync(f, old, old);
+    touchSessionFiles(dir, "alive");
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "someone-else"), maxAgeMs);
+    expect(readConnectKind(dir, "alive")).toBe("gateway");
+    expect(readScopeSet(dir, "alive")).toBe(true);
+    expect(readConnectState(dir, "alive")).toBe(true);
+    // Control: untouched, the connect-state file ages out -- and with it, now, the window's kind and scope records.
+    utimesSync(connectStateFileFor(dir, "alive"), old, old);
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "someone-else"), maxAgeMs);
+    expect(readConnectState(dir, "alive")).toBeUndefined();
+    expect(readConnectKind(dir, "alive")).toBeUndefined();
+    expect(readScopeSet(dir, "alive")).toBe(false);
+  });
+
+  test("a person's kind and scope choices survive an idle night: they are swept only when the window's connect-state file is gone, never on their own age", () => {
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    const old = new Date(Date.now() - 3 * maxAgeMs);
+    writeConnectState(dir, "idle", true); // the window's own record is young (it was used today)
+    writeConnectKind(dir, "idle", "gateway");
+    writeScopeSet(dir, "idle");
+    for (const f of [connectKindFileFor(dir, "idle"), connectScopeFileFor(dir, "idle")]) utimesSync(f, old, old);
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "someone-else"), maxAgeMs);
+    expect(readConnectKind(dir, "idle")).toBe("gateway");
+    expect(readScopeSet(dir, "idle")).toBe(true);
+  });
+
+  test("records whose window is gone (no connect-state file) are removed, young or old; the current key's are never", () => {
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    writeConnectKind(dir, "gone", "gateway");
+    writeScopeSet(dir, "gone");
+    writeConnectKind(dir, "me", "gateway");
+    writeScopeSet(dir, "me");
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "me"), maxAgeMs, connectKindFileFor(dir, "me"), connectScopeFileFor(dir, "me"));
+    expect(readConnectKind(dir, "gone")).toBeUndefined();
+    expect(readScopeSet(dir, "gone")).toBe(false);
+    expect(readConnectKind(dir, "me")).toBe("gateway");
+    expect(readScopeSet(dir, "me")).toBe(true);
+  });
+});

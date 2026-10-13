@@ -4,7 +4,7 @@
  */
 import { describe, test, expect } from "bun:test";
 import { isHeadless } from "../auth/browser";
-import { TokenClient, Clock, supportsKeyCredentials, type AuthMetadata } from "../vendor/bridge-agent-sdk/core/index.js";
+import { TokenClient, Clock, supportsKeyCredentials, type AuthMetadata } from "../vendor/einweave-agent-sdk/core/index.js";
 
 describe("headless detection", () => {
   test("SSH and CI are headless everywhere; Linux needs a display; macOS is not", () => {
@@ -35,7 +35,7 @@ describe("discovery authority (RFC 8414 §3.3)", () => {
     device_authorization_endpoint: `${api}/api/agent-auth/device_authorization`,
     token_endpoint: `${api}/api/agent-auth/token`,
     revocation_endpoint: `${api}/api/agent-auth/revoke`,
-    bridge_connect_done_uri: "https://bridge-web.example.test/connect/done",
+    einweave_connect_done_uri: "https://bridge-web.example.test/connect/done",
     ...over,
   });
 
