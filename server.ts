@@ -1503,7 +1503,7 @@ async function openSession(opts: { takeover?: boolean; gatewayTakeover?: boolean
   const myLock = sessionLock({
     dir: STATE_DIR,
     sessionKey: SESSION_KEY,
-    software: "einweave-claude-plugin",
+    software: "einweave-claude-code",
     version: PLUGIN_VERSION,
     identity: { tty: id.tty, termProgram: id.termProgram, cwd: id.cwd },
     retryMs: LOCK_RETRY_MS,
@@ -4258,7 +4258,7 @@ try {
   myProc = {
     pid: process.pid,
     procStart: procStartOf(process.pid),
-    software: "einweave-claude-plugin",
+    software: "einweave-claude-code",
     version: PLUGIN_VERSION,
     sessionKey: SESSION_KEY,
     profile: PROFILE_LABEL,

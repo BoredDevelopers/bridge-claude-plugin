@@ -15,7 +15,7 @@ const LISTING = JSON.stringify(
       { name: "other", source: { source: "url", url: "https://example.test/other.git" }, version: "9.9.9" },
       {
         name: "einweave",
-        source: { source: "url", url: "https://github.com/BoredDevelopers/bridge-claude-plugin.git" },
+        source: { source: "url", url: "https://github.com/plexodus/einweave-claude-code.git" },
         version: "0.28.0",
         tags: ["einweave"],
       },
@@ -60,7 +60,7 @@ describe("pinListing", () => {
     const bridge = out.plugins.find((p: any) => p.name === "einweave");
     expect(bridge.source).toEqual({
       source: "url",
-      url: "https://github.com/BoredDevelopers/bridge-claude-plugin.git",
+      url: "https://github.com/plexodus/einweave-claude-code.git",
       ref: "v0.28.1",
       sha: SHA,
     });

@@ -128,7 +128,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const ATTEMPT_RE = /^[A-Za-z0-9_-]{22,128}$/;
 const SESSION_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 /** The plugin's public client (AGENT_AUTH_CLIENTS). */
-export const STUB_CLIENT_ID = "einweave-claude-plugin";
+export const STUB_CLIENT_ID = "einweave-claude-code";
 /** RFC 7636 §4.1. */
 const PKCE_VALUE_RE = /^[A-Za-z0-9._~-]{43,128}$/;
 const JKT_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -530,7 +530,7 @@ export function createAuthCore(opts: StubOptions = {}) {
           // nothing below this line runs (no chain read, no lock, no session).
           if ((opts.tooOldMints ?? 0) > 0) {
             opts.tooOldMints!--;
-            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: einweave-claude-plugin >= 0.26.0 required — open /plugin → Installed → einweave → Update now, then /reload-plugins", 400);
+            return refuse(where, "unauthorized_client", opts.tooOldReason ?? "client_too_old: einweave-claude-code >= 0.26.0 required — open /plugin → Installed → einweave → Update now, then /reload-plugins", 400);
           }
           if ((opts.rateLimitMints ?? 0) > 0) {
             opts.rateLimitMints!--;

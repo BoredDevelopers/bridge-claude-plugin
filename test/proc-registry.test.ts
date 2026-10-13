@@ -35,7 +35,7 @@ function info(over: Partial<ProcInfo> = {}): ProcInfo {
   return {
     pid: process.pid,
     procStart: "fixed-start-time",
-    software: "einweave-claude-plugin",
+    software: "einweave-claude-code",
     version: "0.26.0",
     sessionKey: "sess-a",
     profile: "default",

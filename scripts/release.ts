@@ -31,7 +31,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const PLUGIN_REPO = "BoredDevelopers/bridge-claude-plugin";
+const PLUGIN_REPO = "plexodus/einweave-claude-code";
 export const MARKETPLACE_REPO = "plexodus/einweave-marketplace";
 const MARKETPLACE_FILE = ".claude-plugin/marketplace.json";
 export const PLUGIN_NAME = "einweave";

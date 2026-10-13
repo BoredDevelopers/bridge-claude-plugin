@@ -372,7 +372,7 @@ describe("RFC-017 D3: version-aware takeover", () => {
     expect(r.tookOver, "this must be a TAKEOVER line, not a plain first acquisition").toBe(true);
     expect(r.lock.pid, "the record now names the new (winning) process").not.toBe(process.pid);
     expect(r.lock.version).toBe(MY_VERSION);
-    expect(r.lock.software).toBe("einweave-claude-plugin");
+    expect(r.lock.software).toBe("einweave-claude-code");
     // finding 5/10: the TAKEOVER write path (tmp + rename), not just the first-ever
     // O_EXCL acquire, must also land at 0600.
     expect(r.lockMode).toBe(0o600);

@@ -339,7 +339,7 @@ describe("a running plugin serves its feed", () => {
     expect(statSync(rec.feed).mode & 0o777).toBe(0o600);
     expect(statSync(join(rec.feed, "..")).mode & 0o777).toBe(0o700);
     // The @handle from the authenticated frame, not the display name.
-    expect(hello).toMatchObject({ v: 1, software_id: "einweave-claude-plugin", label: "feed-test", agent: { id: "bellman-id", handle: "bellman" } });
+    expect(hello).toMatchObject({ v: 1, software_id: "einweave-claude-code", label: "feed-test", agent: { id: "bellman-id", handle: "bellman" } });
   }, 30_000);
 
   test("an inbound message reaches the feed IN FULL, with the channel's name, stripped", async () => {

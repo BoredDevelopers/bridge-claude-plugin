@@ -29,7 +29,7 @@ export interface ProcInfo {
   pid: number;
   /** `ps -o lstart= -p <pid>` at write time — "" if `ps` is unavailable (e.g. Windows). */
   procStart: string;
-  software: "einweave-claude-plugin";
+  software: "einweave-claude-code";
   version: string;
   sessionKey: string;
   profile: string;

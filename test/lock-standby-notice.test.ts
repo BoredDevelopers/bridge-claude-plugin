@@ -53,7 +53,7 @@ describe("RFC-017 C2: standby names the holder — once, to the model, and in st
         procStart: procStart(process.pid),
         sessionKey: SESSION_ID,
         at: new Date().toISOString(),
-        software: "einweave-claude-plugin",
+        software: "einweave-claude-code",
         version: MY_VERSION, // equal to this test's own build — a same-version standby
         tty: "ttys010",
         termProgram: "iTerm.app",
@@ -127,7 +127,7 @@ describe("finding 9: the standby dedupe key is pid + procStart, not the holder's
       procStart: procStart(process.pid),
       sessionKey: SESSION_ID,
       at,
-      software: "einweave-claude-plugin",
+      software: "einweave-claude-code",
       version: MY_VERSION,
       // Deliberately NO `startedAt` — the exact 0.25 shape, where the old buggy key
       // (`rec.startedAt ?? rec.at`) fell all the way back to the ever-changing `at`.
@@ -182,7 +182,7 @@ describe("fork hint: how to make a second window its own Bridge session", () => 
     mkdirSync(join(dir, "locks"), { recursive: true });
     writeFileSync(
       join(dir, "locks", `${SESSION_ID}.lock`),
-      JSON.stringify({ format: 1, pid: process.pid, procStart: procStart(process.pid), sessionKey: SESSION_ID, at: new Date().toISOString(), software: "einweave-claude-plugin", version: MY_VERSION }),
+      JSON.stringify({ format: 1, pid: process.pid, procStart: procStart(process.pid), sessionKey: SESSION_ID, at: new Date().toISOString(), software: "einweave-claude-code", version: MY_VERSION }),
     );
     if (opts.mapped) {
       mkdirSync(join(dir, "sessions"), { recursive: true });

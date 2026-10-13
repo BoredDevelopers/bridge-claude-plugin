@@ -458,7 +458,7 @@ describe("connect-on-demand: disconnect stops the lock-retry loop", () => {
     mkdirSync(join(dir, "locks"), { recursive: true, mode: 0o700 });
     writeFileSync(
       join(dir, "locks", `${key}.lock`),
-      JSON.stringify({ format: 0, pid: holder.pid, procStart: procStartOf(holder.pid), sessionKey: key, at: new Date().toISOString(), software: "einweave-claude-plugin", version: "99.0.0" }),
+      JSON.stringify({ format: 0, pid: holder.pid, procStart: procStartOf(holder.pid), sessionKey: key, at: new Date().toISOString(), software: "einweave-claude-code", version: "99.0.0" }),
       { mode: 0o600 }
     );
 

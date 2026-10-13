@@ -90,7 +90,7 @@ describe("enrolment (§3.2)", () => {
       const verifier = "v".repeat(43);
       const challenge = new Bun.CryptoHasher("sha256").update(verifier).digest("base64url");
       const redirect = "http://127.0.0.1:1/callback";
-      const q = new URLSearchParams({ response_type: "code", client_id: "einweave-claude-plugin", redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", state: "s", dpop_jkt: jkt });
+      const q = new URLSearchParams({ response_type: "code", client_id: "einweave-claude-code", redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", state: "s", dpop_jkt: jkt });
       const loc = (await fetch(`${meta.authorization_endpoint}?${q}`, { redirect: "manual" })).headers.get("location")!;
       return { code: new URL(loc).searchParams.get("code")!, verifier, redirectUri: redirect };
     };
@@ -620,7 +620,7 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
       sent.push(JSON.parse(String(init?.body ?? "{}")));
       return Response.json({ error: "invalid_grant" }, { status: 400 });
     };
-    const tc = new TokenClient({ clock: new Clock(), clientId: "einweave-claude-plugin", fetch: capture, softwareId: "einweave-claude-plugin", softwareVersion: "0.26.0" });
+    const tc = new TokenClient({ clock: new Clock(), clientId: "einweave-claude-code", fetch: capture, softwareId: "einweave-claude-code", softwareVersion: "0.26.0" });
     const base = "http://127.0.0.1:9";
     const meta = { issuer: `${base}/api/agent-auth`, token_endpoint: `${base}/api/agent-auth/token`, device_authorization_endpoint: `${base}/api/agent-auth/device_authorization` } as AuthMetadata;
     const k = (await generateSoftwareKey()).signer;
@@ -630,7 +630,7 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
     await refused(tc.mint(meta, k, { installationId: "i", joinState: "ew_js_0_x", attempt: "a".repeat(43), sessionKey: "s1", reconnect: false }));
     expect(sent).toHaveLength(4);
     for (const b of sent) {
-      expect(b.software_id).toBe("einweave-claude-plugin");
+      expect(b.software_id).toBe("einweave-claude-code");
       expect(b.software_version).toBe("0.26.0");
     }
   });
@@ -641,7 +641,7 @@ describe("TokenClient construction, discovery cache, typed failures", () => {
       sent.push(JSON.parse(String(init?.body ?? "{}")));
       return Response.json({ error: "invalid_grant" }, { status: 400 });
     };
-    const tc = new TokenClient({ clock: new Clock(), clientId: "einweave-claude-plugin", fetch: capture });
+    const tc = new TokenClient({ clock: new Clock(), clientId: "einweave-claude-code", fetch: capture });
     const k = (await generateSoftwareKey()).signer;
     const meta = { issuer: "x", token_endpoint: "http://127.0.0.1:9/t", device_authorization_endpoint: "http://127.0.0.1:9/d" } as AuthMetadata;
     await refused(tc.enrolWithKey(meta, k, { enrolmentKey: "ek", installationName: "t" }));
