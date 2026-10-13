@@ -245,7 +245,8 @@ async function plugin(apiUrl: string, dir: string, env: Record<string, string>):
     stderr: () => log,
     status,
     call,
-    connected: async () => (await status()).websocket === "connected",
+    // `local`: no API call -- a status that fetched the thread list would renew a token inside its expiry slack.
+    connected: async () => JSON.parse((await call("status", { local: true })).content[0].text).websocket === "connected",
     close: () => client.close().catch(() => {}),
   };
 }
@@ -861,6 +862,14 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
     }
   }, 90_000);
 
+  /** Is any session of THIS database waiting on a lock right now? */
+  const lockWaitSeen = async (): Promise<boolean> =>
+    (await q(`SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`)).length > 0;
+
+  test("the lock-wait barrier needs a real wait: with the gate never taken it times out (control)", async () => {
+    expect(await until(lockWaitSeen, 1_500)).toBe(false);
+  });
+
   test("the live-session cap evicts this session (AGENT_MAX_LIVE_SESSIONS=2): 4008 \"session evicted\" → a new session at once, no block, nothing told to the model", async () => {
     const dir = tmp("keys-real-evict-");
     const p = await plugin(api.url, dir, { EINWEAVE_ENROLMENT_KEY: enrolmentKey(), EINWEAVE_SESSION_KEY: "evict-s1" });
@@ -885,9 +894,9 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
       expect(await entered("evict"), "the eviction gate was never reached").toBe(true);
       await p.call("connect");
       // RFC-028: a socket's auth now WRITES the grant (its declared kind), and s1's grant row is locked by the
-      // gated eviction transaction -- so the auth cannot finish until the gate opens. Wait for the plugin to have
-      // sent it (it is blocked on the row), do not wait for `connected` (that would wait on ourselves).
-      await Bun.sleep(1_500);
+      // gated eviction transaction -- so the auth cannot finish until the gate opens. Wait until Postgres shows a
+      // session blocked on a lock (the plugin's auth), do not wait for `connected` (that would wait on ourselves).
+      expect(await until(lockWaitSeen, 10_000), "no session ever waited on a lock: the barrier saw nothing to wait for").toBe(true);
       release("evict");
       await minting;
       expect(await until(() => p.stderr().includes("WebSocket closed (4008 session evicted)"), 10_000), p.stderr()).toBe(true);
@@ -1080,8 +1089,9 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("RFC-016 against the real API", () => 
         // Past token 1's 4009: had the reauth been refused (4001) or ignored (4009 on token 1), the socket would be closed.
         await Bun.sleep(Math.max(0, T + 23_500 - Date.now()));
         expect(p.stderr()).not.toContain("WebSocket closed");
-        // (No `status` poll here: since 0.31 it lists the threads that need someone -- an authenticated HTTP use that,
-        // inside the expiry slack, would mint and reauth token 2 and so prevent the very 4009 this waits for.)
+        // `connected` asks `status {local: true}`: no API call. (A full status lists the threads that need someone -- an
+        // authenticated HTTP use that, inside the expiry slack, would mint and reauth token 2 and prevent this 4009.)
+        expect(await p.connected()).toBe(true);
         // Token 2 (minted ≈ T+4 s) runs out at ≈ T+26 s — before the plugin's 15 s ticker (≥ T+29.5 s) renews it.
         expect(await until(() => p.stderr().includes("WebSocket closed (4009 token expired)"), 15_000), p.stderr()).toBe(true);
         expect(await until(p.connected, 15_000), p.stderr()).toBe(true);

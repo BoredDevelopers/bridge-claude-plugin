@@ -109,6 +109,9 @@ function errorText(res: ApiResult): string {
 
 export function createHolds(deps: HoldsDeps) {
   let memory: ListMemory | null = null;
+  // The thread a 409 holder_online asked about. `confirm` only means "yes" to THAT thread: a yes the person gave to
+  // one question must not take another because a number or a search now points elsewhere.
+  let pendingConfirm: string | null = null;
 
   function numbered(items: string[]): string {
     return items.map((t, i) => `${i + 1}. ${t}`).join("\n");
@@ -202,6 +205,12 @@ export function createHolds(deps: HoldsDeps) {
   return {
     /** What a verb last showed -- tests and `status` read it. */
     memory: () => memory,
+    /** A take (here or on a reply) was refused because the holder is online: remember what was asked about. */
+    askedAbout: (threadId: string) => {
+      pendingConfirm = threadId;
+    },
+    /** May `confirm: true` be honoured for this thread? Only for the one the last question named. */
+    confirmApplies: (threadId: string) => pendingConfirm === threadId,
     forget: () => {
       memory = null;
     },
@@ -212,15 +221,23 @@ export function createHolds(deps: HoldsDeps) {
     async needSomeone(limit = 5): Promise<{ lines: string[]; text: string }> {
       const { rows } = await fetchTakeable({ limit: 10 });
       const open = rows.filter((r) => r.hold.state !== "held").slice(0, limit);
-      memory = { kind: "takeable", items: open.map((r) => ({ id: r.thread.id, label: r.thread.title })) };
+      // Deliberately NOT remembered and NOT numbered: `take N` means the list `take` itself showed last, and a
+      // status/connect glance in between must never change which thread a number points at.
       const lines = open.map(describeTakeable);
-      return { lines, text: lines.length ? `Threads that need someone (take N):\n${numbered(lines)}` : "" };
+      return { lines, text: lines.length ? `Threads that need someone (run take for the numbered list to pick from):\n${lines.map((l) => `- ${l}`).join("\n")}` : "" };
     },
 
     async take(p: { ref?: unknown; confirm?: unknown; channel?: string; cursor?: string }): Promise<string> {
       const ref = parseRef(p.ref);
       if (ref.kind === "none" || ref.kind === "all") {
         return await showTakeable({ ...(p.channel ? { channel: p.channel } : {}), ...(p.cursor ? { cursor: p.cursor } : {}) });
+      }
+      if (p.confirm === true && !(ref.kind === "id" && ref.id === pendingConfirm)) {
+        return (
+          `confirm: true only answers the question the tool asked about a specific thread` +
+          (pendingConfirm ? ` (${pendingConfirm})` : ` (none is pending)`) +
+          `. Call take with that thread id as ref and confirm: true; a number or words cannot carry a confirmation. Nothing was taken.`
+        );
       }
       let target: ListItem;
       if (ref.kind === "index") {
@@ -239,6 +256,7 @@ export function createHolds(deps: HoldsDeps) {
       if (res.status === 409 && res.body?.error === "holder_online") {
         const h = res.body?.holder ?? {};
         const who = nameOf(h.label, String(h.id ?? ""));
+        pendingConfirm = target.id;
         return (
           `${who} is online and working on this. Take it anyway?\n` +
           `Ask the person; if they agree, call take again with ref "${target.id}" and confirm: true. Nothing was taken.`
@@ -248,6 +266,7 @@ export function createHolds(deps: HoldsDeps) {
         return await showTakeable({ lead: `That thread cannot be taken (${errorText(res)}) -- the list may have changed. Nothing was taken.` });
       }
       if (res.status >= 400) throw new Error(`Bridge API error ${res.status}: ${errorText(res)}`);
+      pendingConfirm = null;
       const moved = res.body?.moved ? ` ${res.body.moved} open entr${res.body.moved === 1 ? "y" : "ies"} moved to this session.` : "";
       return res.body?.changed === false
         ? `This session already held ${target.label}.`
@@ -313,7 +332,7 @@ export function createHolds(deps: HoldsDeps) {
         memory = { kind: "sessions", items, thread: thread! };
         return items.length === 0
           ? `${lead}This agent has no other session to hand ${thread!.label} to.`
-          : `${lead}Hand ${thread!.label} to which session? (handover again with to: N, a session id, or part of its label)\n${numbered(items.map((i) => i.label))}`;
+          : `${lead}Hand ${thread!.label} to which session? (call handover again with \`to\` only -- N from this list, a session id, or part of its label -- or with ref = the thread id; a number as ref would mean the list of threads)\n${numbered(items.map((i) => i.label))}`;
       };
 
       if (to.kind === "none" || to.kind === "all") return list("");

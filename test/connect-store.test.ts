@@ -9,7 +9,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, utimesSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles, connectKindFileFor, readConnectKind, writeConnectKind } from "../connect-store";
+import { connectStateFileFor, readConnectState, writeConnectState, sweepConnectStateFiles, connectKindFileFor, readConnectKind, writeConnectKind, readScopeSet, writeScopeSet, connectScopeFileFor, touchSessionFiles } from "../connect-store";
 
 let dir = "";
 beforeEach(() => {
@@ -155,5 +155,35 @@ describe("RFC-028 D1: the declared kind rides in its own file", () => {
     sweepConnectStateFiles(dir, connectStateFileFor(dir, "current"), maxAgeMs, connectKindFileFor(dir, "current"));
     expect(existsSync(connectKindFileFor(dir, "stale"))).toBe(false);
     expect(existsSync(connectKindFileFor(dir, "current"))).toBe(true);
+  });
+});
+
+describe("RFC-028 D6: the scope-set marker, and keeping a live window's files out of the sweep", () => {
+  test("round-trips; clearing removes the file; a missing file reads false", () => {
+    expect(readScopeSet(dir, "k")).toBe(false);
+    writeScopeSet(dir, "k", true);
+    expect(readScopeSet(dir, "k")).toBe(true);
+    writeScopeSet(dir, "k", false);
+    expect(existsSync(connectScopeFileFor(dir, "k"))).toBe(false);
+    expect(readScopeSet(dir, "k")).toBe(false);
+  });
+
+  test("touching a window's files refreshes their age, so another window's 24 h sweep leaves them alone", () => {
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    const old = new Date(Date.now() - maxAgeMs - 60_000);
+    writeConnectState(dir, "alive", true);
+    writeConnectKind(dir, "alive", "gateway");
+    writeScopeSet(dir, "alive", true);
+    for (const f of [connectStateFileFor(dir, "alive"), connectKindFileFor(dir, "alive"), connectScopeFileFor(dir, "alive")]) utimesSync(f, old, old);
+    touchSessionFiles(dir, "alive");
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "someone-else"), maxAgeMs);
+    expect(readConnectKind(dir, "alive")).toBe("gateway");
+    expect(readScopeSet(dir, "alive")).toBe(true);
+    expect(readConnectState(dir, "alive")).toBe(true);
+    // Control: untouched, the same sweep removes them.
+    for (const f of [connectKindFileFor(dir, "alive"), connectScopeFileFor(dir, "alive")]) utimesSync(f, old, old);
+    sweepConnectStateFiles(dir, connectStateFileFor(dir, "someone-else"), maxAgeMs);
+    expect(readConnectKind(dir, "alive")).toBeUndefined();
+    expect(readScopeSet(dir, "alive")).toBe(false);
   });
 });

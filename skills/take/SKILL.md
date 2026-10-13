@@ -30,8 +30,11 @@ Call the `take` MCP tool.
 
 If the thread is held by a session that is **online**, the tool takes nothing and returns a
 question: "`<label>` is online and working on this. Take it anyway?" Put that question to the
-user. Only if they say yes, call `take` again with the same `ref` and `confirm: true`. Unheld and
-parked (offline) threads are taken directly.
+user. Only if they say yes, call `take` again with **the thread id the tool named** as `ref` and
+`confirm: true` — the confirmation is bound to that thread: a number or words, or another thread's
+id, is refused and nothing is taken. Unheld and parked (offline) threads are taken directly.
+`reply` with `take: true` asks the same way (and says "Nothing was sent"); confirm it with the same `reply`
+plus `confirm: true`.
 
 ## Notes
 

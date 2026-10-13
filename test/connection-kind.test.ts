@@ -163,3 +163,69 @@ describe("the three new close classes say the right remedy, never 'login'", () =
     });
   }, 60_000);
 });
+
+describe("kind precedence and persistence", () => {
+  test("M2: a gateway takeover demotes the window to session, and a restart with EINWEAVE_CONNECTION_KIND=gateway STAYS session -- the record wins over the env", async () => {
+    const stub = startAuthStub();
+    const dir = mkdtempSync(join(tmpdir(), "kind-m2-"));
+    try {
+      await enrolledProfile(stub, dir);
+      await withPlugin(stub, dir, { EINWEAVE_CONNECTION_KIND: "gateway" }, async (client) => {
+        expect(await until(async () => (await status(client)).websocket === "connected", 15_000)).toBe(true);
+        await connect(client, {}); // persists gateway
+        stub.rejectNextWsAuths(1, 4008, "gateway taken over: Mac #cd34");
+        stub.closeAll(1011, "restart");
+        expect(await until(async () => (await status(client)).websocket.includes("taken over"), 15_000)).toBe(true);
+        expect(kindFile(dir)).toBe("session");
+      });
+      const before = stub.stats.authDeclared.length;
+      await withPlugin(stub, dir, { EINWEAVE_CONNECTION_KIND: "gateway" }, async () => {
+        expect(await until(() => stub.stats.authDeclared.length > before, 20_000)).toBe(true);
+        expect(stub.stats.authDeclared[before]).toEqual({ kind: "session" });
+      });
+    } finally {
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("M2: with no record the environment applies (and with neither, session)", async () => {
+    await setup({ EINWEAVE_CONNECTION_KIND: "gateway" }, async (_c, _n, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 15_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "gateway" });
+    });
+  }, 40_000);
+
+  test("M3: naming the kind a window already has (before startup settles) still counts as a person's choice -- the environment does not override it", async () => {
+    const stub = startAuthStub();
+    const dir = mkdtempSync(join(tmpdir(), "kind-m3-"));
+    try {
+      await enrolledProfile(stub, dir);
+      await withPlugin(stub, dir, { EINWEAVE_CONNECTION_KIND: "gateway" }, async (client) => {
+        // The very first tool call: the session key has not settled, startup has not read the environment yet.
+        await connect(client, { kind: "session" });
+        expect(await until(() => stub.stats.authDeclared.length >= 1, 20_000)).toBe(true);
+        await Bun.sleep(500);
+        expect(stub.stats.authDeclared.every((d) => d.kind === "session")).toBe(true);
+        expect(kindFile(dir)).toBe("session");
+      });
+    } finally {
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a connect refused with 'another window took over' neither changes nor remembers the kind it asked for", async () => {
+    await setup({}, async (client, _n, stub, dir) => {
+      expect(await until(async () => (await status(client)).websocket === "connected", 15_000)).toBe(true);
+      stub.rejectNextWsAuths(1, 4008, "session superseded: another window");
+      stub.closeAll(1011, "restart");
+      expect(await until(async () => (await status(client)).websocket.includes("took over"), 15_000)).toBe(true);
+      const kindBefore = kindFile(dir);
+      const text = await connect(client, { kind: "gateway" }); // plain connect: refused while superseded
+      expect(text).toContain("took over");
+      expect(kindFile(dir)).toBe(kindBefore);
+      expect((await status(client)).kind).toBe("session");
+    });
+  }, 60_000);
+});

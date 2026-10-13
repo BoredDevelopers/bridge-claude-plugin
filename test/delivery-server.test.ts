@@ -13,7 +13,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { createAgentAuthRoutes } from "./agent-auth-routes";
 import { mintAgentToken } from "./agent-auth-stub";
-import { readConnectState } from "../connect-store";
+import { readConnectState, readScopeSet } from "../connect-store";
 import { writeLabelFile } from "../label-store";
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
@@ -34,6 +34,7 @@ function startStub() {
   let authCount = 0;
   const authKeys: string[] = [];
   const authLabels: Array<string | undefined> = [];
+  const authScopes: unknown[] = [];
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -44,6 +45,7 @@ function startStub() {
       if (url.pathname === "/ws" || req.headers.get("upgrade") === "websocket") {
         if (srv.upgrade(req)) return;
       }
+      if (req.method === "PUT" && url.pathname === "/api/sessions/me/scope") return Response.json({ scope: await req.json() });
       if (url.pathname === "/api/channels") return Response.json({ channels: [{ id: CHANNEL_ID, name: "general" }] });
       if (url.pathname === "/api/deliveries") return Response.json({ entries: [] });
       return new Response("no", { status: 404 });
@@ -58,6 +60,7 @@ function startStub() {
           authCount++;
           authKeys.push(String(frame.sessionInfo?.sessionKey ?? ""));
           authLabels.push(frame.sessionInfo?.sessionLabel);
+          authScopes.push(frame.scope);
           ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "bellman", agentName: "Bellman", contextId: "ctx-under-test" } }));
         }
       },
@@ -74,6 +77,8 @@ function startStub() {
     authKeys: () => [...authKeys],
     /** The sessionLabel each auth frame carried (undefined = none), in order. */
     authLabels: () => [...authLabels],
+    /** The `scope` each auth frame carried (undefined = none), in order. */
+    authScopes: () => [...authScopes],
     liveSockets: () => sockets.size,
     /** Push a message entry to every connected socket, as the server's `message` frame. */
     pushMessage(id: string, content = "hello") {
@@ -109,7 +114,7 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     rmSync(d, { recursive: true, force: true });
   }, 15_000);
 
-  async function boot(autoconnect: boolean) {
+  async function boot(autoconnect: boolean, extraEnv: Record<string, string> = {}) {
     const plugin = Bun.spawn(["bun", SERVER], {
       env: {
         ...process.env,
@@ -124,6 +129,7 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
         EINWEAVE_TEST_CTL_WATCH_MS: "100",
         CLAUDE_CODE_SESSION_ID: "11111111-2222-3333-4444-555555555555",
         CLAUDE_CODE_SSE_PORT: "",
+        ...extraEnv,
       } as Record<string, string>,
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -215,6 +221,22 @@ describe("plugin ⇄ hook ⇄ server: confirmation reaches the server", () => {
     // The connect choice carried over to the new conversation.
     expect(readConnectState(dir, "sess-0302")).toBe(true);
   }, 40_000);
+
+  test("H3: after /clear the new conversation starts from EINWEAVE_CHANNELS again, even though a person had set another scope in the old one", async () => {
+    const p = await boot(true, { EINWEAVE_CHANNELS: "general" });
+    await waitFor(() => stub.authKeys().includes("sess-0301") && stub.connected(), 15_000, "first auth");
+    expect(stub.authScopes()[0]).toEqual({ mode: "channels", channelIds: [CHANNEL_ID] });
+    const id = nextId++;
+    send(p, { jsonrpc: "2.0", id, method: "tools/call", params: { name: "scope", arguments: { channels: "none" } } });
+    await waitFor(() => lines(p).some((m) => m.id === id), 8000, "scope tool");
+    expect(readScopeSet(dir, "sess-0301")).toBe(true);
+    let err = "";
+    const end = Date.now() + 10_000;
+    while (Date.now() < end && !/re-keyed/.test(err)) err = await runSessionStart("sess-0302");
+    await waitFor(() => stub.authKeys().includes("sess-0302"), 10_000, "auth under the new key");
+    expect(stub.authScopes()[stub.authKeys().indexOf("sess-0302")]).toEqual({ mode: "channels", channelIds: [CHANNEL_ID] });
+    expect(readScopeSet(dir, "sess-0302")).toBe(false);
+  }, 60_000);
 
   test("RFC-028 B4: a SessionStart naming the conversation already in use re-keys nothing", async () => {
     await boot(true);

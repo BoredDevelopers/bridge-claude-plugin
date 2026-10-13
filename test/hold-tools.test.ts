@@ -5,7 +5,12 @@
  */
 import { describe, test, expect } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { setup, status, connect, until } from "./plugin-harness";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { startAuthStub } from "./agent-auth-stub";
+import { enrolledProfile } from "./key-fixtures";
+import { setup, withPlugin, status, connect, until } from "./plugin-harness";
 
 const CH_GENERAL = "02000000-0000-7000-8000-00000000000a";
 const CH_OPS = "02000000-0000-7000-8000-00000000000b";
@@ -80,6 +85,9 @@ describe("the hold verbs, over HTTP", () => {
       expect(listed).toContain("2. #ops · Review the PR — held by Bellman #cd34 (online)");
       expect(h.calls.at(-1)!.path).toBe("/api/threads?takeable=1");
 
+      // A status and a connect in between must not move what "2" means (they used to rewrite the remembered list).
+      await status(client);
+      await connect(client, {});
       const asked = await text(client, "take", { ref: "2" });
       expect(asked).toContain("Bellman #cd34 is online and working on this. Take it anyway?");
       expect(h.calls.at(-1)).toMatchObject({ method: "POST", path: `/api/threads/${T2}/hold`, body: { action: "take" } });
@@ -124,9 +132,12 @@ describe("the hold verbs, over HTTP", () => {
     await setup({}, async (client) => {
       expect(await until(async () => (await status(client)).websocket === "connected", 15_000)).toBe(true);
       const s = await status(client);
-      expect(s.threads_that_need_someone).toContain("1. #general · Fix the build — unheld");
+      expect(s.threads_that_need_someone).toContain("- #general · Fix the build — unheld");
       expect(s.threads_that_need_someone).not.toContain("Review the PR"); // held by a live sibling: nobody needs to pick it up
       expect(await connect(client, {})).toContain("Threads that need someone");
+      // A glance is not a list to pick from: take lists, and only THEN do numbers mean something.
+      expect(await text(client, "take", { ref: "1" })).toContain("There is no 1");
+      await text(client, "take", {});
       await text(client, "take", { ref: "1" });
       expect(h.calls.at(-1)).toMatchObject({ path: `/api/threads/${T1}/hold` });
     }, { api: h.api });
@@ -198,4 +209,86 @@ describe("EINWEAVE_CHANNELS is the starting scope (RFC-028 D6)", () => {
       expect(stub.stats.authDeclared[2]).toEqual({ kind: "session" }); // scope omitted: the server keeps the one the person set
     }, { api: h.api, channels: CHANNELS });
   }, 60_000);
+});
+
+describe("H1: a channel list that cannot be read is never 'no name resolves'", () => {
+  const channelsApi = (failFirst: number) => {
+    const state = { calls: 0, puts: [] as any[] };
+    const api = async (req: Request, url: URL): Promise<Response | undefined> => {
+      if (url.pathname === "/api/channels") {
+        state.calls++;
+        return state.calls <= failFirst ? new Response("boom", { status: 500 }) : Response.json({ channels: CHANNELS });
+      }
+      if (req.method === "PUT" && url.pathname === "/api/sessions/me/scope") {
+        const body = await req.json();
+        state.puts.push(body);
+        return Response.json({ scope: body });
+      }
+    };
+    return { state, api };
+  };
+
+  test("one failed read is retried before the first connect: the first frame carries channels:[general], no notice", async () => {
+    const c = channelsApi(1);
+    await setup({ EINWEAVE_CHANNELS: "general" }, async (_c, notices, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 20_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session", scope: { mode: "channels", channelIds: [CH_GENERAL] } });
+      expect(notices().filter((n) => n.includes("cannot see"))).toEqual([]);
+    }, { api: c.api });
+  }, 60_000);
+
+  test("a list that stays unreadable connects with NO scope (never none), then sets channels:[general] once it loads", async () => {
+    const c = channelsApi(4); // the 3 start-up tries fail; the 4th read (the deferred one) answers
+    await setup({ EINWEAVE_CHANNELS: "general" }, async (client, notices, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 30_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session" }); // not {mode:"none"}
+      expect(await until(() => c.state.puts.length >= 1, 30_000)).toBe(true);
+      expect(c.state.puts[0]).toEqual({ mode: "channels", channelIds: [CH_GENERAL] });
+      expect(await until(async () => (await status(client)).scope?.mode === "channels", 5_000)).toBe(true);
+      expect(notices().filter((n) => n.includes("cannot see"))).toEqual([]);
+    }, { api: c.api });
+  }, 90_000);
+
+  test("after a SUCCESSFUL load a UUID that is not one of this agent's channels is named, not sent", async () => {
+    const stranger = "09999999-0000-7000-8000-000000000001";
+    await setup({ EINWEAVE_CHANNELS: `general,${stranger}` }, async (_c, notices, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 20_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session", scope: { mode: "channels", channelIds: [CH_GENERAL] } });
+      expect(await until(() => notices().some((n) => n.includes(stranger)), 10_000)).toBe(true);
+    }, { channels: CHANNELS });
+  }, 60_000);
+
+  test("more channels than a scope can hold is refused locally, with a message, and no scope is sent", async () => {
+    const many = Array.from({ length: 201 }, (_, i) => `c${i}`).join(",");
+    await setup({ EINWEAVE_CHANNELS: many }, async (_c, notices, stub) => {
+      expect(await until(() => stub.stats.authDeclared.length >= 1, 20_000)).toBe(true);
+      expect(stub.stats.authDeclared[0]).toEqual({ kind: "session" });
+      expect(await until(() => notices().some((n) => n.includes("at most 200")), 10_000)).toBe(true);
+    }, { channels: CHANNELS });
+  }, 60_000);
+});
+
+describe("H3: a scope a person set survives a restart; a new conversation starts from EINWEAVE_CHANNELS", () => {
+  test("EINWEAVE_CHANNELS=general, scope set to ops, a new process with the same dir and key sends NO scope", async () => {
+    const h = holdApi();
+    const stub = startAuthStub({ api: h.api, channels: CHANNELS });
+    const dir = mkdtempSync(join(tmpdir(), "h3-"));
+    try {
+      await enrolledProfile(stub, dir);
+      await withPlugin(stub, dir, { EINWEAVE_CHANNELS: "general" }, async (client) => {
+        expect(await until(() => stub.stats.authDeclared.length >= 1, 20_000)).toBe(true);
+        expect(stub.stats.authDeclared[0]).toMatchObject({ scope: { mode: "channels", channelIds: [CH_GENERAL] } });
+        expect(await until(async () => (await status(client)).websocket === "connected", 10_000)).toBe(true);
+        await text(client, "scope", { channels: "ops" });
+      });
+      const before = stub.stats.authDeclared.length;
+      await withPlugin(stub, dir, { EINWEAVE_CHANNELS: "general" }, async () => {
+        expect(await until(() => stub.stats.authDeclared.length > before, 20_000)).toBe(true);
+        expect(stub.stats.authDeclared[before]).toEqual({ kind: "session" });
+      });
+    } finally {
+      stub.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
 });

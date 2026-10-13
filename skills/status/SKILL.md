@@ -55,8 +55,8 @@ Report the snapshot itself:
 - Kind (`kind`: `session` = work session, `gateway` = the agent's triage connection) and,
   once authenticated, the server's `scope` (which channels' unheld work this session takes)
   and `holds` (the thread ids it holds).
-- `threads_that_need_someone` (when connected): the numbered list `/einweave:take` works on -- show it
-  and offer `/einweave:take N`.
+- `threads_that_need_someone` (when connected): threads nobody holds that are addressed to this agent. Show
+  them and offer `/einweave:take` (which lists them numbered; the bullets here are not numbers to pick from).
 - Delivery (`delivery.state`) — whether what Bridge pushed actually reached the model:
   `confirmed`, `awaiting confirmation`, `idle` (nothing pushed yet), `unconfirmed`
   (entries were missed: this session runs without channels — give the person

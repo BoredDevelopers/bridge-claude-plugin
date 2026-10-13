@@ -21,7 +21,7 @@
  * corrupt, not a newer plugin's file, and must not wedge this store shut forever: it is
  * overwritten (logged once).
  */
-import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, mkdirSync, utimesSync } from "fs";
 import { join } from "path";
 
 const PREFIX = ".connect-state-";
@@ -29,6 +29,9 @@ const PREFIX = ".connect-state-";
 // "0"/"1" file above: a 0.30 window sharing this directory reads that one and must go on
 // reading it (the rule at the top of this file).
 const KIND_PREFIX = ".connect-kind-";
+// RFC-028 D6: "a person set this session's scope" -- present means the environment's starting scope
+// (EINWEAVE_CHANNELS) must not be sent over it on the next start.
+const SCOPE_PREFIX = ".connect-scope-";
 
 export function connectStateFileFor(dir: string, key: string): string {
   return join(dir, `${PREFIX}${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
@@ -57,6 +60,49 @@ export function writeConnectKind(dir: string, key: string, kind: ConnectKind): v
     writeFileSync(tmp, kind + "\n", { mode: 0o600 });
     renameSync(tmp, target);
   } catch {}
+}
+
+export function connectScopeFileFor(dir: string, key: string): string {
+  return join(dir, `${SCOPE_PREFIX}${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+}
+
+/** Did a person set this session key's scope (so the env's starting scope must stay out of the way)? */
+export function readScopeSet(dir: string, key: string): boolean {
+  try {
+    return readFileSync(connectScopeFileFor(dir, key), "utf8").trim() === "set";
+  } catch {
+    return false;
+  }
+}
+
+export function writeScopeSet(dir: string, key: string, on: boolean): void {
+  try {
+    const target = connectScopeFileFor(dir, key);
+    if (!on) {
+      try {
+        unlinkSync(target);
+      } catch {}
+      return;
+    }
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, "set\n", { mode: 0o600 });
+    renameSync(tmp, target);
+  } catch {}
+}
+
+/**
+ * The sweep is age-based and runs in OTHER windows too, and these small files are only written when something
+ * changes -- so a window alive for days would have its kind/scope file swept from under it. Touching them is the
+ * liveness stamp the sweep reads.
+ */
+export function touchSessionFiles(dir: string, key: string): void {
+  const now = new Date();
+  for (const f of [connectStateFileFor(dir, key), connectKindFileFor(dir, key), connectScopeFileFor(dir, key)]) {
+    try {
+      utimesSync(f, now, now);
+    } catch {}
+  }
 }
 
 /** true / false as stored, or undefined when there is no file. */
@@ -118,7 +164,7 @@ export function sweepConnectStateFiles(dir: string, currentPath: string, maxAgeM
   try {
     const cutoff = Date.now() - maxAgeMs;
     for (const name of readdirSync(dir)) {
-      if (!name.startsWith(PREFIX) && !name.startsWith(KIND_PREFIX)) continue;
+      if (!name.startsWith(PREFIX) && !name.startsWith(KIND_PREFIX) && !name.startsWith(SCOPE_PREFIX)) continue;
       const path = join(dir, name);
       if (path === currentPath || alsoCurrent.includes(path)) continue;
       try {

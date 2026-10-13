@@ -116,6 +116,20 @@ describe("take: N refers to the list this session showed last, and the server is
     expect(text).toContain("There is no 1");
   });
 
+  test("status/connect glancing at the threads that need someone does not move the numbers: take() -> needSomeone() -> take 2 is still T2", async () => {
+    const f = fake((c) => {
+      if (c.method === "POST") return { status: 200, body: { changed: true, moved: 0 } };
+      // A different order, as the server answers a moment later.
+      if (c.path.includes("limit=10")) return { status: 200, body: { threads: [takeableRow(T3, "Deploy plan"), takeableRow(T1, "Fix the build"), takeableRow(T2, "Review the PR")], next: null } };
+      return list3(c);
+    });
+    await f.holds.take({}); // shows T1, T2, T3
+    const glance = await f.holds.needSomeone(5);
+    expect(glance.text).not.toMatch(/^\d+\./m); // not numbered: nothing to mistake for the take list
+    await f.holds.take({ ref: "2" });
+    expect(f.calls.at(-1)!.path).toBe(`/api/threads/${T2}/hold`);
+  });
+
   test("a link or id acts on that id without needing a list", async () => {
     const f = fake((c) => (c.method === "POST" ? { status: 200, body: { changed: true, moved: 0 } } : undefined));
     await f.holds.take({ ref: `https://einweave.example/w/ws/c/${CH_A}/t/${T3}` });
@@ -158,9 +172,35 @@ describe("take from an online holder asks first", () => {
 
   test("confirm: true sends the confirmation and takes it", async () => {
     const f = fake(online);
+    await f.holds.take({ ref: T1 }); // the question
     const text = await f.holds.take({ ref: T1, confirm: true });
-    expect(f.calls[0]!.body).toEqual({ action: "take", confirm: true });
+    expect(f.calls[1]!.body).toEqual({ action: "take", confirm: true });
     expect(text).toContain("now holds");
+  });
+
+  test("a confirmation answers the question about ONE thread: another ref, a number, or no question at all is refused, nothing sent", async () => {
+    const f = fake((c) => (c.method === "POST" ? online(c) : list3(c)));
+    // No question asked yet.
+    expect(await f.holds.take({ ref: T1, confirm: true })).toContain("none is pending");
+    expect(f.calls).toHaveLength(0);
+    await f.holds.take({ ref: T1 }); // asks about T1
+    const before = f.calls.length;
+    // Yes to T1 does not take T2, nor "the second one".
+    expect(await f.holds.take({ ref: T2, confirm: true })).toContain("Nothing was taken");
+    await f.holds.take({});
+    expect(await f.holds.take({ ref: "2", confirm: true })).toContain("Nothing was taken");
+    expect(f.calls.slice(before).filter((c) => c.method === "POST")).toHaveLength(0);
+    // ...and it is spent once it took.
+    await f.holds.take({ ref: T1, confirm: true });
+    expect(await f.holds.take({ ref: T1, confirm: true })).toContain("none is pending");
+  });
+
+  test("the reply path asks the same question and binds the same way", () => {
+    const f = fake(() => undefined);
+    expect(f.holds.confirmApplies(T1)).toBe(false);
+    f.holds.askedAbout(T1);
+    expect(f.holds.confirmApplies(T1)).toBe(true);
+    expect(f.holds.confirmApplies(T2)).toBe(false);
   });
 
   test("a holder with no label is still named", async () => {
@@ -208,6 +248,15 @@ describe("release and handover", () => {
     // Words pick the session too.
     await f.holds.handover({ ref: T2, to: "cd34" });
     expect(f.calls.at(-1)).toEqual({ method: "POST", path: `/api/threads/${T2}/hold`, body: { action: "handover", to: S2 } });
+  });
+
+  test("handover: a ref number cannot carry step 2 -- the pending thread is replaced by a new ref, and no POST goes out", async () => {
+    const f = fake(routes);
+    await f.holds.handover({ ref: T1 }); // step 1 -> sessions listed for T1
+    const text = await f.holds.handover({ ref: T2, to: "1" }); // a different thread: T1's list does not apply
+    expect(f.calls.some((c) => c.method === "POST")).toBe(false);
+    expect(text).toContain("There is no 1");
+    expect(text).toContain("`to` only");
   });
 
   test("a stale session number is not guessed", async () => {

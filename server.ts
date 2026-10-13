@@ -49,7 +49,7 @@ import { readFileSync, mkdirSync, chmodSync, existsSync } from "fs";
 import { homedir, hostname, tmpdir } from "os";
 import { dirname, join } from "path";
 import { labelFileFor, readLabelFile, writeLabelFile, clearLabelFile, sweepLabelFiles } from "./label-store";
-import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles, readConnectKind, writeConnectKind, connectKindFileFor, type ConnectKind } from "./connect-store";
+import { readConnectState, writeConnectState, connectStateFileFor, sweepConnectStateFiles, readConnectKind, writeConnectKind, connectKindFileFor, readScopeSet, writeScopeSet, connectScopeFileFor, touchSessionFiles, type ConnectKind } from "./connect-store";
 import { describeClose, type CloseClass, type HolderIdentity } from "./reconnect-policy";
 import { writeProc, removeProc, updateProcState, listProcs, type ProcInfo } from "./proc-registry";
 import { readOrphanedAt, decideStaleNotice, staleNoticeText, findInstalledVersion, INITIAL_STALE_WATCH_STATE, type StaleWatchState } from "./stale-watcher";
@@ -750,7 +750,7 @@ function rememberSentMessage(id: string, type: string): void {
 
 // Channel name→id map, populated on first connect for name-based filtering
 let channelNameToId: Map<string, string> | null = null;
-let channelMapPromise: Promise<void> | null = null;
+let channelMapPromise: Promise<boolean> | null = null;
 let channelMapAttemptedAt = 0;
 // Refresh floor: a channel id the map can never resolve (e.g. not visible to
 // this token) must not trigger one request per inbound message. Kept short —
@@ -758,28 +758,28 @@ let channelMapAttemptedAt = 0;
 // map can be refreshed.
 const CHANNEL_MAP_MIN_REFRESH_MS = 5000;
 
-async function loadChannelMap(): Promise<void> {
+/** True when the server ANSWERED with a channel list (even an empty one); false for any failure to ask or be answered. */
+async function loadChannelMap(): Promise<boolean> {
   channelMapAttemptedAt = Date.now();
   try {
     const res = await apiFetch("/api/channels");
-    if (!res.ok) return;
+    if (!res.ok) return false;
     const data = (await res.json()) as any;
     const next = new Map<string, string>();
     for (const ch of data.channels ?? []) {
       if (ch?.name && ch?.id) next.set(String(ch.name), String(ch.id));
     }
-    // Only a non-empty result replaces the map. Assigning an empty map would
-    // latch: every name-based filter would reject forever, and the map is
-    // non-null so nothing would ever retry.
-    if (next.size === 0) {
-      process.stderr.write(
-        `bridge channel: channel map response had no channels — keeping previous map\n`
-      );
-      return;
+    // An empty answer is still an answer (RFC-028: "no name resolves" must be told apart from "the map never
+    // loaded"), but it never REPLACES a map we already hold -- that would forget every name until the next refresh.
+    if (next.size === 0 && channelNameToId) {
+      process.stderr.write(`bridge channel: channel map response had no channels — keeping previous map\n`);
+      return true;
     }
     channelNameToId = next;
+    return true;
   } catch (err) {
     process.stderr.write(`bridge channel: failed to load channel map: ${err}\n`);
+    return false;
   }
 }
 
@@ -845,7 +845,7 @@ function feedWithChannelName(channelId: string, publish: (channelName: string) =
 
 // Single in-flight load, rate-limited. Resolves once the map is as fresh as
 // it is going to get.
-function ensureChannelMap(): Promise<void> {
+function ensureChannelMap(): Promise<unknown> {
   if (channelMapPromise) return channelMapPromise;
   if (Date.now() - channelMapAttemptedAt < CHANNEL_MAP_MIN_REFRESH_MS) {
     return Promise.resolve();
@@ -1372,34 +1372,94 @@ function keyCheckedLock(inner: SessionLockHandle): SessionLockHandle {
   };
 }
 
-// True once a person changed this session's scope (/einweave:scope) in this process: a later reopen
-// (a login, a kind change) must not put the environment's starting scope back over it.
+// True once a person changed this session's scope (/einweave:scope) -- in this process or an earlier one of this
+// session key (the marker file, connect-store.ts): the environment's starting scope must not be sent over it.
 let scopeSetHere = false;
 
-/**
- * EINWEAVE_CHANNELS (names or ids) as the server's scope object, or null when unset. When no name resolves the scope is `none`, never `all`. The first connect says it once; the server stores it on the grant (RFC-028 D6). A name
- * that does not resolve is told to the model -- never silently widened to "all" for the whole list.
- */
-async function startingScopeFromEnv(): Promise<{ mode: "channels"; channelIds: string[] } | { mode: "none" } | null> {
-  if (STARTING_SCOPE_CHANNELS.length === 0) return null;
-  await ensureChannelMap();
+type StartScope = { mode: "channels"; channelIds: string[] } | { mode: "none" };
+const MAX_SCOPE_CHANNELS = 200; // the server's limit; refuse locally with a clear message instead of a 4008
+
+/** Load the channel list for scope resolution: a few tries in a row (the 5 s floor is for message-driven refreshes). */
+async function loadMapForScope(): Promise<boolean> {
+  for (let i = 0; i < 3; i++) {
+    if (await loadChannelMap()) return true;
+    await Bun.sleep(400 * (i + 1));
+  }
+  return false;
+}
+
+/** EINWEAVE_CHANNELS against the LOADED channel list: the scope, and the entries that name no channel this agent sees. */
+function resolveEnvScope(): { scope: StartScope; missing: string[] } {
+  const known = new Set(channelNameToId?.values() ?? []);
   const ids: string[] = [];
   const missing: string[] = [];
   for (const ref of STARTING_SCOPE_CHANNELS) {
     const id = channelIdOf(ref);
-    if (id) ids.push(id);
+    if (id && known.has(id)) ids.push(id);
     else missing.push(ref);
   }
-  if (missing.length > 0) {
-    notifyModel(
-      `⚠️ EINWEAVE_CHANNELS names channel(s) this agent cannot see: ${missing.join(", ")}. ` +
-        (ids.length > 0
-          ? `The starting scope covers only ${STARTING_SCOPE_CHANNELS.filter((r) => !missing.includes(r)).join(", ")}.`
-          : "None resolved, so this session starts with scope NONE (it takes no unheld work; threads it holds still arrive) -- the narrow reading of what was asked. /einweave:scope sets it."),
-      "status"
-    );
+  return { scope: ids.length > 0 ? { mode: "channels", channelIds: [...new Set(ids)] } : { mode: "none" }, missing };
+}
+
+function announceMissingScopeEntries(r: { scope: StartScope; missing: string[] }): void {
+  if (r.missing.length === 0) return;
+  notifyModel(
+    `⚠️ EINWEAVE_CHANNELS names channel(s) this agent cannot see: ${r.missing.join(", ")}. ` +
+      (r.scope.mode === "channels"
+        ? `The starting scope covers only ${STARTING_SCOPE_CHANNELS.filter((x) => !r.missing.includes(x)).join(", ")}.`
+        : "None resolved, so this session starts with scope NONE (it takes no unheld work; threads it holds still arrive) -- the narrow reading of what was asked. /einweave:scope sets it."),
+    "status"
+  );
+}
+
+let deferredScopeRunning = false;
+/**
+ * The channel list could not be read at start. Never read that as "no name resolves" (that would store scope none for
+ * the life of the grant): connect without a scope, and set it ONCE the list loads, unless a person set one meanwhile.
+ */
+function applyStartingScopeWhenMapLoads(): void {
+  if (deferredScopeRunning) return;
+  deferredScopeRunning = true;
+  void (async () => {
+    try {
+      for (let i = 0; i < 40 && !shuttingDown && !scopeSetHere; i++) {
+        await Bun.sleep(Math.min(30_000, 2_000 * 2 ** i));
+        if (scopeSetHere || shuttingDown || !authenticated || connectionKind !== "session") continue;
+        if (!(await loadChannelMap())) continue;
+        const r = resolveEnvScope();
+        const res = await apiFetch("/api/sessions/me/scope", { method: "PUT", body: JSON.stringify(r.scope) });
+        if (!res.ok) continue;
+        serverScope = ((await res.json().catch(() => null)) as any)?.scope ?? serverScope;
+        announceMissingScopeEntries(r);
+        return;
+      }
+    } catch (err) {
+      process.stderr.write(`bridge channel: starting scope could not be set: ${err}\n`);
+    } finally {
+      deferredScopeRunning = false;
+    }
+  })();
+}
+
+/**
+ * EINWEAVE_CHANNELS (names or ids) as the starting scope for the FIRST auth frame, or null (nothing to send). The
+ * server stores it on the grant (RFC-028 D6). After a SUCCESSFUL list load: some resolve -> those (the rest named to
+ * the model); none -> `none`, loudly. If the list cannot be loaded -> null now, and the scope is set when it loads.
+ */
+async function startingScopeFromEnv(): Promise<StartScope | null> {
+  if (STARTING_SCOPE_CHANNELS.length === 0) return null;
+  if (STARTING_SCOPE_CHANNELS.length > MAX_SCOPE_CHANNELS) {
+    notifyModel(`⚠️ EINWEAVE_CHANNELS lists ${STARTING_SCOPE_CHANNELS.length} channels; a scope holds at most ${MAX_SCOPE_CHANNELS}. No starting scope was set (the session keeps the scope it had) -- shorten the list or use /einweave:scope.`, "status");
+    return null;
   }
-  return ids.length > 0 ? { mode: "channels", channelIds: [...new Set(ids)] } : { mode: "none" };
+  if (!channelNameToId && !(await loadMapForScope())) {
+    process.stderr.write("bridge channel: channel list unavailable -- connecting without a starting scope; it is set when the list loads\n");
+    applyStartingScopeWhenMapLoads();
+    return null;
+  }
+  const r = resolveEnvScope();
+  announceMissingScopeEntries(r);
+  return r.scope;
 }
 
 /**
@@ -1755,6 +1815,12 @@ function rekeyTo(conversationId: string): boolean {
   // Same for the kind (RFC-028 D1): the new conversation's own declaration wins; else this window's carries on.
   connectionKind = readConnectKind(STATE_DIR, SESSION_KEY) ?? connectionKind;
   writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
+  // A new conversation starts from EINWEAVE_CHANNELS again (a resumed one keeps the scope a person set in it, which
+  // is the marker file under ITS key). The old conversation's numbered lists and pending question are not this one's.
+  scopeSetHere = readScopeSet(STATE_DIR, SESSION_KEY);
+  serverScope = null;
+  serverHolds = [];
+  holds.forget();
   myContextId = "";
   // A superseded/standby episode belonged to the old conversation's session.
   superseded = false;
@@ -2710,10 +2776,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "status",
       description:
-        "Show this session's Bridge connection/intent snapshot — configured, wantConnected (persisted intent), websocket state, and display label. Also this build's own version, the installed version (if this copy is stale), the server's advertised minimum/recommended versions and advice, and every other Bridge process on this machine (other_processes). Always answers, even when unconfigured or disconnected; unlike the other tools it is not gated.",
+        "Show this session's Bridge connection/intent snapshot — configured, wantConnected (persisted intent), websocket state, and display label. Also this build's own version, the installed version (if this copy is stale), the server's advertised minimum/recommended versions and advice, and every other Bridge process on this machine (other_processes). Always answers, even when unconfigured or disconnected; unlike the other tools it is not gated. When connected it also lists the threads that need someone (one API call); local: true skips that and answers from this process alone.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: {
+          local: { type: "boolean", description: "Answer from this process only: no API call (no thread list)." },
+        },
       },
     },
   ],
@@ -2758,6 +2826,7 @@ const holds = createHolds({
   onScope: (scope) => {
     serverScope = scope;
     scopeSetHere = true;
+    writeScopeSet(STATE_DIR, SESSION_KEY, true); // survives a restart: the env's starting scope must not undo it
   },
   currentScope: () => (authenticated ? serverScope : null),
 });
@@ -2807,6 +2876,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const take = args.take === true;
         if (take && !threadId) throw new Error("take applies to a reply in a thread: pass thread_id.");
+        if (args.confirm === true && !(take && threadId && holds.confirmApplies(threadId))) {
+          return {
+            content: [{ type: "text", text: "confirm: true only answers a question the tool asked about THIS thread (reply with take: true on it). No question is pending for it. Nothing was sent." }],
+          };
+        }
 
         // RFC-012 slice 5.2 split wire: a REPLY posts to its THREAD (the thread
         // fixes the channel and its root is the parent, so the client names
@@ -2829,6 +2903,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           { method: "POST", body: JSON.stringify(body) }
         );
 
+        if (res.status === 409 && take) {
+          // A take from a holder who is online, unconfirmed: the server wrote nothing. Same question as the take tool.
+          const j = (await res.json().catch(() => null)) as any;
+          if (j?.error === "holder_online" && threadId) {
+            holds.askedAbout(threadId);
+            const who = j.holder?.label || (j.holder?.id ? `session ${String(j.holder.id).slice(-4)}` : "another session");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `${who} is online and working on this. Take it anyway? Nothing was sent.\nAsk the person; if they agree, call reply again with the same text, thread_id "${threadId}", take: true and confirm: true.`,
+                },
+              ],
+            };
+          }
+          throw new Error(`Bridge API error 409: ${JSON.stringify(j)}`);
+        }
         if (!res.ok) {
           const err = await res.text();
           // Posting needs membership (server 5a-2): say how to get it, not just that it failed.
@@ -3823,8 +3914,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: "text", text: 'takeover:"gateway" moves the agent\'s gateway to this window, so it needs kind "gateway" (a work session is not the gateway).' }] };
         }
         const kindChanged = wantedKind !== connectionKind;
+        const previousKind = connectionKind;
         connectionKind = wantedKind;
-        if (kindChanged) kindExplicitlySet = true; // like intentExplicitlySet: startup must not overwrite this
+        // Like intentExplicitlySet: startup must not overwrite a kind the person NAMED (even the one it already has).
+        if (args.kind !== undefined || gatewayTakeover) kindExplicitlySet = true;
         if (takeover) superseded = false;
 
         wantConnected = true;
@@ -3836,9 +3929,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // before it settles would otherwise write under FALLBACK_SESSION_KEY.
         if (sessionKeyReady) await sessionKeyReady;
         writeConnectState(STATE_DIR, SESSION_KEY, true);
-        writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
 
         const problem = creds.configError();
+        if (problem) writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
         if (problem) return { content: [{ type: "text", text: `Bridge not configured — ${problem}` }] };
         // RFC-016 E9: after a session revoke, THIS is the explicit user reconnect —
         // the next mint says so (reconnect=true) and the server opens a new session.
@@ -3854,6 +3947,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           // A PLAIN connect cannot resume a superseded window; saying "connecting" would be
           // dishonest. `takeover` already cleared `superseded` above.
           if (superseded) {
+            // Nothing happened: the kind asked for is neither in effect nor remembered.
+            connectionKind = previousKind;
             return {
               content: [
                 { type: "text", text: "another window took over this session — /einweave:connect takeover to move it back" },
@@ -3863,6 +3958,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           reconnectAttempt = 0;
           resetRefusalEpisode();
           last4001At = null;
+          writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind);
           if (reopen) {
             const decided = await openSession({ takeover, gatewayTakeover });
             // A PLAIN connect never takes a lock another window holds: say so, not "connecting".
@@ -3878,7 +3974,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             }
           }
         }
-        // RFC-028 D8: a connected window is told which threads need someone (the same list `take` works on).
+        writeConnectKind(STATE_DIR, SESSION_KEY, connectionKind); // (also a refresh of its age for the sweep)
+        // RFC-028 D8: a connected window is told which threads need someone.
         const needSomeone = authenticated ? await needSomeoneText() : "";
         return {
           content: [{ type: "text", text: `${authenticated ? "connected" : "connecting"}${connectionKind === "gateway" ? " (gateway)" : ""}${needSomeone ? `\n\n${needSomeone}` : ""}` }],
@@ -3928,7 +4025,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                   ...updateStatus(),
                   wantConnected,
                   ...(await (async () => {
-                    const t = await needSomeoneText();
+                    const t = args.local === true ? "" : await needSomeoneText();
                     return t ? { threads_that_need_someone: t } : {};
                   })()),
                   configured: !creds.configError(),
@@ -4043,11 +4140,17 @@ if (!intentExplicitlySet) {
 // RFC-028 D1: the launch environment is an explicit statement (claudeb --gateway), then what this
 // key declared last, else a work session. A `connect` answered in the pre-settle window already
 // chose; it must not be overwritten by this read.
+// The kind this key last declared wins (a gateway takeover demotes the window to session, and the environment must
+// not undo that on the next start); the environment applies only when there is no record; the default is session.
 if (!kindExplicitlySet) {
   const fromEnv = process.env.EINWEAVE_CONNECTION_KIND;
-  connectionKind = fromEnv === "gateway" || fromEnv === "session" ? fromEnv : readConnectKind(STATE_DIR, SESSION_KEY) ?? "session";
+  connectionKind = readConnectKind(STATE_DIR, SESSION_KEY) ?? (fromEnv === "gateway" ? "gateway" : "session");
 }
-sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), STATE_SWEEP_MAX_AGE_MS, connectKindFileFor(STATE_DIR, SESSION_KEY));
+scopeSetHere = readScopeSet(STATE_DIR, SESSION_KEY);
+touchSessionFiles(STATE_DIR, SESSION_KEY);
+// Another window's startup sweeps files older than a day: a window that stays up keeps its own young.
+setInterval(() => touchSessionFiles(STATE_DIR, SESSION_KEY), 6 * 60 * 60 * 1000).unref();
+sweepConnectStateFiles(STATE_DIR, connectStateFileFor(STATE_DIR, SESSION_KEY), STATE_SWEEP_MAX_AGE_MS, connectKindFileFor(STATE_DIR, SESSION_KEY), connectScopeFileFor(STATE_DIR, SESSION_KEY));
 // The one line someone debugging a lost context will need.
 process.stderr.write(
   `bridge channel: session key ${SESSION_KEY} (source: ${resolvedSessionKey.source})\n`

@@ -96,12 +96,15 @@ There is no `/plugin update` command in a session. To update:
 0.31 is the einweave rename plus RFC-028 sessions, one cutover with the server (the server
 refuses 0.30 and older, "client too old").
 
-1. **Install the new plugin; it replaces `bridge`.** `/plugin marketplace add plexodus/einweave-marketplace`,
-   `/plugin install einweave@einweave`, then `/reload-plugins`. Commands are now `/einweave:*`.
-2. **Sign in once: `/einweave:login`.** Credentials are re-issued with the new `ew_` prefix, so a 0.30
+1. **Replace the plugin.** Uninstall `bridge` (`/plugin` → Installed → bridge → Uninstall), add the new marketplace
+   with `/plugin marketplace add plexodus/einweave-marketplace`, install `/plugin install einweave@einweave`, then
+   `/reload-plugins`. Commands are now `/einweave:*`. Nothing points from the old listing to the new one.
+2. **Change any launch alias or script.** `--dangerously-load-development-channels plugin:bridge@bored-marketplace`
+   becomes `--dangerously-load-development-channels plugin:einweave@einweave`.
+3. **Sign in once: `/einweave:login`.** Credentials are re-issued with the new `ew_` prefix, so a 0.30
    sign-in on disk reads as "not signed in". Nothing else moves: `~/.einweave` stays.
-3. **A window is a work session by default.** `/einweave:connect gateway` makes it the agent's
-   gateway; see *Sessions and holds*.
+4. **A window is a work session by default.** `/einweave:connect gateway` makes it the agent's
+   gateway (or start it with `EINWEAVE_CONNECTION_KIND=gateway`); see *Sessions and holds*.
 
 ## Upgrading to 0.30
 
@@ -137,8 +140,8 @@ server: a v2 server refuses 0.29 and older ("client too old"). Deploy the server
 
 An agent can have several Claude windows (and a runtime like OpenClaw) connected at once.
 
-- **Kind.** A window is a **work session** by default. `/einweave:connect gateway` (or `claudeb --gateway`,
-  `EINWEAVE_CONNECTION_KIND=gateway`) makes it the agent's one **gateway**: the triage connection that gets all
+- **Kind.** A window is a **work session** by default. `/einweave:connect gateway` (or launch it with
+  `EINWEAVE_CONNECTION_KIND=gateway` in the environment; a kind the window declared before wins over it) makes it the agent's one **gateway**: the triage connection that gets all
   unheld work. `/einweave:connect gateway takeover` moves the gateway here from the window that has it. A
   gateway that is in use elsewhere is retried, and the plugin tells you who has it, once.
 - **Holds.** A thread is held by one session. The first post an agent makes in an unheld thread makes that session
@@ -147,7 +150,7 @@ An agent can have several Claude windows (and a runtime like OpenClaw) connected
   way to aim a message at a session: the hold decides, so `reply` no longer takes a `context_id`.
 - **Scope.** A work session also gets unheld work in its scope while the agent has no live gateway;
   `/einweave:scope` sets it (`EINWEAVE_CHANNELS` only sets the scope a session starts with).
-- A thread that needs someone is listed by `/einweave:status` and the connect result; `take N` works on that list.
+- A thread that needs someone is listed by `/einweave:status` and the connect result; `/einweave:take` shows them numbered.
 
 ## Tools
 
