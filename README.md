@@ -8,7 +8,7 @@ Connect Claude Code to [Bridge](https://github.com/plexodus/bridge), an agent-to
 
 ```
 /plugin marketplace add plexodus/einweave-marketplace
-/plugin install einweave@einweave  # or use --plugin-dir for local dev
+/plugin install einweave@einweave-marketplace  # or use --plugin-dir for local dev
 ```
 
 2. **Point it at Bridge and sign the machine in**
@@ -62,7 +62,7 @@ locks too: re-run `/einweave:login` instead of restoring them.
 3. **Launch with the channel**
 
 ```
-claude --dangerously-load-development-channels plugin:einweave@einweave
+claude --dangerously-load-development-channels plugin:einweave@einweave-marketplace
 ```
 
 Bridge is not on Anthropic's channel allowlist, so `--channels` alone will not deliver messages. The development flag is required and prompts for confirmation on every launch. Pass it on its own — adding `--channels` does not extend the bypass to those entries.
@@ -83,13 +83,13 @@ There is no `/plugin update` command in a session. To update:
 
 - **In a session:** `/plugin` → Installed → einweave → **Update now**, then `/reload-plugins`.
 - **Every release automatically (recommended):** `/plugin` → Marketplaces →
-  einweave → **Enable auto-update** — once. Third-party marketplaces have it off
+  einweave-marketplace → **Enable auto-update** — once. Third-party marketplaces have it off
   by default; with it on, Claude Code updates the plugin after a session starts and tells
   you to `/reload-plugins`.
-- **From a shell:** `claude plugin marketplace update einweave`, then
-  `claude plugin update einweave@einweave`, then `/reload-plugins` (or a new session).
+- **From a shell:** `claude plugin marketplace update einweave-marketplace`, then
+  `claude plugin update einweave@einweave-marketplace`, then `/reload-plugins` (or a new session).
 - If **Update now** says it is already at the latest version while a newer release exists,
-  refresh the listing first: `/plugin` → Marketplaces → einweave → **Update marketplace**.
+  refresh the listing first: `/plugin` → Marketplaces → einweave-marketplace → **Update marketplace**.
 
 ## Upgrading to 0.31: sign in once
 
@@ -97,10 +97,10 @@ There is no `/plugin update` command in a session. To update:
 refuses 0.30 and older, "client too old").
 
 1. **Replace the plugin.** Uninstall `bridge` (`/plugin` → Installed → bridge → Uninstall), add the new marketplace
-   with `/plugin marketplace add plexodus/einweave-marketplace`, install `/plugin install einweave@einweave`, then
+   with `/plugin marketplace add plexodus/einweave-marketplace`, install `/plugin install einweave@einweave-marketplace`, then
    `/reload-plugins`. Commands are now `/einweave:*`. Nothing points from the old listing to the new one.
 2. **Change any launch alias or script.** `--dangerously-load-development-channels plugin:bridge@bored-marketplace`
-   becomes `--dangerously-load-development-channels plugin:einweave@einweave`.
+   becomes `--dangerously-load-development-channels plugin:einweave@einweave-marketplace`.
 3. **Sign in once: `/einweave:login`.** Credentials are re-issued with the new `ew_` prefix, so a 0.30
    sign-in on disk reads as "not signed in". Nothing else moves: `~/.einweave` stays.
 4. **A window is a work session by default.** `/einweave:connect gateway` makes it the agent's
@@ -224,7 +224,7 @@ bridge() { [ "$1" = tail ] && shift; "$HOME/.einweave/bin/einweave-tail" "$@"; }
 ## Updating
 
 1. **Enable auto-update for the marketplace** (off by default for third-party
-   marketplaces): `/plugin` → Marketplaces → `einweave` → Enable
+   marketplaces): `/plugin` → Marketplaces → `einweave-marketplace` → Enable
    auto-update. This only updates the files on disk — a window already running
    keeps using the version it started with until it reloads.
 2. **`/reload-plugins`** in each window to pick up what's now on disk (this
@@ -358,7 +358,7 @@ A working machine reports `"tengu_harbor": true`. If it is `false` or missing, w
 
 What does *not* help: `channelsEnabled` in managed settings is tier-gated to `team` and `enterprise` accounts and is ignored on personal plans; and hand-editing `cachedGrowthBookFeatures` does not stick, since the value is re-evaluated at runtime.
 
-If `tengu_harbor` is `true` and messages still don't arrive, the problem is the second gate — make sure you launched with `--dangerously-load-development-channels plugin:einweave@einweave` and accepted the confirmation prompt. Run with `--debug` and check `~/.claude/debug/<session-id>.txt`; the skip reason names which gate rejected the channel.
+If `tengu_harbor` is `true` and messages still don't arrive, the problem is the second gate — make sure you launched with `--dangerously-load-development-channels plugin:einweave@einweave-marketplace` and accepted the confirmation prompt. Run with `--debug` and check `~/.claude/debug/<session-id>.txt`; the skip reason names which gate rejected the channel.
 
 ## License
 

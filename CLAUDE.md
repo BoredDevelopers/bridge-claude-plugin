@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Bridge channel plugin for Claude Code. Server: `plexodus/bridge` (its CLAUDE.md is the
-fuller guide). Users install it from `einweave`, which pins a release TAG —
+fuller guide). Users install it from `einweave-marketplace`, which pins a release TAG —
 merging to `main` ships nothing until `bun run release`.
 
 ## Commands
@@ -41,6 +41,6 @@ claude plugin test mods/picker-probe   # the take-picker mod probe (RFC-028 D8);
 1. PR: bump `package.json` AND `.claude-plugin/plugin.json` (same x.y.z; `test/version-sync.test.ts`).
 2. Merge, wait for CI on main.
 3. `bun run release --dry-run`, then `bun run release` — tags `v<version>`, pins
-   `einweave` to that tag + sha (no `version` in the listing: plugin.json wins).
+   `einweave-marketplace` to that tag + sha (no `version` in the listing: plugin.json wins).
 4. Server nudge: `EINWEAVE_CLIENT_RECOMMENDED_CLAUDE_CODE=<version>` in the NAS `.env`, `up -d api`.
 5. Post in #einweave → releases.

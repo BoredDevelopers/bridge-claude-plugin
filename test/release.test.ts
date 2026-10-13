@@ -10,7 +10,7 @@ import { ciVerdict, peeled, pinListing, releaseVersion, tagAction } from "../scr
 const SHA = "f4d0019c0ffee0000000000000000000000000ab";
 const LISTING = JSON.stringify(
   {
-    name: "einweave",
+    name: "einweave-marketplace",
     plugins: [
       { name: "other", source: { source: "url", url: "https://example.test/other.git" }, version: "9.9.9" },
       {

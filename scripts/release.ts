@@ -181,7 +181,7 @@ ${dry ? "Dry run — nothing was pushed." : `Released ${PLUGIN_NAME} ${version}.
      ssh jorgen_admin@thenas "cd /volume1/docker/bridge && sudo /usr/local/bin/docker compose up -d api"
   2. Post it in #einweave → releases.
   3. Each machine: /plugin → Installed → ${PLUGIN_NAME} → Update now, then /reload-plugins
-     (or once: /plugin → Marketplaces → einweave → Enable auto-update).`);
+     (or once: /plugin → Marketplaces → einweave-marketplace → Enable auto-update).`);
 }
 
 if (import.meta.main) {
