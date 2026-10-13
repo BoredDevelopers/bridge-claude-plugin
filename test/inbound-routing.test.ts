@@ -14,10 +14,12 @@
  *
  * WHAT IT PINS
  *   A  subscribed channel,   untargeted   -> surfaces
- *   B  other channel,       untargeted    -> filtered (EINWEAVE_CHANNELS honoured)
- *   C  other channel,       TARGETED      -> surfaces anyway
- *   D  our own `me-tasks`,  untargeted    -> filtered, like any other channel
- *   E  other channel,       @MENTION      -> surfaces anyway
+ *   B  other channel,       untargeted    -> not pushed (EINWEAVE_CHANNELS is the starting SCOPE, server-side)
+ *   D  our own `me-tasks`,  untargeted    -> not pushed, like any other channel
+ *   E  other channel,       @MENTION      -> ⚠️ UNVERIFIED against the RFC-028 server (see the case)
+ *
+ * 0.31.0 (RFC-028): the plugin filters nothing itself. Case C (explicit `contextId` targeting) is gone with
+ * the field -- the server answers 400; the hold is the target.
  *
  * C and E are the ones that matter most: a message addressed to THIS session
  * must arrive regardless of channel subscriptions. B is their control — without
@@ -303,9 +305,6 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
       await post(CH["other-tasks"]!, "case-B-unsubscribed-untargeted");
       const gotB = await awaitArrival("case-B-unsubscribed-untargeted");
 
-      await post(CH["other-tasks"]!, "case-C-targeted", ctx);
-      const gotC = await awaitArrival("case-C-targeted");
-
       // D: OUR OWN `me-tasks`, unsubscribed and unaddressed. Delivered
       // unconditionally before the exemption was removed.
       await post(CH["me-tasks"]!, "case-D-own-tasks-channel");
@@ -332,14 +331,13 @@ describe.skipIf(!HAVE_SERVER || !HAVE_PG)("inbound routing", () => {
 
       expect(threw, `inbound handler threw: ${threw.join(" | ")}`).toEqual([]);
       expect(gotA, "subscribed + untargeted should surface").toBe(true);
-      expect(gotB, "unsubscribed + untargeted should be filtered").toBe(false);
-      expect(gotC, "TARGETED at this session must surface regardless of filter").toBe(true);
-      expect(gotD, "our own `-tasks` channel no longer bypasses the filter").toBe(false);
-      expect(gotE, "an @mention must pierce the channel filter").toBe(true);
-      expect(errLines.some((l) => l.includes(`FILTERED ch=${CH["other-tasks"]}`)),
-        "expected the client filter to log the drop").toBe(true);
-      expect(errLines.some((l) => l.includes(`FILTERED ch=${CH["me-tasks"]}`)),
-        "expected our own -tasks channel to be dropped by the filter too").toBe(true);
+      expect(gotB, "unsubscribed + untargeted is outside the session's scope: the server does not push it").toBe(false);
+      expect(gotD, "our own `-tasks` channel has no exemption from the scope").toBe(false);
+      // ⚠️ UNVERIFIED (written 2026-10-13 without a server to run against). RFC-028 D6: scope narrows UNHELD work, and a
+      // mention in an unheld thread is unheld work -- so this may now be false. Decide against the A3 server:
+      // either the mention pierces the scope (keep) or it does not (flip to false and say so in the RFC).
+      expect(gotE, "an @mention must pierce the channel scope").toBe(true);
+      expect(errLines.some((l) => l.includes("FILTERED ch="))).toBe(false); // the client has no filter left to log one
     },
     120_000
   );

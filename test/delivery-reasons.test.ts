@@ -125,7 +125,7 @@ function handshake(stdin: any): void {
   stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 }
 
-describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
+describe("RFC-028 D6: the client filters nothing -- addressed or not, what the server pushes surfaces", () => {
   let dir = "";
   let stub: Stub;
   let plugin: ReturnType<typeof Bun.spawn>;
@@ -229,18 +229,16 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
     expect(await surfaced("msg-assignee-1")).toBe(true);
   }, 30_000);
 
-  test("THE CONTROL: broadcast-only traffic in a filtered channel is still DROPPED", async () => {
-    // Without this, "addressed messages arrive" could just as well mean "the
-    // filter stopped working", which is a different bug with the same green test.
+  test("THE CONTROL: broadcast-only traffic in a channel outside EINWEAVE_CHANNELS SURFACES -- narrowing is the server's scope now, not a drop here", async () => {
+    // 0.30 dropped this in the plugin (and left the server owing it). EINWEAVE_CHANNELS is now only the
+    // session's STARTING SCOPE, stored server-side; what the server does send, the plugin shows.
     stub.send(msgFrame(message("msg-broadcast-1"), ["channel"]));
-    expect(await surfaced("msg-broadcast-1", 2000)).toBe(false);
+    expect(await surfaced("msg-broadcast-1", 3000)).toBe(true);
   }, 30_000);
 
-  test("no reasons at all — an older server — keeps the old channel-only behaviour", async () => {
-    // No version negotiation: a server that predates this sends no field, the
-    // bypass is false, and the filter applies exactly as before.
+  test("no reasons at all surfaces too: the plugin has no filter left to apply", async () => {
     stub.send(msgFrame(message("msg-legacy-1", { threadId: "thr-1" })));
-    expect(await surfaced("msg-legacy-1", 2000)).toBe(false);
+    expect(await surfaced("msg-legacy-1", 3000)).toBe(true);
   }, 30_000);
 
   test("THE ECHO GUARD: our own message never surfaces just because reasons exist", async () => {
@@ -268,14 +266,12 @@ describe("EINWEAVE_CHANNELS cannot suppress an addressed message", () => {
     expect(await surfaced("msg-own-control", 3000), "general must be deliverable").toBe(true);
   }, 30_000);
 
-  test("RESUME: an addressed redelivery surfaces; a broadcast one is still filtered", async () => {
+  test("RESUME: an addressed redelivery and a broadcast one both surface", async () => {
     // A resume (RFC-027 D5) replays what this session missed as ordinary sequenced frames
-    // flagged `redelivery` — the SAME filter runs over them as over live ones. Paired, so
-    // the addressed one arriving proves the frames were processed: only then does the
-    // broadcast one being absent mean the filter ran (not that nothing was delivered yet).
+    // flagged `redelivery`. What the server owes after a resume already respects the scope.
     stub.send(msgFrame(message("msg-replay-thread", { threadId: "thr-9" }), ["thread"], true));
     stub.send(msgFrame(message("msg-replay-broadcast"), ["channel"], true));
     expect(await surfaced("msg-replay-thread", 5_000), "redelivery not processed").toBe(true);
-    expect(await surfaced("msg-replay-broadcast", 1000), "same resume").toBe(false);
+    expect(await surfaced("msg-replay-broadcast", 3000), "same resume").toBe(true);
   }, 40_000);
 });

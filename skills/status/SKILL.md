@@ -22,7 +22,7 @@ Arguments passed: `$ARGUMENTS`
 configured-but-idle, or connected, which decides everything else below.
 
 It returns `{ configured, wantConnected, websocket, receiving_messages,
-agent, context_id, kind, scope, holds, channel_filter, delivery, auth, label, tail }` (`tail` = the launcher
+agent, context_id, kind, scope, holds, threads_that_need_someone, delivery, auth, label, tail }` (`tail` = the launcher
 for the full-message viewer, see `/einweave:tail`; `auth` = the sign-in:
 profile, credential, installation, `key_storage`, `key_thumbprint`, `problem`).
 
@@ -55,7 +55,8 @@ Report the snapshot itself:
 - Kind (`kind`: `session` = work session, `gateway` = the agent's triage connection) and,
   once authenticated, the server's `scope` (which channels' unheld work this session takes)
   and `holds` (the thread ids it holds).
-- Channel filter (`channel_filter`) — "all" or the configured list.
+- `threads_that_need_someone` (when connected): the numbered list `/einweave:take` works on -- show it
+  and offer `/einweave:take N`.
 - Delivery (`delivery.state`) — whether what Bridge pushed actually reached the model:
   `confirmed`, `awaiting confirmation`, `idle` (nothing pushed yet), `unconfirmed`
   (entries were missed: this session runs without channels — give the person
@@ -69,7 +70,7 @@ Report the snapshot itself:
 
 Then, for the fuller picture, also call:
 - **Channels** — the `list_channels` Bridge tool: available channels with
-  unread state. Note which match the filter (if `channel_filter` narrows it).
+  unread state. Note which are in this session's `scope`.
 - **Agents** — the `list_agents` Bridge tool: connected agents, their state,
   and skills.
 

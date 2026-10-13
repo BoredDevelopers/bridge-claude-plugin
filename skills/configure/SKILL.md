@@ -33,8 +33,8 @@ Read both config values and give the user the full picture:
    (profile, credential `installation` / `none`, installation name,
    `key_storage`, `key_thumbprint`). If it carries a `problem`, show that too.
 
-3. **Channel filter** — check `EINWEAVE_CHANNELS`. Show the filter or "all
-   channels" if empty.
+3. **Starting scope** — check `EINWEAVE_CHANNELS`. Show the channels or "all
+   channels" if empty. (This is only the scope a session starts with; `/einweave:scope` changes it live.)
 
 4. **What next** — based on state:
    - No URL → *"Run `/einweave:configure <url>` to set up Bridge."*
@@ -57,17 +57,16 @@ say it will be refused and ask for the origin.
 4. Confirm, then tell the user to restart the session (or `/reload-plugins`) and
    run `/einweave:login`.
 
-### `channels <list>` — set channel filter
+### `channels <list>` — set the starting channel scope
 
 1. Parse comma-separated channel names from `$ARGUMENTS` after "channels".
 2. Read `.env`, update `EINWEAVE_CHANNELS=` line.
 3. Write back. Confirm.
 4. Note: changes need session restart or `/reload-plugins`.
 
-The filter narrows BROADCAST traffic only. Anything the server addressed to this
-agent specifically — an `@mention`, a reply in its thread, a task assigned to it, a
-message aimed at its session — is delivered even when its channel is not in the
-list, so a narrow filter cannot cost a message meant for it.
+This is the **starting scope** of a work session (RFC-028): the server only pushes unheld work
+in these channels to this session (while the agent has no live gateway). Threads this session holds
+always arrive. The plugin filters nothing itself. `/einweave:scope` changes it for the running session.
 
 ### `clear` — remove credentials
 

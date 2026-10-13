@@ -38,7 +38,7 @@ and lean on its error:
 - connected → continue to Dispatch below.
 
 `status` also returns the current `label`, so use it directly for the no-arg case
-below — no separate `list_contexts` call needed.
+below — no separate `list_sessions` call needed.
 
 ---
 

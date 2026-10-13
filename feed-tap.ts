@@ -123,18 +123,13 @@ export interface OutboundSend {
   text: string;
   /** This session's agent, as the sender. */
   self: { id: string; handle: string };
-  /** The caller forced a broadcast reply: it has no single recipient. */
-  broadcast: boolean;
-  /** The session the server actually targeted, when it targeted one. */
-  targetContextId: string;
 }
 
 /**
  * A successful `reply` → a feed frame. An outgoing message is always shown as addressed
  * (`targeted: true`): it is this session's own, never broadcast noise to its reader.
  * The recipient of a thread reply is whoever started the thread, when this session saw
- * the root; a new root, a forced broadcast, and a reply into our own thread have no single
- * recipient and carry none. The targeted session rides along when the server named one.
+ * the root; a new root and a reply into our own thread have no single recipient and carry none.
  */
 export function outboundToFeed(send: OutboundSend, threads: ThreadNotes): FeedMessage {
   const isRoot = !send.threadId;
@@ -155,9 +150,7 @@ export function outboundToFeed(send: OutboundSend, threads: ThreadNotes): FeedMe
   };
   if (threadId) frame.thread_id = threadId;
   if (note?.title) frame.thread_title = note.title;
-  if (!isRoot && !send.broadcast && note?.rootSender && note.rootSender !== send.self.handle) {
-    frame.to = send.targetContextId ? { handle: note.rootSender, context_id: send.targetContextId } : { handle: note.rootSender };
-  }
+  if (!isRoot && note?.rootSender && note.rootSender !== send.self.handle) frame.to = { handle: note.rootSender };
   return frame;
 }
 

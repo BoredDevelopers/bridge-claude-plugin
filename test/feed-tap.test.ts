@@ -81,7 +81,7 @@ describe("inboundToFeed", () => {
 
 describe("outboundToFeed", () => {
   const self = { id: "a-me", handle: "bellman" };
-  const send = { id: "o1", channelId: "c1", channelName: "dev", threadId: "", resultThreadId: "t9", title: "", type: "task", text: "Please rerun the suite.\nOnly recovery.", self, broadcast: false, targetContextId: "" };
+  const send = { id: "o1", channelId: "c1", channelName: "dev", threadId: "", resultThreadId: "t9", title: "", type: "task", text: "Please rerun the suite.\nOnly recovery.", self };
 
   test("a new root: no recipient, the title is the explicit one or the first line", () => {
     const f = outboundToFeed(send, new ThreadNotes());
@@ -97,10 +97,6 @@ describe("outboundToFeed", () => {
     const f = outboundToFeed(reply, threads);
     expect(f).toMatchObject({ is_root: false, thread_id: "t1", thread_title: "Is it safe?" });
     expect(f.to).toEqual({ handle: "kevin" });
-    // The session the server actually targeted rides along…
-    expect(outboundToFeed({ ...reply, id: "o4", targetContextId: "ctx-kevin-2" }, threads).to).toEqual({ handle: "kevin", context_id: "ctx-kevin-2" });
-    // …and a forced broadcast has no single recipient at all.
-    expect(outboundToFeed({ ...reply, id: "o5", broadcast: true }, threads).to).toBeUndefined();
   });
 
   test("a reply into our own thread, or one we never saw, names no recipient", () => {
@@ -379,7 +375,7 @@ describe("a running plugin serves its feed", () => {
     }
   }
 
-  test("a message the plugin does NOT surface is not in the feed: every skip, each at its own point", async () => {
+  test("a message the plugin does NOT surface is not in the feed: every skip, each at its own point (RFC-028: no per-message target any more -- the hold decides)", async () => {
     await boot();
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
@@ -387,8 +383,6 @@ describe("a running plugin serves its feed", () => {
       { data: { id: "skip-own-send", channelId: "chan-dev-id", agentName: "bellman", content: "echo", senderContextId: "ctx-under-test" }, deliveryReasons: ["target"] },
       // Skipped in the adapter: this agent's own message from another of its sessions, unaddressed.
       { data: { id: "skip-own-agent", channelId: "chan-dev-id", agentId: "bellman-id", agentName: "bellman", content: "from my other window", senderContextId: "ctx-other" } },
-      // Skipped in the adapter: targeted at ANOTHER session of this agent.
-      { data: { id: "skip-other-context", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "for the other window", metadata: JSON.stringify({ contextId: "ctx-other", contextAgentId: "bellman-id" }) }, deliveryReasons: ["mention"] },
     ]);
     expect(seen).toEqual(["msg-barrier"]);
   }, 30_000);
@@ -432,16 +426,14 @@ describe("a running plugin serves its feed", () => {
     expect(order).toEqual([["ord-2-new-channel", "ops"], ["ord-3-known-channel", "dev"]]);
   }, 40_000);
 
-  test("a channel outside EINWEAVE_CHANNELS is filtered from the feed exactly as from the host", async () => {
+  test("there is no client-side channel filter (RFC-028 D6): EINWEAVE_CHANNELS no longer drops what the server pushes", async () => {
     await boot({ EINWEAVE_CHANNELS: "ops" });
     const { frames } = await attach();
     const seen = await feedIdsUpToBarrier(frames, [
-      // Broadcast traffic in #dev, which is not in the filter: dropped by the Session's broadcast filter.
-      { data: { id: "skip-filtered", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "broadcast in a filtered channel" }, deliveryReasons: ["channel"] },
+      // #dev is not in EINWEAVE_CHANNELS. The server's scope keeps such work from being sent at all; what it DOES send, the client shows.
+      { data: { id: "not-filtered", channelId: "chan-dev-id", agentId: "kevin-id", agentName: "kevin", content: "broadcast in another channel" }, deliveryReasons: ["channel"] },
     ]);
-    // The barrier is a mention, which bypasses the filter — and is the only thing in the feed.
-    expect(seen).toEqual(["msg-barrier"]);
-    expect(out).not.toContain("skip-filtered");
+    expect(seen).toEqual(["not-filtered", "msg-barrier"]);
   }, 30_000);
 
   test("the feed says what the link is doing: reconnecting after a drop, connected again, stopped when it is not coming back", async () => {

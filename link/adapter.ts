@@ -53,14 +53,15 @@ export function renderMessage(msg: Inbound): Rendered {
     ts: msg.createdAt ?? "",
   };
   if (str(meta.routedTo)) out.routed_to = str(meta.routedTo);
-  // RFC-027 D2: `context_id` is the TARGET session's grant id.
-  if (str(meta.contextId)) {
-    out.context_id = str(meta.contextId);
-    if (str(meta.contextLabel)) out.context_label = str(meta.contextLabel);
+  // RFC-028 D3: another session of THIS agent posted into a thread this session holds. The
+  // server stamps `contribution = {holder}`; replies to it come to the holder, not to the sibling.
+  const holder = meta.contribution && typeof meta.contribution === "object" ? (meta.contribution as { holder?: { id?: unknown; label?: unknown } }).holder : undefined;
+  if (holder && str(holder.id)) {
+    out.contribution_holder_id = str(holder.id);
+    if (str(holder.label)) out.contribution_holder = str(holder.label);
   }
   const from = senderGrant(msg);
   if (from) out.sender_context_id = from;
-  if (str(meta.contextUnavailable)) out.context_unavailable = str(meta.contextUnavailable);
   return { content: msg.content ?? "", meta: out };
 }
 
@@ -119,11 +120,10 @@ export interface AdapterDeps {
 }
 
 /**
- * An entry that is never surfaced to the model: our own send coming back (even targeted at us
- * — the model can pass its own context_id to `reply`), the agent's other sessions' broadcasts,
- * and anything targeted at ANOTHER session of this agent (the server routes targets itself, RFC-027 D2;
- * this is the client's own check that a mis-route never surfaces in the wrong window). Shared by
- * the push path and `read_deliveries`, so both treat the same entries the same way.
+ * An entry that is never surfaced to the model: our own send coming back, and the agent's other
+ * sessions' broadcasts. (Where a message goes is the thread's hold, decided by the server, RFC-028;
+ * there is no per-message target for the client to second-guess.) Shared by the push path and
+ * `read_deliveries`, so both treat the same entries the same way.
  */
 export function shouldDismiss(entry: Entry, d: Pick<AdapterDeps, "myGrant" | "myAgentId" | "isOwnSend">): boolean {
   if (entry.kind !== "message") return false;
@@ -131,9 +131,7 @@ export function shouldDismiss(entry: Entry, d: Pick<AdapterDeps, "myGrant" | "my
   const m = entry.message;
   const ownSend = (mine && senderGrant(m) === mine) || d.isOwnSend(entry.id);
   const ownAgentBroadcast = !!m.agentId && m.agentId === d.myAgentId() && !isAddressed(m.deliveryReasons);
-  const meta = parseMetadata(m.metadata);
-  const forOtherSession = !!mine && str(meta.contextId) !== "" && str(meta.contextId) !== mine && meta.contextAgentId === d.myAgentId();
-  return !!(ownSend || ownAgentBroadcast || forOtherSession);
+  return !!(ownSend || ownAgentBroadcast);
 }
 
 export function channelAdapter(d: AdapterDeps): DeliveryAdapter {

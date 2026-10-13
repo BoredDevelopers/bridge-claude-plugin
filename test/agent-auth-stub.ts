@@ -93,6 +93,12 @@ export interface StubOptions {
    * repo's own manager.ts tests need.
    */
   tooOldMints?: number;
+  /** What GET /api/channels answers (`{channels}`); unset = the generic empty answer. */
+  channels?: Array<{ id: string; name: string }>;
+  /** Answers `/api/*` requests the stub does not know (after the credential check): return a Response to take it over. */
+  api?: (req: Request, url: URL) => Response | Promise<Response | undefined> | undefined;
+  /** The thread ids the `authenticated` frame reports as held (RFC-028). */
+  holds?: string[];
   /** The `error_description` `tooOldMints` answers with. Default: a `client_too_old:` one WITH a `>= x.y.z`; set to a `client_blocked:` one (which names none) to test the no-minimum fallback. */
   tooOldReason?: string;
 }
@@ -728,6 +734,16 @@ export function startAuthStub(opts: StubOptions = {}) {
       if (url.pathname === "/ws" && srv.upgrade(req, { data: { session: "" } })) return;
       const auth = await core.handleAuth(req);
       if (auth) return auth;
+      // A test's own API (and the channel list for EINWEAVE_CHANNELS names, RFC-028 D6). The credential is
+      // checked ONCE: a DPoP proof is single-use, so a second check of the same request would be a replay.
+      if (url.pathname.startsWith("/api/") && (opts.api || (url.pathname === "/api/channels" && opts.channels))) {
+        const denied = core.checkResource(req);
+        if (denied) return denied;
+        const r = await opts.api?.(req, url);
+        if (r) return core.withDate(r);
+        if (url.pathname === "/api/channels" && opts.channels) return core.withDate(Response.json({ channels: opts.channels }));
+        return core.withDate(Response.json([]));
+      }
       if (url.pathname.startsWith("/api/")) return core.checkResource(req) ?? core.withDate(Response.json([]));
       return core.withDate(new Response("not found", { status: 404 }));
     },
@@ -769,7 +785,7 @@ export function startAuthStub(opts: StubOptions = {}) {
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");
           ws.data.session = a.session;
           const s = core.sessions.get(a.session)!;
-          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "agent-1", agentName: "Agent", contextId: s.key } }));
+          ws.send(JSON.stringify({ v: 2, type: "authenticated", payload: { agentId: "agent-1", agentName: "Agent", contextId: s.key, kind: f.kind, scope: f.scope ? { mode: f.scope.mode, channelIds: f.scope.channelIds ?? [] } : { mode: "all", channelIds: [] }, holds: opts.holds ?? [] } }));
         } else if (f.type === "reauth") {
           const a = core.wsCheck(origin, f);
           if (!a) return core.closeLikeServer(ws, 4001, "Invalid token");

@@ -252,31 +252,17 @@ describe("read_deliveries", () => {
     expect(stub.calls.find((c) => c.startsWith("GET /api/deliveries"))).toContain("limit=200");
   }, 40_000);
 
-  test("EINWEAVE_CHANNELS: a broadcast in an excluded channel is not shown, NOT acked, and stays owed; addressed ones pass", async () => {
-    stub.state.owed = [message(1, "broadcast in an excluded channel"), message(2, "for me", ["mention"])];
+  test("RFC-028 D6: EINWEAVE_CHANNELS no longer filters read_deliveries -- everything the server owes is shown and acked", async () => {
+    // The scope is applied by the SERVER (it never sends/owes what the scope excludes), so a plugin-side
+    // drop would only hide owed work and leave it owed forever.
+    stub.state.owed = [message(1, "broadcast in an 'excluded' channel"), message(2, "for me", ["mention"])];
     await boot(true, { EINWEAVE_CHANNELS: "nowhere" });
     const body = JSON.parse((await call("read_deliveries")).text);
-    expect(body.entries.map((e: any) => e.id)).toEqual([id(2)]);
-    expect(body.filtered).toBe(1);
-    expect(body.hint).toContain("EINWEAVE_CHANNELS");
+    expect(body.entries.map((e: any) => e.id)).toEqual([id(1), id(2)]);
+    expect(body.filtered).toBeUndefined();
+    expect(body.unresolved).toBeUndefined();
     await acksSettled(1);
-    expect(stub.acks).toEqual([{ ids: [id(2)], how: "model" }]); // never the filtered one: no false ✓✓
-    const again = JSON.parse((await call("read_deliveries")).text);
-    expect(again.entries).toEqual([]); // still owed, still not shown
-    expect(again.filtered).toBe(1);
-    expect(stub.acks).toHaveLength(1);
-  }, 40_000);
-
-  test("paging advances past filtered rows: the cursor comes from the server page", async () => {
-    stub.state.owed = [message(1), message(2), message(3, "mine", ["thread"])];
-    await boot(true, { EINWEAVE_CHANNELS: "nowhere" });
-    const first = JSON.parse((await call("read_deliveries", { limit: 2 })).text);
-    expect(first.entries).toEqual([]);
-    expect(first.filtered).toBe(2);
-    expect(first.next).toBe(id(2));
-    expect(first.hint).toContain(`read_deliveries(after: "${id(2)}")`);
-    const second = JSON.parse((await call("read_deliveries", { limit: 2, after: first.next })).text);
-    expect(second.entries.map((e: any) => e.id)).toEqual([id(3)]);
+    expect(stub.acks).toEqual([{ ids: [id(1), id(2)], how: "model" }]);
   }, 40_000);
 
   test("a page over the byte budget: only what is returned is acked, no `next` is offered, and the next call returns the rest", async () => {
@@ -361,41 +347,6 @@ describe("read_deliveries", () => {
     expect(text).toContain("reconnecting");
     expect(text).toContain("acks can't be sent yet");
     expect(stub.acks).toEqual([]);
-  }, 60_000);
-
-  test("m2: a channel the name map has not heard of is fetched once and then DELIVERED, not mistaken for an excluded one", async () => {
-    const LATE = "0190a000-0000-7000-9000-0000000000c9";
-    const late = message(1, "in a channel created after the map was built");
-    (late.payload.message as any).channelId = LATE;
-    stub.state.owed = [late];
-    await boot(true, { EINWEAVE_CHANNELS: "late" });
-    stub.state.channels = [...stub.state.channels, { id: LATE, name: "late" }];
-    await Bun.sleep(5300); // the map refresh is rate-limited to once per 5 s
-    const body = JSON.parse((await call("read_deliveries")).text);
-    expect(body.filtered).toBe(0);
-    expect(body.entries.map((e: any) => e.id)).toEqual([id(1)]);
-    await acksSettled(1);
-    expect(stub.acks).toEqual([{ ids: [id(1)], how: "model" }]);
-  }, 60_000);
-
-  test("an UNRESOLVED channel (the channel list cannot be read) is counted separately from an excluded one: not shown, not acked", async () => {
-    stub.state.owed = [message(1, "in a channel nobody can name yet")];
-    stub.state.channelsStatus = 500;
-    await boot(true, { EINWEAVE_CHANNELS: "general" });
-    const body = JSON.parse((await call("read_deliveries")).text);
-    expect(body.entries).toEqual([]);
-    expect(body.unresolved).toBe(1);
-    expect(body.filtered).toBe(0);
-    expect(body.hint).toContain("not resolved yet");
-    expect(body.hint).not.toContain("excluded by EINWEAVE_CHANNELS");
-    await Bun.sleep(500);
-    expect(stub.acks).toEqual([]);
-    // Once the list can be read, the same entry is delivered.
-    stub.state.channelsStatus = 200;
-    await Bun.sleep(5300);
-    const later = JSON.parse((await call("read_deliveries")).text);
-    expect(later.entries.map((e: any) => e.id)).toEqual([id(1)]);
-    expect(later.unresolved).toBeUndefined();
   }, 60_000);
 
   test("a window that STANDS BY refuses: no fetch, no ack", async () => {
